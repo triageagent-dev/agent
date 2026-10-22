@@ -1,0 +1,401 @@
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
+
+//go:build obi_bpf_ignore
+
+#include <bpfcore/vmlinux.h>
+#include <bpfcore/bpf_helpers.h>
+
+#include <common/algorithm.h>
+#include <common/preempt_guard.h>
+
+#include <generictracer/ssl_defs.h>
+#include <generictracer/tls_prefix.h>
+
+#include <logger/bpf_dbg.h>
+
+#include <maps/active_ssl_read_args.h>
+#include <maps/active_ssl_write_args.h>
+
+#include <pid/pid.h>
+
+static __always_inline int ssl_size_to_int(size_t size) {
+    return (int)min((size_t)__INT_MAX__, size);
+}
+
+// SSL read and read_ex are more less the same, but some frameworks use one or the other.
+// SSL_read_ex sets an argument pointer with the number of bytes read, while SSL_read returns
+// the number of bytes read.
+SEC("uprobe/libssl.so:SSL_read")
+int BPF_UPROBE_GUARDED(obi_uprobe_ssl_read, void *ssl, const void *buf, int num) {
+    (void)ctx;
+    (void)num;
+
+    const u64 id = bpf_get_current_pid_tgid();
+
+    if (!valid_pid(id)) {
+        return 0;
+    }
+
+    bpf_dbg_printk("=== uprobe SSL_read id=%d ssl=%llx ===", id, ssl);
+
+    ssl_pid_connection_info_t *s_conn = bpf_map_lookup_elem(&ssl_to_conn, &ssl);
+    if (s_conn) {
+        finish_possible_delayed_tls_http_request(&s_conn->p_conn);
+    }
+
+    ssl_args_t args = {};
+    args.buf = (u64)buf;
+    args.ssl = (u64)ssl;
+    args.flags = 0;
+
+    bpf_map_update_elem(&active_ssl_read_args, &id, &args, BPF_ANY);
+    bpf_map_update_elem(&ssl_to_pid_tid,
+                        &args.ssl,
+                        &id,
+                        BPF_NOEXIST); // we must not overwrite here, remember the original thread
+
+    return 0;
+}
+
+SEC("uretprobe/libssl.so:SSL_read")
+int BPF_URETPROBE_GUARDED(obi_uretprobe_ssl_read, int ret) {
+    const u64 id = bpf_get_current_pid_tgid();
+
+    if (!valid_pid(id)) {
+        return 0;
+    }
+
+    bpf_dbg_printk("=== uretprobe SSL_read id=%d ===", id);
+
+    ssl_args_t *args = bpf_map_lookup_elem(&active_ssl_read_args, &id);
+
+    bpf_map_delete_elem(&active_ssl_read_args, &id);
+
+    // must be last in the function, doesn't return
+    handle_ssl_buf(ctx, id, args, ret, TCP_RECV);
+    return 0;
+}
+
+SEC("uprobe/libssl.so:SSL_read_ex")
+int BPF_UPROBE_GUARDED(obi_uprobe_ssl_read_ex,
+                       void *ssl,
+                       const void *buf,
+                       int num,
+                       size_t *readbytes) { //NOLINT(readability-non-const-parameter)
+    (void)ctx;
+    (void)num;
+
+    const u64 id = bpf_get_current_pid_tgid();
+
+    if (!valid_pid(id)) {
+        return 0;
+    }
+
+    bpf_dbg_printk("=== SSL_read_ex id=%d ssl=%llx ===", id, ssl);
+
+    ssl_pid_connection_info_t *s_conn = bpf_map_lookup_elem(&ssl_to_conn, &ssl);
+    if (s_conn) {
+        finish_possible_delayed_tls_http_request(&s_conn->p_conn);
+    }
+
+    ssl_args_t args = {};
+    args.buf = (u64)buf;
+    args.ssl = (u64)ssl;
+    args.len_ptr = (u64)readbytes;
+    args.flags = 0;
+
+    bpf_map_update_elem(&active_ssl_read_args, &id, &args, BPF_ANY);
+    bpf_map_update_elem(&ssl_to_pid_tid,
+                        &args.ssl,
+                        &id,
+                        BPF_NOEXIST); // we must not overwrite here, remember the original thread
+
+    return 0;
+}
+
+SEC("uretprobe/libssl.so:SSL_read_ex")
+int BPF_URETPROBE_GUARDED(obi_uretprobe_ssl_read_ex, int ret) {
+    const u64 id = bpf_get_current_pid_tgid();
+
+    if (!valid_pid(id)) {
+        return 0;
+    }
+
+    bpf_dbg_printk("=== uretprobe SSL_read_ex id=%d ===", id);
+
+    ssl_args_t *args = bpf_map_lookup_elem(&active_ssl_read_args, &id);
+
+    if (!args) {
+        bpf_map_delete_elem(&active_ssl_read_args, &id);
+        return 0;
+    }
+
+    if (ret != 1) {
+        const u64 ssl = args->ssl;
+        bpf_map_delete_elem(&active_ssl_read_args, &id);
+        bpf_map_delete_elem(&ssl_to_pid_tid, &ssl);
+        return 0;
+    }
+
+    size_t read_len = 0;
+    bpf_probe_read_user(&read_len, sizeof(read_len), (void *)args->len_ptr);
+
+    bpf_map_delete_elem(&active_ssl_read_args, &id);
+    // must be last in the function, doesn't return
+    handle_ssl_buf(ctx, id, args, ssl_size_to_int(read_len), TCP_RECV);
+    return 0;
+}
+
+// SSL write and write_ex are more less the same, but some frameworks use one or the other.
+// SSL_write_ex sets an argument pointer with the number of bytes written, while SSL_write returns
+// the number of bytes written.
+SEC("uprobe/libssl.so:SSL_write")
+int BPF_UPROBE_GUARDED(obi_uprobe_ssl_write, void *ssl, const void *buf, int num) {
+    (void)ctx;
+    (void)num;
+
+    const u64 id = bpf_get_current_pid_tgid();
+
+    if (!valid_pid(id)) {
+        return 0;
+    }
+
+    bpf_dbg_printk("=== uprobe SSL_write id=%d ssl=%llx ===", id, ssl);
+
+    ssl_args_t args = {};
+    args.buf = (u64)buf;
+    args.ssl = (u64)ssl;
+    args.flags = 0;
+
+    bpf_map_update_elem(&active_ssl_write_args, &id, &args, BPF_ANY);
+
+    return 0;
+}
+
+SEC("uretprobe/libssl.so:SSL_write")
+int BPF_URETPROBE_GUARDED(obi_uretprobe_ssl_write, int ret) {
+    const u64 id = bpf_get_current_pid_tgid();
+
+    if (!valid_pid(id)) {
+        return 0;
+    }
+
+    ssl_args_t *args = bpf_map_lookup_elem(&active_ssl_write_args, &id);
+
+    bpf_dbg_printk("=== uretprobe SSL_write id=%d args %llx ===", id, args);
+
+    if (args) {
+        ssl_args_t saved = {};
+        __builtin_memcpy(&saved, args, sizeof(ssl_args_t));
+        bpf_map_delete_elem(&active_ssl_write_args, &id);
+        // must be last in the function, doesn't return
+        handle_ssl_buf(ctx, id, &saved, ret, TCP_SEND);
+    }
+
+    return 0;
+}
+
+SEC("uprobe/libssl.so:SSL_write_ex")
+int BPF_UPROBE_GUARDED(obi_uprobe_ssl_write_ex,
+                       void *ssl,
+                       const void *buf,
+                       size_t num,
+                       size_t *written) { //NOLINT(readability-non-const-parameter)
+    (void)ctx;
+    (void)num;
+
+    const u64 id = bpf_get_current_pid_tgid();
+
+    if (!valid_pid(id)) {
+        return 0;
+    }
+
+    bpf_dbg_printk("=== SSL_write_ex id=%d ssl=%llx ===", id, ssl);
+
+    ssl_args_t args = {};
+    args.buf = (u64)buf;
+    args.ssl = (u64)ssl;
+    args.len_ptr = (u64)written;
+    args.flags = 0;
+
+    bpf_map_update_elem(&active_ssl_write_args, &id, &args, BPF_ANY);
+
+    return 0;
+}
+
+SEC("uprobe/libssl.so:SSL_write_ex2")
+int BPF_UPROBE_GUARDED(obi_uprobe_ssl_write_ex2,
+                       void *ssl,
+                       const void *buf,
+                       size_t num,
+                       u64 flags,
+                       size_t *written) { //NOLINT(readability-non-const-parameter)
+    (void)ctx;
+    (void)num;
+    (void)flags;
+
+    const u64 id = bpf_get_current_pid_tgid();
+
+    if (!valid_pid(id)) {
+        return 0;
+    }
+
+    bpf_dbg_printk("=== SSL_write_ex2 id=%d ssl=%llx ===", id, ssl);
+
+    ssl_args_t args = {};
+    args.buf = (u64)buf;
+    args.ssl = (u64)ssl;
+    args.len_ptr = (u64)written;
+    args.flags = 0;
+
+    bpf_map_update_elem(&active_ssl_write_args, &id, &args, BPF_ANY);
+
+    return 0;
+}
+
+SEC("uretprobe/libssl.so:SSL_write_ex")
+int BPF_URETPROBE_GUARDED(obi_uretprobe_ssl_write_ex, int ret) {
+    const u64 id = bpf_get_current_pid_tgid();
+
+    if (!valid_pid(id)) {
+        return 0;
+    }
+
+    ssl_args_t *args = bpf_map_lookup_elem(&active_ssl_write_args, &id);
+
+    bpf_dbg_printk("=== uretprobe SSL_write_ex id=%d args %llx ===", id, args);
+
+    if (ret != 1 || !args) {
+        bpf_map_delete_elem(&active_ssl_write_args, &id);
+        return 0;
+    }
+
+    size_t write_len = 0;
+    bpf_probe_read_user(&write_len, sizeof(write_len), (void *)args->len_ptr);
+
+    ssl_args_t saved = {};
+    __builtin_memcpy(&saved, args, sizeof(ssl_args_t));
+    bpf_map_delete_elem(&active_ssl_write_args, &id);
+    // must be last in the function, doesn't return
+    handle_ssl_buf(ctx, id, &saved, ssl_size_to_int(write_len), TCP_SEND);
+
+    return 0;
+}
+
+SEC("uretprobe/libssl.so:SSL_write_ex2")
+int BPF_URETPROBE_GUARDED(obi_uretprobe_ssl_write_ex2, int ret) {
+    const u64 id = bpf_get_current_pid_tgid();
+
+    if (!valid_pid(id)) {
+        return 0;
+    }
+
+    ssl_args_t *args = bpf_map_lookup_elem(&active_ssl_write_args, &id);
+
+    bpf_dbg_printk("=== uretprobe SSL_write_ex2 id=%d args %llx ===", id, args);
+
+    if (ret != 1 || !args) {
+        bpf_map_delete_elem(&active_ssl_write_args, &id);
+        return 0;
+    }
+
+    size_t write_len = 0;
+    bpf_probe_read_user(&write_len, sizeof(write_len), (void *)args->len_ptr);
+
+    ssl_args_t saved = {};
+    __builtin_memcpy(&saved, args, sizeof(ssl_args_t));
+    bpf_map_delete_elem(&active_ssl_write_args, &id);
+    // must be last in the function, doesn't return
+    handle_ssl_buf(ctx, id, &saved, ssl_size_to_int(write_len), TCP_SEND);
+
+    return 0;
+}
+
+SEC("uprobe/libssl.so:SSL_shutdown")
+int BPF_UPROBE_GUARDED(obi_uprobe_ssl_shutdown, void *s) {
+    (void)ctx;
+
+    const u64 id = bpf_get_current_pid_tgid();
+
+    if (!valid_pid(id)) {
+        return 0;
+    }
+
+    bpf_dbg_printk("=== SSL_shutdown id=%d ssl=%llx ===", id, s);
+
+    ssl_release_connection_state(id, s);
+    ssl_release_thread_state(id);
+
+    return 0;
+}
+
+// Records which BIOs this SSL reads from and writes to.
+//
+// CPython (_ssl.c) and Node (crypto_tls.cc) both call this when building the
+// connection. It names the connection's own BIOs, separating them from
+// OpenSSL's internal staging BIOs, and identifies the SSL behind a BIO level
+// write during the handshake, while SSL_write is off the stack.
+SEC("uprobe/libssl.so:SSL_set_bio")
+int BPF_UPROBE_GUARDED(obi_uprobe_ssl_set_bio, void *ssl, void *rbio, void *wbio) {
+    (void)ctx;
+
+    const u64 id = bpf_get_current_pid_tgid();
+
+    if (!valid_pid(id)) {
+        return 0;
+    }
+
+    // Split in two: bpf_trace_printk takes at most three arguments, and clang
+    // silently switches to bpf_trace_vprintk beyond that, which needs 5.16.
+    bpf_dbg_printk("=== SSL_set_bio id=%d ssl=%llx ===", id, ssl);
+    bpf_dbg_printk("SSL_set_bio rbio=%llx wbio=%llx", rbio, wbio);
+
+    ssl_bios_track(pid_from_pid_tgid(id), ssl, rbio, wbio);
+
+    return 0;
+}
+
+// Drops the BIO associations of an SSL that is going away.
+//
+// Allocators reuse BIO pointers, and a reused pointer may next serve as an
+// internal BIO that SSL_set_bio never names.
+SEC("uprobe/libssl.so:SSL_free")
+int BPF_UPROBE_GUARDED(obi_uprobe_ssl_free, void *ssl) {
+    (void)ctx;
+
+    const u64 id = bpf_get_current_pid_tgid();
+
+    if (!valid_pid(id)) {
+        return 0;
+    }
+
+    bpf_dbg_printk("=== SSL_free id=%d ssl=%llx ===", id, ssl);
+
+    // Node can free an SSL without shutting it down first, so this is the
+    // reliable release point. Only SSL-keyed state goes here: this thread may
+    // still be serving other connections through pid_tid_to_conn.
+    ssl_release_connection_state(id, ssl);
+
+    return 0;
+}
+
+// The seam where ciphertext becomes observable for every TLS stack.
+//
+// OpenSSL writes a finished record out through the BIO the same way for a
+// socket BIO and a memory BIO, whatever the application does with the buffer
+// afterwards. It is a libcrypto symbol.
+SEC("uprobe/libcrypto.so:BIO_write")
+int BPF_UPROBE_GUARDED(obi_uprobe_bio_write, void *bio, const void *buf, int len) {
+    (void)ctx;
+
+    const u64 id = bpf_get_current_pid_tgid();
+
+    if (!valid_pid(id)) {
+        return 0;
+    }
+
+    tls_prefix_register_egress(bio, buf, len);
+
+    return 0;
+}

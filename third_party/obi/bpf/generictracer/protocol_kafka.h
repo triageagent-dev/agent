@@ -1,0 +1,554 @@
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
+
+#pragma once
+
+#include <bpfcore/vmlinux.h>
+#include <bpfcore/bpf_endian.h>
+#include <bpfcore/bpf_helpers.h>
+#include <bpfcore/utils.h>
+
+#include <common/algorithm.h>
+#include <common/common.h>
+#include <common/connection_info.h>
+#include <common/large_buffers.h>
+#include <common/ringbuf.h>
+#include <generictracer/protocol_common.h>
+#include <generictracer/maps/protocol_cache.h>
+
+// message_size -> https://kafka.apache.org/protocol#protocol_common
+// The message_size field in the Kafka protocol defines the size of the
+// request/response payload excluding the 4 bytes used by the message_size field itself.
+
+// Every kafka api packet is prefixed by an header
+// https://kafka.apache.org/protocol#protocol_messages
+struct kafka_request_hdr {
+    s32 message_size;
+    s16 request_api_key;     // The API key of this request
+    s16 request_api_version; // The API version of this request
+    s32 correlation_id;      // The correlation ID of this request
+    // client-id is a nullable string
+};
+
+struct kafka_response_hdr {
+    s32 message_size;
+    s32 correlation_id; // The correlation ID of this response
+};
+
+typedef struct kafka_state_data {
+    s32 message_size;
+} kafka_state_data_t;
+
+typedef struct kafka_state_key {
+    connection_info_t conn;
+    u8 direction;
+    u8 _pad[3];
+} kafka_state_key_t;
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __type(key, kafka_state_key_t);
+    __type(value, kafka_state_data_t);
+    __uint(max_entries, MAX_CONCURRENT_REQUESTS);
+} kafka_state SEC(".maps");
+
+typedef struct kafka_correlation_data {
+    s32 correlation_id;
+    // A single Kafka response can span multiple recv() chunks, so we need to keep
+    // the correlation entry alive and append every chunk until the whole response
+    // (message_size + 4) has been captured, instead of finalizing on the first chunk.
+    // 0 means no capture in progress.
+    s32 response_bytes_remaining;
+} kafka_correlation_data_t;
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __type(key, connection_info_t);
+    __type(value, kafka_correlation_data_t);
+    __uint(max_entries, MAX_CONCURRENT_REQUESTS);
+} kafka_ongoing_requests SEC(".maps");
+
+enum {
+    k_kafka_hdr_message_size = 4,
+    k_kafka_hdr_request_api_key = 2,
+    k_kafka_hdr_request_api_version = 2,
+    k_kafka_hdr_correlation_id = 4,
+    k_kafka_request_header_fields_without_message_size =
+        k_kafka_hdr_request_api_key + k_kafka_hdr_request_api_version + k_kafka_hdr_correlation_id,
+    k_kafka_min_request_header_size =
+        k_kafka_hdr_message_size + k_kafka_request_header_fields_without_message_size,
+
+    k_kafka_min_response_message_size_value = 4, // correlation_id (4)
+
+    // https://kafka.apache.org/protocol#protocol_api_keys
+    k_kafka_api_key_metadata = 3,
+    // only versions 10-13 contain topic_id which we are interested in
+    k_kafka_min_metadata_api_version = 10,
+    k_kafka_max_metadata_api_version = 13,
+
+    // Sanity checks
+    k_kafka_message_size_max = 1 << 13, // 8K
+};
+
+static __always_inline int kafka_read_message_size(const unsigned char *data, size_t data_len) {
+    if (data_len < k_kafka_hdr_message_size) {
+        return -1;
+    }
+
+    int message_size = 0;
+    bpf_probe_read(&message_size, k_kafka_hdr_message_size, (const void *)data);
+    message_size = bpf_ntohl(message_size);
+
+    // we can be in the case where we already have the first part
+    // of the header saved in the map and we are reading the second
+    // part so we think that is message_size but it is actually
+    // key+version in case of request or the correlation id in case of
+    // response
+
+    if (message_size < k_kafka_min_response_message_size_value ||
+        message_size > k_kafka_message_size_max) {
+        bpf_dbg_printk("possible invalid message_size: %d", message_size);
+        return 0;
+    }
+    return message_size;
+}
+
+// This function is used to store the Kafka header if it comes in split packets
+// from double send.
+// Given the fact that we need to store this for the duration of the full request
+// (split in potentially multiple packets), we will **not** process or preserve
+// any actual payloads that are exactly 4 bytes long — they are intentionally
+// dropped in favor of state storage.
+static __always_inline int kafka_store_state_data(const connection_info_t *conn_info,
+                                                  const unsigned char *data,
+                                                  size_t data_len,
+                                                  u8 direction) {
+
+    // we want to store only request/response of split sends that are 4 bytes long
+    if (data_len != k_kafka_hdr_message_size) {
+        return 0;
+    }
+
+    int message_size = kafka_read_message_size(data, data_len);
+    if (message_size == -1) {
+        return 0;
+    }
+    kafka_state_data_t new_state_data = {};
+    new_state_data.message_size = message_size;
+    kafka_state_key_t state_key = {.conn = *conn_info, .direction = direction};
+    bpf_map_update_elem(&kafka_state, &state_key, &new_state_data, BPF_ANY);
+
+    return -1;
+}
+
+// This function reads all fields in a request header, ignoring the first field (message_size).
+// Specifically, it also checks whether the request_api_key is relevant to us (currently, we're
+// only interested in the Metadata type), whether the request_api_version is valid, and whether
+// the correlation_id is valid.
+// Note: we are interested in request_api_version values ​​between 10 and 13 because
+// these versions contain the topic_id while versions < 9 have directly the topic_name.
+static __always_inline int kafka_check_request_header_fields_without_message_size(
+    struct kafka_request_hdr *hdr, const unsigned char *data, size_t data_len) {
+
+    if (data_len < k_kafka_request_header_fields_without_message_size) {
+        bpf_dbg_printk("packet too short for kafka request header");
+        return -1;
+    }
+
+    u8 offset = 0;
+
+    bpf_probe_read(&hdr->request_api_key, k_kafka_hdr_request_api_key, (const void *)(data));
+    hdr->request_api_key = bpf_ntohs(hdr->request_api_key);
+    if (hdr->request_api_key != k_kafka_api_key_metadata) {
+        bpf_dbg_printk("request_api_key "
+                       "provided %d, is not metadata(%d)",
+                       hdr->request_api_key,
+                       k_kafka_api_key_metadata);
+        return -1;
+    }
+
+    offset += k_kafka_hdr_request_api_key;
+    bpf_probe_read(
+        &hdr->request_api_version, k_kafka_hdr_request_api_version, (const void *)(data + offset));
+    hdr->request_api_version = bpf_ntohs(hdr->request_api_version);
+    if (hdr->request_api_version < k_kafka_min_metadata_api_version ||
+        hdr->request_api_version > k_kafka_max_metadata_api_version) {
+        bpf_dbg_printk("provided "
+                       "api_version %d not supported for the provided request_api_key %d ",
+                       hdr->request_api_version,
+                       hdr->request_api_key);
+        return -1;
+    }
+
+    offset += k_kafka_hdr_request_api_version;
+    bpf_probe_read(&hdr->correlation_id, k_kafka_hdr_correlation_id, (const void *)(data + offset));
+    hdr->correlation_id = bpf_ntohl(hdr->correlation_id);
+
+    if (hdr->correlation_id < 0) {
+        bpf_dbg_printk("invalid correlation_id: %d", hdr->correlation_id);
+        return -1;
+    }
+    return 0;
+}
+
+// Request header
+// +--------------+-----------------+---------------------+----------------|
+// | message_size | request_api_key | request_api_version | correlation_id |
+// +--------------+-----------------+---------------------+----------------|
+// |    4B        |     2B          |     2B              |      4B        |
+// +--------------+-----------------+---------------------+----------------|
+// This function parses the request header. First, it reads the value of the message_size field.
+// If the value is equal to the size of the received data minus the size of message_size itself,
+// then we've just received data that possibly indicates a healthy packet.
+// Otherwise, we need to check if we have a valid message_size saved in the kafka_state map,
+// and if the value of message_size is equal to the size of the received data,
+// which means we've received the entire packet minus the message_size we already had.
+// In both cases, we try to read all the remaining fields and see if it is a intersted and valid packet.
+static __always_inline int kafka_parse_fixup_request_header(const connection_info_t *conn_info,
+                                                            struct kafka_request_hdr *hdr,
+                                                            const unsigned char *data,
+                                                            size_t data_len,
+                                                            u8 direction) {
+
+    // Try to parse and validate the header first.
+    hdr->message_size = kafka_read_message_size(data, data_len);
+    if (hdr->message_size == -1) {
+        return -1;
+    }
+    if (hdr->message_size == (data_len - k_kafka_hdr_message_size)) {
+        // Header is valid and we have the full data, we can proceed.
+        if (kafka_check_request_header_fields_without_message_size(
+                hdr, data + k_kafka_hdr_message_size, data_len - k_kafka_hdr_message_size) < 0) {
+            return -1;
+        }
+        return 0;
+    }
+
+    kafka_state_key_t state_key = {.conn = *conn_info, .direction = direction};
+    kafka_state_data_t *state_data = bpf_map_lookup_elem(&kafka_state, &state_key);
+    if (state_data != NULL && state_data->message_size == data_len) {
+        // Prepend the header from state data.
+        hdr->message_size = state_data->message_size;
+        if (kafka_check_request_header_fields_without_message_size(hdr, data, data_len) < 0) {
+            return -1;
+        }
+        return 0;
+    }
+
+    bpf_dbg_printk("failed to parse kafka request header");
+    return -1;
+}
+
+// This function reads the response header correlation_id field and checks if it is
+// a valid value
+static __always_inline int
+kafka_check_response_header_correlation_id(struct kafka_response_hdr *hdr,
+                                           const unsigned char *data) {
+
+    bpf_probe_read(&hdr->correlation_id, k_kafka_hdr_correlation_id, (const void *)data);
+    hdr->correlation_id = bpf_ntohl(hdr->correlation_id);
+    if (hdr->correlation_id < 0) {
+        bpf_dbg_printk("invalid correlation_id: %d", hdr->correlation_id);
+        return -1;
+    }
+    return 0;
+}
+
+// Response header
+// +--------------+----------------|
+// | message_size | correlation_id |
+// +--------------+----------------|
+// |    4B        |       4B.      |
+// +--------------+----------------|
+// This function parses the response header. First, it reads the value of the message_size field.
+// If the value is equal to the size of the received data minus the size of message_size itself,
+// then we've just received data that possibly indicates a healthy packet.
+// Otherwise, we need to check if we have a valid message_size saved in the kafka_state map,
+// and if the value of message_size is equal to the size of the received data,
+// which means we've received the entire packet minus the message_size we already had.
+// In both cases, we need to check if the value of the correlation_id field is valid.
+static __always_inline int kafka_parse_fixup_response_header(const connection_info_t *conn_info,
+                                                             struct kafka_response_hdr *hdr,
+                                                             const unsigned char *data,
+                                                             size_t data_len,
+                                                             u8 direction) {
+    // Try to parse and validate the header first.
+    hdr->message_size = kafka_read_message_size(data, data_len);
+    if (hdr->message_size == -1) {
+        return -1;
+    }
+
+    if (hdr->message_size == (data_len - k_kafka_hdr_message_size)) {
+        // Header is valid and we have the full data, we can proceed.
+        if (kafka_check_response_header_correlation_id(hdr, data + k_kafka_hdr_message_size) < 0) {
+            return -1;
+        }
+        return 0;
+    }
+    // Prepend the header from state data.
+    kafka_state_key_t state_key = {.conn = *conn_info, .direction = direction};
+    kafka_state_data_t *state_data = bpf_map_lookup_elem(&kafka_state, &state_key);
+    if (state_data != NULL && state_data->message_size == data_len) {
+        // Prepend the header from state data.
+        hdr->message_size = state_data->message_size;
+        if (kafka_check_response_header_correlation_id(hdr, data) < 0) {
+            return -1;
+        }
+        return 0;
+    }
+
+    bpf_dbg_printk("failed to parse kafka response header");
+    return -1;
+}
+
+static __always_inline s32 kafka_read_response_correlation_id(const kafka_state_data_t *state_data,
+                                                              const void *u_buf,
+                                                              u32 bytes_len) {
+    s32 correlation_id = 0;
+    if (state_data && state_data->message_size > 0 && (u32)state_data->message_size == bytes_len) {
+        if (bytes_len < k_kafka_hdr_correlation_id) {
+            return -1;
+        }
+        if (bpf_probe_read(&correlation_id, k_kafka_hdr_correlation_id, u_buf) != 0) {
+            return -1;
+        }
+    } else {
+        if (bytes_len < k_kafka_hdr_message_size + k_kafka_hdr_correlation_id) {
+            return -1;
+        }
+        if (bpf_probe_read(&correlation_id,
+                           k_kafka_hdr_correlation_id,
+                           (const u8 *)u_buf + k_kafka_hdr_message_size) != 0) {
+            return -1;
+        }
+    }
+    return bpf_ntohl(correlation_id);
+}
+
+// Emit a large buffer event for Kafka protocol.
+// The return value is used to control the flow for this specific protocol.
+// -1: wait additional data; 0: continue, regardless of errors.
+static __always_inline int kafka_send_large_buffer(tcp_req_t *req,
+                                                   pid_connection_info_t *pid_conn,
+                                                   const void *u_buf,
+                                                   u32 bytes_len,
+                                                   u8 direction,
+                                                   enum large_buf_action action) {
+    if (kafka_max_captured_bytes > k_large_buf_max_kafka_captured_bytes) {
+        bpf_dbg_printk("BUG: kafka_max_captured_bytes exceeds maximum allowed value.");
+    }
+
+    if (kafka_max_captured_bytes == 0 || req->lb_res_bytes >= kafka_max_captured_bytes ||
+        bytes_len == 0) {
+        return 0;
+    }
+
+    if (kafka_store_state_data(&pid_conn->conn, u_buf, bytes_len, direction) < 0) {
+        bpf_dbg_printk("4 bytes packet, storing state data");
+        return -1;
+    }
+
+    kafka_correlation_data_t *correlation_data =
+        bpf_map_lookup_elem(&kafka_ongoing_requests, &pid_conn->conn);
+
+    // lb_res_bytes > 0 means we already captured the first chunk of this response
+    // and are mid-capture, so keep appending even if the correlation entry was
+    // evicted from the LRU map in the meantime.
+    const bool capture_in_progress = req->lb_res_bytes > 0;
+
+    if (!correlation_data && !capture_in_progress) {
+        bpf_dbg_printk("no ongoing request found for this response");
+        return 0;
+    }
+
+    const kafka_state_key_t state_key = {.conn = pid_conn->conn, .direction = direction};
+    const kafka_state_data_t *state_data = bpf_map_lookup_elem(&kafka_state, &state_key);
+
+    // message_size arrived split from the rest of the response and was stashed in
+    // kafka_state: u_buf starts at the correlation_id and we synthesize the
+    // message_size prefix below.
+    const bool msg_size_from_state =
+        state_data && state_data->message_size > 0 && (u32)state_data->message_size == bytes_len;
+
+    if (!capture_in_progress) {
+        // First chunk of the response: validate it against the pending request.
+        if (!correlation_data) {
+            return 0;
+        }
+        const s32 correlation_id = kafka_read_response_correlation_id(state_data, u_buf, bytes_len);
+        if (correlation_id != correlation_data->correlation_id) {
+            bpf_dbg_printk("request correlation_id != response "
+                           "correlation_id, %d != %d. Ignoring...",
+                           correlation_data->correlation_id,
+                           correlation_id);
+            return 0;
+        }
+    }
+
+    // Total wire bytes to capture (message_size field + its value), read once on
+    // the first chunk; later chunks rely on the stored remaining counter.
+    s32 response_total_bytes = 0;
+    if (!capture_in_progress) {
+        s32 message_size = 0;
+        if (msg_size_from_state) {
+            message_size = state_data->message_size;
+        } else if (bytes_len >= k_kafka_hdr_message_size) {
+            bpf_probe_read(&message_size, k_kafka_hdr_message_size, u_buf);
+            message_size = bpf_ntohl(message_size);
+        }
+        if (message_size > 0) {
+            response_total_bytes = message_size + k_kafka_hdr_message_size;
+        }
+        bpf_dbg_printk("kafka response capture start, target=%d bytes_len=%d",
+                       response_total_bytes,
+                       bytes_len);
+    }
+
+    tcp_large_buffer_t *lb = (tcp_large_buffer_t *)tcp_large_buffers_mem();
+
+    if (!lb) {
+        bpf_dbg_printk("failed to reserve space for Kafka large buffer");
+        return 0;
+    }
+
+    lb->type = EVENT_TCP_LARGE_BUFFER;
+    lb->packet_type = PACKET_TYPE_RESPONSE;
+    lb->action = action;
+    lb->kind = k_large_buf_layer_app;
+    lb->direction = direction;
+    lb->conn_info = pid_conn->conn;
+    lb->tp = req->tp;
+    lb->source = k_large_buffer_source_kprobes;
+
+    u32 max_available_bytes = kafka_max_captured_bytes - req->lb_res_bytes;
+    u32 consumed_bytes = 0;
+
+    if (msg_size_from_state) {
+        bpf_map_delete_elem(&kafka_state, &state_key);
+
+        if (max_available_bytes < k_kafka_hdr_message_size) {
+            bpf_dbg_printk("kafka_send_large_buffer: not enough space for state data");
+            return 0;
+        }
+
+        const s32 message_size_be = bpf_htonl(state_data->message_size);
+
+        _Static_assert(k_kafka_hdr_message_size < sizeof(void *),
+                       "total_size needs to be adjusted");
+
+        __builtin_memcpy(lb->buf, &message_size_be, k_kafka_hdr_message_size);
+        lb->len = k_kafka_hdr_message_size;
+
+        const u32 total_size = sizeof(tcp_large_buffer_t) + sizeof(void *);
+        bpf_ringbuf_output(&events, lb, total_size, get_flags());
+
+        max_available_bytes -= k_kafka_hdr_message_size;
+        consumed_bytes += k_kafka_hdr_message_size;
+        lb->action = k_large_buf_action_append;
+    }
+
+    bpf_clamp_umax(max_available_bytes, k_large_buf_max_kafka_captured_bytes);
+
+    const u32 available_bytes = min(bytes_len, max_available_bytes);
+    consumed_bytes += large_buf_emit_chunks(lb, u_buf, available_bytes, k_large_buf_read_kernel);
+
+    req->lb_res_bytes += consumed_bytes;
+
+    if (consumed_bytes > 0) {
+        req->has_large_buffers = true;
+    }
+
+    s32 remaining;
+    if (!capture_in_progress) {
+        remaining = response_total_bytes - (s32)req->lb_res_bytes;
+    } else {
+        // If the entry was LRU-evicted mid-capture, correlation_data is NULL and
+        // remaining goes negative -> we finalize below (possibly truncated) rather
+        // than never completing the response.
+        remaining = (correlation_data ? correlation_data->response_bytes_remaining : 0) -
+                    (s32)consumed_bytes;
+    }
+
+    if (req->lb_res_bytes >= kafka_max_captured_bytes) {
+        remaining = 0;
+    }
+
+    if (remaining > 0) {
+        if (correlation_data) {
+            correlation_data->response_bytes_remaining = remaining;
+        }
+        bpf_dbg_printk("kafka response incomplete, captured=%d remaining=%d, waiting for more",
+                       req->lb_res_bytes,
+                       remaining);
+        return -1;
+    }
+
+    bpf_dbg_printk("kafka response fully captured, res_bytes=%d", req->lb_res_bytes);
+    bpf_map_delete_elem(&kafka_ongoing_requests, &pid_conn->conn);
+    return 0;
+}
+
+// This function first checks whether the received event hasn't already been classified as Kafka;
+// it then attempts to save the data in a map if and only if it's a 4 byte packet (we're interested
+// in the message_size field). If the event is of interest to us, we try to parse it as if it were
+// a request, because the sequence of bytes that characterizes a request is better than a response;
+// if that fails, we try parsing it as a response.
+// If we find a request, we save it in an ongoing request map.
+// If we find a response (or at least something that looks like a response from the bytes),
+// we need to perform a further check: see if we have an ongoing request related to this response
+// using the correlation_id.
+// In both cases, if we found a Kafka packet, we update the protocol_cache map and return.
+static __always_inline u8 is_kafka(connection_info_t *conn_info,
+                                   const unsigned char *data,
+                                   u32 data_len,
+                                   enum protocol_type *protocol_type,
+                                   u8 direction) {
+    if (*protocol_type != k_protocol_type_kafka && *protocol_type != k_protocol_type_unknown) {
+        // Already classified, not kafka.
+        return 0;
+    }
+
+    if (kafka_store_state_data(conn_info, data, (size_t)data_len, direction) < 0) {
+        bpf_dbg_printk("4 bytes packet, storing state data");
+        return 0;
+    }
+
+    struct kafka_request_hdr req_hdr = {};
+    struct kafka_response_hdr res_hdr = {};
+    if (kafka_parse_fixup_request_header(conn_info, &req_hdr, data, data_len, direction) == 0) {
+        kafka_correlation_data_t correlation_data = {};
+        correlation_data.correlation_id = req_hdr.correlation_id;
+        bpf_map_update_elem(&kafka_ongoing_requests, conn_info, &correlation_data, BPF_ANY);
+        bpf_dbg_printk("kafka! request_api_key %d, correlation_id=%d",
+                       req_hdr.request_api_key,
+                       req_hdr.correlation_id);
+    } else {
+        if (kafka_parse_fixup_response_header(conn_info, &res_hdr, data, data_len, direction) !=
+            0) {
+            bpf_dbg_printk("failed to parse kafka response header");
+            return 0;
+        }
+
+        kafka_correlation_data_t *correlation_data =
+            bpf_map_lookup_elem(&kafka_ongoing_requests, conn_info);
+        if (!correlation_data) {
+            bpf_dbg_printk("no ongoing request found for this response");
+            return 0;
+        }
+
+        if (res_hdr.correlation_id != correlation_data->correlation_id) {
+            bpf_dbg_printk("request correlation_id != response "
+                           "correlation_id, %d != %d. Ignoring...",
+                           correlation_data->correlation_id,
+                           res_hdr.correlation_id);
+            return 0;
+        }
+
+        bpf_dbg_printk("kafka! message_size %d, correlation_id=%d",
+                       res_hdr.message_size,
+                       res_hdr.correlation_id);
+    }
+    *protocol_type = k_protocol_type_kafka;
+    bpf_map_update_elem(&protocol_cache, conn_info, protocol_type, BPF_ANY);
+    return 1;
+}

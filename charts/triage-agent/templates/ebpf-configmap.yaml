@@ -1,0 +1,203 @@
+{{- $ebpf := .Values.ebpf | default dict }}
+{{- $networkFlows := $ebpf.networkFlows | default dict }}
+{{- if $ebpf.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "triage-agent.fullname" . }}-ebpf
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "triage-agent.labels" . | nindent 4 }}
+data:
+  triage-ebpf-config.yml: |
+    # Application-mode eBPF instrumentation (docs/adr/0009-red-metrics-beyla.md):
+    # per-service HTTP RED metrics with zero code changes. Unlike network mode
+    # (hack/servicemap-collector in the core repo, a one-shot traffic
+    # capture), application mode hooks into each process's userspace HTTP
+    # handling via uprobes, which is why the DaemonSet needs hostPID (see
+    # ebpf-daemonset.yaml) to reach every other container's process on the
+    # node, not just its own.
+    discovery:
+      instrument:
+        {{- if $ebpf.includeNamespaces }}
+        {{- /* Allowlist mode: instrument only the named namespaces. exclude_instrument
+               below is irrelevant here — nothing outside the list is selected at all. */}}
+        {{- range $ebpf.includeNamespaces }}
+        - k8s_namespace: "{{ . }}"
+        {{- end }}
+        {{- else if $ebpf.instrumentNamespaces }}
+        {{- /* AUDIT.md finding 1: an explicit allowlist. Plain names, NOT ^ns$
+               anchors: discovery.instrument matches k8s_namespace as a GLOB
+               (verified live 2026-08-22: anchored entries match nothing and
+               OBI instruments zero processes; the regex semantics the
+               anchoring assumed belong to the deprecated discovery.services
+               block). A bare glob with no wildcard is an exact match, so the
+               substring concern the anchors addressed does not exist here. */}}
+        {{- range $ebpf.instrumentNamespaces }}
+        - k8s_namespace: "{{ . }}"
+        {{- end }}
+        {{- else if .Values.target.namespaces }}
+        {{- /* No explicit allowlist configured — derive one from target.namespaces
+               instead of defaulting to "*". We only observe what's listed there, so
+               instrumenting anything wider is pure risk with no observability
+               benefit: nothing outside that set ever reaches the triage agent.
+               Plain names for the same glob-semantics reason as above. */}}
+        {{- range .Values.target.namespaces }}
+        {{- $ns := trim . }}
+        {{- if $ns }}
+        - k8s_namespace: "{{ $ns }}"
+        {{- end }}
+        {{- end }}
+        {{- else }}
+        # The bare wildcard means "follow the triageagent.dev/tenant
+        # annotations live" (superviseInstrumenter), not "instrument every
+        # namespace". Naming namespaces here instead pins the scope and
+        # stops the watch.
+        - k8s_namespace: "*"
+        {{- end }}
+      {{- $exclNS := list }}
+      {{- if and (not $ebpf.includeNamespaces) (not $ebpf.instrumentNamespaces) (not .Values.target.namespaces) }}
+      {{- $exclNS = $ebpf.excludeNamespaces | default list }}
+      {{- end }}
+      {{- $exclWl := $ebpf.excludeWorkloads | default list }}
+      {{- $exclPath := $ebpf.excludePaths | default list }}
+      exclude_instrument:
+        {{- /* ALWAYS rendered: the triageagent.dev/* annotation contract
+               reaches the eBPF layer too. A POD (template) annotated
+               `triageagent.dev/instrument: "false"` is never instrumented.
+               Opt-out, owner-controlled, no chart change per workload. NOTE:
+               must be a pod-template annotation, workload
+               metadata.annotations do not reach the pod and are not seen by
+               this selector. */}}
+        - k8s_pod_annotations:
+            triageagent.dev/instrument: "false"
+        {{- /* triageagent.dev/triage: "false" takes a workload out of
+               triage entirely and implies instrument "false". A separate
+               entry, not a second key in the map above: every key of one
+               k8s_pod_annotations map must match. Like instrument, OBI sees
+               only the POD's annotations, so here it acts on the pod-template
+               form; the workload-metadata and Namespace forms are dropped by
+               the controller (push/exclusion.go) and the Namespace form also
+               removes the namespace from the instrumented set. */}}
+        - k8s_pod_annotations:
+            triageagent.dev/triage: "false"
+        {{- range $exclPath }}
+        {{- /* Executable-path glob, e.g. "*ms-playwright*": excludes by the
+               BINARY being run, whatever workload spawns it — the right tool
+               for embedded test browsers/ffmpeg that appear across workloads. */}}
+        - exe_path: "{{ . }}"
+        {{- end }}
+        {{- range $exclNS }}
+        - k8s_namespace: "{{ . }}"
+        {{- end }}
+        {{- range $exclWl }}
+        {{- /* Owner-name glob (Deployment/StatefulSet/DaemonSet name), e.g.
+               "*synthetic*": drops workloads whose short-lived process churn
+               (playwright browsers, ffmpeg) burns CPU/memory for unread RED
+               metrics. */}}
+        - k8s_owner_name: "{{ . }}"
+        {{- end }}
+      exclude_otel_instrumented_services: {{ $ebpf.excludeOtelInstrumentedServices }}
+
+    # Resolves each instrumented process's pod to its namespace/service identity,
+    # which is what lands on every metric as k8s_namespace_name/service_name (the
+    # redMetrics.namespaceLabel/serviceLabel defaults below).
+    #
+    # meta_restrict_local_node: node-local (OBI's own default is cluster-wide)
+    # is enough when ebpf.networkFlows.enabled is false — our application-mode
+    # RED metrics only decorate with the LOCAL instrumented pod's identity, and
+    # RED-derived topology edges come from address text, not from OBI's
+    # destination metadata. Network flows are different: OBI decorates L4 flow
+    # peers from its OWN pod metadata, so a node-restricted informer never
+    # resolves a peer pod on another node — that edge is dropped rather than
+    # named. So this renders `false` (cluster-wide) whenever networkFlows is
+    # enabled, and `true` (node-local) otherwise, UNLESS
+    # ebpf.metaRestrictLocalNode is set explicitly (hasKey, not `default`, so
+    # the key's mere presence decides — an explicit `false` must survive too),
+    # in which case the explicit value wins over either default. The node
+    # informer stays disabled either way (nothing this chart renders reads
+    # node metadata; the pods informer itself cannot be disabled). A
+    # cluster-wide informer's memory cost scales with total cluster pod count,
+    # not with what this DaemonSet instruments — size
+    # ebpf.resources.limits.memory accordingly on large clusters.
+    attributes:
+      kubernetes:
+        enable: true
+        meta_restrict_local_node: {{ if hasKey $ebpf "metaRestrictLocalNode" }}{{ $ebpf.metaRestrictLocalNode }}{{ else if $networkFlows.enabled }}false{{ else }}true{{ end }}
+        {{- $di := $ebpf.disableInformers | default (list "node") }}
+        {{- if $di }}
+        disable_informers: [{{ range $i, $v := $di }}{{ if $i }}, {{ end }}{{ $v }}{{ end }}]
+        {{- end }}
+      {{- if $networkFlows.enabled }}
+      {{- /* k8s owner attributes + direction for obi_network_flow_bytes_total are
+             already default-enabled once kubernetes.enable is true above
+             (third_party/obi/pkg/export/attributes/attr_defs.go's
+             networkKubeAttributes/networkAttributes groups, verified against the
+             vendored OBI in the agent repo) — selected explicitly anyway,
+             against future OBI attribute-default drift. Sibling of `kubernetes:`
+             above, NOT a second top-level `attributes:` key: a duplicate top-level
+             key is silently resolved to whichever the YAML parser sees LAST,
+             dropping the other one entirely. */}}
+      select:
+        obi.network.flow:
+          include:
+            - k8s.src.owner.name
+            - k8s.src.namespace
+            - k8s.src.owner.type
+            - k8s.dst.owner.name
+            - k8s.dst.namespace
+            - k8s.dst.owner.type
+            - direction
+      {{- end }}
+
+    # sources: [k8s] is already OBI's own default (verified against the
+    # vendored copy in the agent repo) — made explicit here for the same
+    # future-version-safety reason as attributes.select above: rewrites an
+    # unresolved client-span server.address IP to a k8s Service name where the
+    # k8s informer can attribute one. Not relied on for correctness — the
+    # controller's own ClusterIP index resolves a raw IP address
+    # independently regardless (agent repo's
+    # docs/todo/service-graph-from-obi.md).
+    name_resolver:
+      sources: [k8s]
+
+    {{- if $networkFlows.enabled }}
+    # L4 network-flow edges (agent repo's docs/todo/service-graph-from-obi.md).
+    # This is OBI's DEPRECATED `network:` toggle, used deliberately: it ORs
+    # onto whatever metrics.features already is (the compiled-in default RED
+    # feature) rather than replacing it, so enabling this can never silently
+    # turn RED metrics off. The non-deprecated replacement (metrics.features)
+    # replaces the feature list instead of adding to it, so switching to it
+    # would need every feature restated here and risks silently dropping RED
+    # metrics on a values change that only meant to add flows. socket_filter
+    # needs no extra capability beyond what this DaemonSet's containers
+    # already carry; it DOES need the host
+    # network namespace — see ebpf.networkFlows' values.yaml comment for what
+    # that implies for this pod.
+    network:
+      enable: true
+      source: socket_filter
+      # A connection open before this DaemonSet pod started has no observed
+      # SYN, so OBI cannot tell the initiator; the ordinal guess (highest
+      # port = client) resolves its direction instead of leaving it unknown.
+      guess_ports: ordinal
+    {{- end }}
+
+    # The heuristic matcher (OBI's default) keeps an unmatched path's static
+    # segments and collapses the ones it recognises as IDs to "*", so each HTTP
+    # operation gets its own series. It reduces http.route cardinality but does
+    # not bound it: a segment it does not recognise as an ID stays, one route
+    # per value. The bound is on the controller: it tracks at most
+    # redMetrics.baseline.maxOperations operations per service and judges the
+    # rest together. The earlier wildcard folded every route into "/**", which
+    # hid a slow or failing minority route from the per-operation baseline arms
+    # (docs/todo/baseline-gates.md). See docs/adr/0009-red-metrics-beyla.md.
+    routes:
+      unmatched: heuristic
+
+    # Exported in process to the sensor stream as OTLP
+    # (docs/adr/0015-sensor-stream-grpc.md); nothing listens. The interval is
+    # how often OBI hands the sensor a fresh cumulative snapshot.
+    otel_metrics_export:
+      interval: 15s
+{{- end }}

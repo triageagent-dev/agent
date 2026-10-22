@@ -1,0 +1,156 @@
+{{- if include "triage-agent.sensorStream" . }}
+{{- /* Sensor stream (docs/adr/0015-sensor-stream-grpc.md): the sensors of the
+       eBPF DaemonSet dial the controller over gRPC with TLS the controller
+       manages itself. The Secret and ConfigMap are created empty: the
+       controller writes its self-signed certificate into the Secret and
+       publishes the certificate in the ConfigMap for the sensors to pin.
+       Neither has a data field here, so a helm upgrade leaves what the
+       controller wrote in place. */}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "triage-agent.fullname" . }}-sensors
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "triage-agent.labels" . | nindent 4 }}
+spec:
+  selector:
+    {{- include "triage-agent.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: sensor-stream
+      port: {{ include "triage-agent.sensorStreamPort" . }}
+      targetPort: sensor-stream
+      protocol: TCP
+    {{- if and (include "triage-agent.otlp" .) (not (include "triage-agent.otlpSensor" .)) }}
+    - name: otlp-grpc
+      port: {{ include "triage-agent.otlpPort" . }}
+      targetPort: otlp-grpc
+      protocol: TCP
+      appProtocol: grpc
+    {{- end }}
+---
+{{- /* Replica gossip (ADR-0015 phase 4): the headless Service's DNS name
+       resolves to every controller pod, which is how a replica finds its
+       peers without API access. Not-ready pods are listed too, so a
+       starting replica receives the others' state before it is ready. It
+       renders with one replica as well: during a rollout the old and the
+       new pod gossip, so the new leader takes over with every node. */}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "triage-agent.fullname" . }}-peers
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "triage-agent.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    {{- include "triage-agent.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: mesh
+      port: {{ include "triage-agent.meshPort" . }}
+      targetPort: mesh
+      protocol: TCP
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ include "triage-agent.fullname" . }}-sensor-tls
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "triage-agent.labels" . | nindent 4 }}
+type: Opaque
+{{- if and (include "triage-agent.otlp" .) .Values.otlp.ownCA }}
+---
+{{- /* The agent's own client CA for remote OTLP senders: created empty, the
+       controller writes the CA on first use (ca.crt, ca.key). */}}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ include "triage-agent.fullname" . }}-otlp-client-ca
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "triage-agent.labels" . | nindent 4 }}
+type: Opaque
+{{- end }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "triage-agent.fullname" . }}-sensor-ca
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "triage-agent.labels" . | nindent 4 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "triage-agent.fullname" . }}-sensor-stream
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "triage-agent.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: [{{ printf "%s-sensor-tls" (include "triage-agent.fullname" .) | quote }}{{ if and (include "triage-agent.otlp" .) .Values.otlp.ownCA }}, {{ printf "%s-otlp-client-ca" (include "triage-agent.fullname" .) | quote }}{{ end }}]
+    verbs: ["get", "update"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: [{{ printf "%s-sensor-ca" (include "triage-agent.fullname" .) | quote }}]
+    verbs: ["get", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "triage-agent.fullname" . }}-sensor-stream
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "triage-agent.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "triage-agent.fullname" . }}-sensor-stream
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "triage-agent.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- if include "triage-agent.tokenReview" . }}
+---
+{{- /* The controller checks each sensor's projected token with a
+       TokenReview. Rendered only when a token authenticates something: the
+       eBPF DaemonSet roles, or OTLP senders named in
+       otlp.allowedServiceAccounts. Client-certificate senders need none. */}}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "triage-agent.fullname" . }}-sensor-tokenreview
+  labels:
+    {{- include "triage-agent.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["authentication.k8s.io"]
+    resources: ["tokenreviews"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "triage-agent.fullname" . }}-sensor-tokenreview
+  labels:
+    {{- include "triage-agent.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "triage-agent.fullname" . }}-sensor-tokenreview
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "triage-agent.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+  {{- if and (include "triage-agent.otlpSensor" .) (.Values.otlp.allowedServiceAccounts) }}
+  {{- /* The otlp sensor pods check token senders themselves. */}}
+  - kind: ServiceAccount
+    name: {{ include "triage-agent.fullname" . }}-otlp
+    namespace: {{ .Release.Namespace }}
+  {{- end }}
+{{- end }}
+{{- end }}

@@ -1,0 +1,118 @@
+# promevents in the core's namespace. Its ServiceAccount token (audience
+# triage-core) authenticates to the events server through TokenReview; the
+# Role grants `ingest` on each tenant it posts for. Set the image, the events
+# URL and NAMESPACE_TENANTS for your install.
+#
+# /alertmanager requires a bearer token, read from the Secret
+# triage-promevents-webhook (key `token`). Create it before applying this, and give
+# the same token to Alertmanager (http_config.authorization), see README.md:
+#   kubectl -n triage create secret generic triage-promevents-webhook \
+#     --from-literal=token="$(openssl rand -hex 32)"
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: triage-promevents
+  namespace: triage
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: triage-promevents-ingest
+  namespace: triage
+rules:
+  - apiGroups: ["triageagent.dev"]
+    resources: ["tenants"]
+    resourceNames: ["tenant-a"]
+    verbs: ["ingest"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: triage-promevents-ingest
+  namespace: triage
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: triage-promevents-ingest
+subjects:
+  - kind: ServiceAccount
+    name: triage-promevents
+    namespace: triage
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: triage-promevents
+  namespace: triage
+  labels:
+    app.kubernetes.io/name: triage-promevents
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: triage-promevents
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: triage-promevents
+    spec:
+      serviceAccountName: triage-promevents
+      automountServiceAccountToken: false
+      imagePullSecrets:
+        - name: triage-ghcr-pull
+      containers:
+        - name: promevents
+          image: ghcr.io/triageagent-dev/promevents:latest
+          env:
+            - name: TRIAGE_EVENTS_URL
+              value: http://triage-core-events.triage.svc.cluster.local:8086
+            - name: TRIAGE_TOKEN_FILE
+              value: /var/run/secrets/triage/token
+            - name: NAMESPACE_TENANTS
+              value: app-ns=tenant-a
+            - name: WEBHOOK_TOKEN_FILE
+              value: /var/run/secrets/webhook/token
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            httpGet: { path: /healthz, port: http }
+          resources:
+            requests: { cpu: 10m, memory: 16Mi }
+            limits: { memory: 64Mi }
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: [ALL] }
+          volumeMounts:
+            - name: triage-token
+              mountPath: /var/run/secrets/triage
+              readOnly: true
+            - name: webhook-token
+              mountPath: /var/run/secrets/webhook
+              readOnly: true
+      volumes:
+        - name: webhook-token
+          secret:
+            secretName: triage-promevents-webhook
+        - name: triage-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  audience: triage-core
+                  expirationSeconds: 3600
+                  path: token
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: triage-promevents
+  namespace: triage
+spec:
+  selector:
+    app.kubernetes.io/name: triage-promevents
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http

@@ -1,0 +1,40 @@
+# golangci-lint v2 configuration.
+#
+# The linter itself was pinned at v1.23.6 (2020) until 2026-08-21, which could not
+# read Go 1.26 export data and failed on every package — `make lint` and `make all`
+# were dead. Bumping it surfaced a backlog; the trivial findings were fixed, and the
+# two families below are genuine deferred work, named here rather than left to fail
+# the build or be silently dropped from the linter set.
+version: "2"
+
+linters:
+  settings:
+    staticcheck:
+      # This is golangci-lint's DEFAULT staticcheck set (all minus the ST* naming
+      # and comment checks) with one subtraction. Spelling it out is necessary
+      # because naming `checks` at all replaces the default rather than extending
+      # it — a bare `- all` silently switches on the whole ST* family.
+      checks:
+        - all
+        - "-ST1000"
+        - "-ST1003"
+        - "-ST1016"
+        - "-ST1020"
+        - "-ST1021"
+        - "-ST1022"
+        # QF1008 wants embedded fields dropped from selectors (r.Client.List ->
+        # r.List, app.Status.ComponentList.Objects -> app.Status.Objects). The
+        # explicit form is deliberate here: it says which embedded type owns the
+        # call, which matters in a reconciler that embeds client.Client and a
+        # status struct that inlines ComponentList.
+        - "-QF1008"
+
+  exclusions:
+    rules:
+      # corev1.Endpoints / EndpointSubset are deprecated in favour of
+      # discoveryv1.EndpointSlice. The collectors discover scrape targets through
+      # Endpoints; moving them to EndpointSlice is a behavioural change to target
+      # discovery that needs its own change and its own testing, not a drive-by fix
+      # bundled into an unrelated commit.
+      - linters: [staticcheck]
+        text: "SA1019.*(Endpoints|EndpointSubset) is deprecated"

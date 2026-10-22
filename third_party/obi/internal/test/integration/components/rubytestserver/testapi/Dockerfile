@@ -1,0 +1,31 @@
+FROM ruby:4.0.1@sha256:66302616aabd939350e9bd7bc31ccad5ef993a5ba5e93f0cc029bb82e80a8d3b AS builder
+
+# Set the working directory to /build
+WORKDIR /build
+
+ENV BUNDLE_PATH=/usr/local/bundle
+
+# Copy the source code into the image for building
+COPY internal/test/integration/components/rubytestserver/testapi .
+
+RUN gem update --system
+RUN gem install bundler -v 4.0.7
+RUN bundle install
+RUN bundle binstubs railties
+RUN bundle exec rake db:migrate
+
+FROM ruby:4.0.1-slim@sha256:f3207b8383a8ed08a043e960984b756a957f05217f1724f9001712696bfaea88
+
+RUN gem update --system
+
+WORKDIR /build
+
+ENV BUNDLE_PATH=/usr/local/bundle
+
+COPY --from=builder /build .
+COPY --from=builder /usr/local/bundle /usr/local/bundle
+
+EXPOSE 3040
+
+# Run the node app
+CMD [ "bundle", "exec", "rails", "server", "-p", "3040", "-b", "0.0.0.0" ]

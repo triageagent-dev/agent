@@ -1,0 +1,300 @@
+{{- /* Nil-safe: `helm upgrade --reuse-values` renders with the PREVIOUS release's
+       values only — a brand-new top-level key like logExporter is entirely absent
+       from that stored object, so a bare .Values.logExporter.enabled nil-derefs the
+       render on exactly that upgrade path (same reasoning as deployment.yaml's
+       $redSource guard). .Values.useMetrics is NOT re-guarded here — it predates
+       this key and every real upgrade already carries it. */}}
+{{- $logExporter := .Values.logExporter | default dict }}
+{{- $ebpf := .Values.ebpf | default dict }}
+{{- /* Nil-safe for the same --reuse-values reason as $logExporter above —
+       networkFlows is a brand-new sub-key of ebpf, absent from a release's
+       previously-stored values on that upgrade path. */}}
+{{- $networkFlows := $ebpf.networkFlows | default dict }}
+{{- /* Renders whenever ANY of ebpf / useMetrics / logExporter is enabled
+       (docs/adr/0013-red-source-profiles.md, docs/adr/0014-log-exporter-in-agent-
+       ds.md): the node-exporter (USE metrics) and log-exporter (log metrics)
+       containers each need a DaemonSet pod to run on, independent of whether the
+       eBPF instrumentation itself is running: a cluster on the hubble
+       redSource profile (ebpf.enabled=false) still wants USE/log metrics. The
+       ebpf container, hostPID, and every ebpf-only volume below are
+       separately gated on $ebpf.enabled so a useMetrics/logExporter-only
+       render carries none of them. */}}
+{{- if or $ebpf.enabled (include "triage-agent.nodeExporter" .) $logExporter.enabled }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "triage-agent.fullname" . }}-ebpf
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "triage-agent.labels" . | nindent 4 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "triage-agent.fullname" . }}-ebpf
+  labels:
+    {{- include "triage-agent.labels" . | nindent 4 }}
+rules:
+  # Shared by every container this ClusterRole's ServiceAccount may run
+  # (ebpf.enabled and/or useMetrics.enabled and/or logExporter.enabled, see the
+  # top-level gate above): OBI's kubernetes attribute decorator resolves an
+  # instrumented process's pod to its owning workload (via ReplicaSet, for
+  # Deployments) and Service, so a RED metric gets k8s_namespace_name/service_name
+  # instead of a bare, meaningless pod IP; the node-exporter container's pod
+  # informer (nodeexporter/exporter.go) resolves each local pod's cgroup path to
+  # the same namespace/service identity; the log-exporter container's pod informer
+  # (logexporter/exporter.go, docs/adr/0014-log-exporter-in-agent-ds.md) resolves
+  # each discovered container-log file's (namespace, pod) to a service label the
+  # same way. This "pods" get/list/watch grant already covers the log-exporter
+  # container's need in full — no new rule was added for it. None of the three
+  # ever touch Secrets or ConfigMaps beyond the agent's own triage-ebpf-config ConfigMap
+  # (mounted, not API-read).
+  - apiGroups: [""]
+    resources: ["pods", "services", "nodes"]
+    verbs: ["get", "list", "watch"]
+  # namespaces: the log-exporter container reads container log CONTENT off the
+  # node, so it must know which namespaces carry the triageagent.dev/tenant
+  # annotation. An unannotated namespace is never read. Namespace is
+  # cluster-scoped, so this is one watch on one low-churn resource, not a
+  # per-namespace cost. Without it the exporter cannot tell annotated from
+  # unannotated and fails closed, exporting nothing.
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["replicasets", "deployments", "statefulsets", "daemonsets"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "triage-agent.fullname" . }}-ebpf
+  labels:
+    {{- include "triage-agent.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "triage-agent.fullname" . }}-ebpf
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "triage-agent.fullname" . }}-ebpf
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  {{- /* The -ebpf ServiceAccount is the one the controller accepts sensor
+         stream tokens from (sensor-stream.yaml). */}}
+  name: {{ include "triage-agent.fullname" . }}-ebpf
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "triage-agent.labels" . | nindent 4 }}
+    app.kubernetes.io/component: ebpf
+spec:
+  selector:
+    matchLabels:
+      {{- include "triage-agent.ebpfSelectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: ebpf
+  template:
+    metadata:
+      labels:
+        {{- include "triage-agent.ebpfSelectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: ebpf
+      {{- if $ebpf.enabled }}
+      annotations:
+        # Force a rollout when the eBPF config ConfigMap changes. eBPF-only:
+        # a useMetrics-only pod has no triage-ebpf-config ConfigMap to track.
+        checksum/config: {{ include (print $.Template.BasePath "/ebpf-configmap.yaml") . | sha256sum }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "triage-agent.fullname" . }}-ebpf
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if $ebpf.enabled }}
+      # Application-mode OBI instruments each container's process via eBPF
+      # uprobes into its userspace HTTP handling, which means it has to see every
+      # OTHER container's PIDs on the node, not just its own — hostPID gives it
+      # that view into the shared process namespace. This is the requirement
+      # network mode (hack/servicemap-collector) does NOT have, since network
+      # mode only hooks socket/packet-level eBPF, never a specific process.
+      # There is no scoped-capability substitute for hostPID itself (it is a
+      # pod-level namespace share, not a privilege). See the ebpf container's
+      # own securityContext below for what IS scoped down: eBPF load no longer
+      # requires full `privileged: true` (AUDIT.md finding 1).
+      #
+      # Gated on ebpf.enabled (docs/adr/0013-red-source-profiles.md): the
+      # node-exporter container reads local cgroup files by pod UID and has no
+      # use for the host PID namespace, so a useMetrics-only pod (ebpf.enabled
+      # false, e.g. the hubble redSource profile) runs with NO hostPID at all —
+      # a real hardening win, not just a no-op toggle.
+      hostPID: true
+      {{- end }}
+      {{- if $networkFlows.enabled }}
+      # L4 network-flow edges (ebpf.networkFlows.enabled, agent repo's
+      # docs/todo/service-graph-from-obi.md):
+      # socket_filter captures from the HOST network namespace, not the
+      # pod's — see values.yaml's ebpf.networkFlows comment for what this
+      # implies for every OTHER container/port on this same pod.
+      # dnsPolicy must follow hostNetwork (the default ClusterFirst does not
+      # resolve cluster DNS once the pod shares the host's network
+      # namespace).
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      {{- end }}
+      {{- with $ebpf.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $ebpf.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        {{- /* ONE container running all three roles in one process: the
+               agent binary built with -tags obi, --mode repeated once per
+               role (main.go multi-role dispatch). Carries the ebpf role's
+               securityContext (the superset) and the union of the three
+               roles' mounts. */}}
+        - name: agent
+          {{- /* Same image as the controller: the DaemonSet runs the SAME agent
+                 binary, just with --mode repeated per role. There is only one
+                 image (built with -tags obi), so this is never overridden
+                 separately from image.repository/image.tag. */}}
+          image: {{ include "triage-agent.image" $ | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - --mode=ebpf
+            {{- if include "triage-agent.nodeExporter" . }}
+            - --mode=node-exporter
+            {{- end }}
+            {{- if $logExporter.enabled }}
+            - --mode=log-exporter
+            {{- end }}
+            {{- if include "triage-agent.sensorStream" . }}
+            - --sensor-controller={{ include "triage-agent.fullname" . }}-sensors.{{ .Release.Namespace }}.svc:{{ include "triage-agent.sensorStreamPort" . }}
+            {{- with ($.Values.sensorStream | default dict).tick }}
+            - --sensor-tick={{ . }}
+            {{- end }}
+            {{- end }}
+            {{- if $logExporter.enabled }}
+            {{- $siLogNs := $logExporter.includeNamespaces | default list }}
+            {{- if $siLogNs }}
+            {{- range $siLogNs }}
+            - --log-exporter-include-namespaces={{ . }}
+            {{- end }}
+            {{- else if .Values.target.namespaces }}
+            {{- range .Values.target.namespaces }}
+            - --log-exporter-include-namespaces={{ . }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            {{- /* Config-FILE-driven: discovery/exclude changes are a helm
+                   upgrade, never a rebuild. */}}
+            - name: OBI_CONFIG_PATH
+              value: /etc/obi/config/triage-ebpf-config.yml
+          securityContext:
+            {{- if $ebpf.privileged }}
+            privileged: true
+            readOnlyRootFilesystem: true
+            runAsUser: 0
+            {{- else }}
+            privileged: false
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsUser: 0
+            seccompProfile:
+              type: RuntimeDefault
+            capabilities:
+              drop:
+                - ALL
+              add:
+                - BPF
+                - PERFMON
+                - NET_RAW
+                - SYS_PTRACE
+                - DAC_READ_SEARCH
+                - CHECKPOINT_RESTORE
+                {{- range $ebpf.extraCapabilities }}
+                - {{ . }}
+                {{- end }}
+            {{- end }}
+          resources:
+            {{- toYaml $ebpf.resources | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/obi/config
+              readOnly: true
+            - name: bpffs
+              mountPath: /sys/fs/bpf
+            {{- if include "triage-agent.sensorStream" . }}
+            - name: sensor-token
+              mountPath: /var/run/secrets/triage-sensor
+              readOnly: true
+            - name: sensor-ca
+              mountPath: /etc/triage-sensor
+              readOnly: true
+            {{- end }}
+            {{- if include "triage-agent.nodeExporter" . }}
+            - name: cgroup
+              mountPath: /sys/fs/cgroup
+              readOnly: true
+            {{- end }}
+            {{- if $logExporter.enabled }}
+            - name: varlog
+              mountPath: /var/log
+              readOnly: true
+            {{- end }}
+      volumes:
+        {{- if include "triage-agent.sensorStream" . }}
+        {{- /* The sensor stream (docs/adr/0015-sensor-stream-grpc.md): a
+               projected token for the stream's own audience, and the
+               controller certificate to pin. The ConfigMap is optional so the
+               pod starts before the controller has published it; the sensor
+               retries until it has. */}}
+        - name: sensor-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  audience: triage-agent-sensors
+                  expirationSeconds: 3600
+                  path: token
+        - name: sensor-ca
+          configMap:
+            name: {{ include "triage-agent.fullname" . }}-sensor-ca
+            optional: true
+        {{- end }}
+        {{- if $ebpf.enabled }}
+        - name: config
+          configMap:
+            name: {{ include "triage-agent.fullname" . }}-ebpf
+        - name: bpffs
+          hostPath:
+            path: /sys/fs/bpf
+            type: DirectoryOrCreate
+        {{- end }}
+        {{- if include "triage-agent.nodeExporter" . }}
+        - name: cgroup
+          hostPath:
+            path: /sys/fs/cgroup
+            type: Directory
+        {{- end }}
+        {{- if $logExporter.enabled }}
+        # Read-only into the log-exporter container ONLY (see its volumeMounts
+        # above) — no other container on this pod mounts it.
+        - name: varlog
+          hostPath:
+            path: /var/log
+            type: Directory
+        {{- end }}
+{{- end }}

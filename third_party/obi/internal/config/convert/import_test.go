@@ -1,0 +1,1532 @@
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package convert
+
+import (
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/require"
+	"go.yaml.in/yaml/v3"
+
+	"go.opentelemetry.io/obi/internal/config/schema"
+	"go.opentelemetry.io/obi/pkg/appolly/services"
+	"go.opentelemetry.io/obi/pkg/config"
+	"go.opentelemetry.io/obi/pkg/export"
+	"go.opentelemetry.io/obi/pkg/export/debug"
+	"go.opentelemetry.io/obi/pkg/export/imetrics"
+	"go.opentelemetry.io/obi/pkg/export/instrumentations"
+	"go.opentelemetry.io/obi/pkg/filter"
+	"go.opentelemetry.io/obi/pkg/obi"
+	"go.opentelemetry.io/obi/pkg/transform"
+)
+
+func TestV2ToRuntimeDefaultExportFoundation(t *testing.T) {
+	t.Parallel()
+
+	_, ext := RuntimeToV2(nil)
+
+	got, err := V2ToRuntime(ext)
+	require.NoError(t, err)
+
+	require.Equal(t, obi.DefaultConfig.ChannelBufferLen, got.ChannelBufferLen)
+	require.Equal(t, obi.DefaultConfig.ChannelSendTimeout, got.ChannelSendTimeout)
+	require.Equal(t, obi.DefaultConfig.EnforceSysCaps, got.EnforceSysCaps)
+	require.Equal(t, obi.DefaultConfig.EBPF.WakeupLen, got.EBPF.WakeupLen)
+	require.Equal(t, obi.DefaultConfig.EBPF.BatchLength, got.EBPF.BatchLength)
+	require.Equal(t, obi.DefaultConfig.EBPF.BatchTimeout, got.EBPF.BatchTimeout)
+	require.Equal(t, obi.DefaultConfig.EBPF.ContextPropagation, got.EBPF.ContextPropagation)
+	require.Equal(t, obi.DefaultConfig.EBPF.TCBackend, got.EBPF.TCBackend)
+	require.Equal(t, obi.DefaultConfig.EBPF.ForceBPFMapReader, got.EBPF.ForceBPFMapReader)
+	require.Equal(t, obi.DefaultConfig.EBPF.MapsConfig, got.EBPF.MapsConfig)
+	require.Equal(t, obi.DefaultConfig.EBPF.InstrumentCuda, got.EBPF.InstrumentCuda)
+	require.Equal(t, obi.DefaultConfig.EBPF.LogEnricher.FieldNames, got.EBPF.LogEnricher.FieldNames)
+	require.Equal(t, obi.DefaultConfig.EBPF.LogEnricher.PlainText, got.EBPF.LogEnricher.PlainText)
+	require.Equal(t, obi.DefaultConfig.NetworkFlows.Source, got.NetworkFlows.Source)
+	require.Equal(t, obi.DefaultConfig.NetworkFlows.ExcludeInterfaces, got.NetworkFlows.ExcludeInterfaces)
+	require.Equal(t, obi.DefaultConfig.NodeJS.Enabled, got.NodeJS.Enabled)
+	require.Equal(t, obi.DefaultConfig.Java.Enabled, got.Java.Enabled)
+	require.Equal(t, obi.DefaultConfig.LogLevel, got.LogLevel)
+	require.Equal(t, obi.DefaultConfig.LogFormat, got.LogFormat)
+	require.Equal(t, obi.DefaultConfig.LogConfig, got.LogConfig)
+	require.Equal(t, obi.DefaultConfig.InternalMetrics, got.InternalMetrics)
+	require.Equal(t, export.FeatureApplicationRED, got.Metrics.Features)
+	require.Contains(t, got.Traces.Instrumentations, instrumentations.InstrumentationHTTP)
+	require.Contains(t, got.Traces.Instrumentations, instrumentations.InstrumentationSunRPC)
+	require.NotContains(t, got.Traces.Instrumentations, instrumentations.InstrumentationDNS)
+	require.Contains(t, got.OTELMetrics.Instrumentations, instrumentations.InstrumentationHTTP)
+	require.NotContains(t, got.OTELMetrics.Instrumentations, instrumentations.InstrumentationDNS)
+}
+
+func TestV2ToRuntimeFlowLimitAliases(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name              string
+		networkPackets    int
+		maxTrackedFlows   int
+		wantCacheMaxFlows int
+		wantErr           string
+	}{
+		{
+			name:              "both omitted",
+			wantCacheMaxFlows: obi.DefaultConfig.NetworkFlows.CacheMaxFlows,
+		},
+		{
+			name:              "limits alias only",
+			networkPackets:    71,
+			wantCacheMaxFlows: 71,
+		},
+		{
+			name:              "flow lifecycle alias only",
+			maxTrackedFlows:   72,
+			wantCacheMaxFlows: 72,
+		},
+		{
+			name:              "equal aliases",
+			networkPackets:    73,
+			maxTrackedFlows:   73,
+			wantCacheMaxFlows: 73,
+		},
+		{
+			name:            "divergent aliases",
+			networkPackets:  74,
+			maxTrackedFlows: 75,
+			wantErr: "capture.limits.network_packets (74) must equal " +
+				"capture.network.capture.flow_lifecycle.max_tracked_flows (75): " +
+				"both configure network.cache_max_flows",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			got, err := V2ToRuntime(&schema.Extension{
+				Version: schema.SupportedVersion,
+				Capture: schema.Capture{
+					Limits: schema.CaptureLimits{
+						NetworkPackets: test.networkPackets,
+					},
+					Network: schema.CaptureNetwork{
+						Capture: schema.NetworkCapture{
+							FlowLifecycle: schema.FlowLifecycle{
+								MaxTrackedFlows: test.maxTrackedFlows,
+							},
+						},
+					},
+				},
+			})
+			if test.wantErr != "" {
+				require.EqualError(t, err, test.wantErr)
+				return
+			}
+
+			require.NoError(t, err)
+			require.Equal(t, test.wantCacheMaxFlows, got.NetworkFlows.CacheMaxFlows)
+		})
+	}
+}
+
+func TestV2ToRuntimeParsedFlowLimitAliases(t *testing.T) {
+	t.Parallel()
+
+	_, standalone, err := schema.ParseStandaloneYAML([]byte(`
+file_format: "1.0"
+extensions:
+  obi:
+    version: "2.0"
+    capture:
+      limits:
+        network_packets: 0
+`))
+	require.NoError(t, err)
+	_, err = V2ToRuntime(standalone)
+	require.EqualError(t, err, "capture.limits.network_packets must be greater than zero")
+
+	receiver, err := schema.ParseReceiverYAML([]byte(`
+version: "2.0"
+network:
+  capture:
+    flow_lifecycle:
+      max_tracked_flows: 0
+`))
+	require.NoError(t, err)
+	_, err = V2ToRuntime(receiver)
+	require.EqualError(
+		t,
+		err,
+		"capture.network.capture.flow_lifecycle.max_tracked_flows must be greater than zero",
+	)
+}
+
+func TestV2ToRuntimeRejectsNegativeChannelBufferLength(t *testing.T) {
+	t.Parallel()
+
+	_, err := V2ToRuntime(&schema.Extension{
+		Version: schema.SupportedVersion,
+		Capture: schema.Capture{
+			Channels: schema.CaptureChannels{BufferLen: -1},
+		},
+	})
+	require.EqualError(t, err, "capture.channels.buffer_len must be greater than or equal to zero")
+}
+
+func TestV2ToRuntimeCompleteInstrumentationCanDisableAerospike(t *testing.T) {
+	t.Parallel()
+
+	_, ext := RuntimeToV2(nil)
+	instrumentation := &ext.Capture.Instrumentation
+	require.NotNil(t, instrumentation.Aerospike)
+	instrumentation.HTTP.Enabled.Traces = false
+	instrumentation.GRPC.Enabled.Traces = false
+	instrumentation.SQL.Enabled.Traces = false
+	instrumentation.Redis.Enabled.Traces = false
+	instrumentation.Kafka.Enabled.Traces = false
+	instrumentation.Mongo.Enabled.Traces = false
+	instrumentation.Couchbase.Enabled.Traces = false
+	instrumentation.DNS.Enabled.Traces = false
+	instrumentation.GPU.Enabled.Traces = false
+	instrumentation.Aerospike.Enabled.Traces = false
+	instrumentation.Aerospike.Enabled.Metrics = false
+
+	got, err := V2ToRuntime(ext)
+	require.NoError(t, err)
+
+	require.NotContains(t, got.Traces.Instrumentations, instrumentations.InstrumentationAerospike)
+	require.NotContains(t, got.OTELMetrics.Instrumentations, instrumentations.InstrumentationAerospike)
+	require.NotContains(t, got.Prometheus.Instrumentations, instrumentations.InstrumentationAerospike)
+}
+
+func TestV2ToRuntimePartialInstrumentationCanDisableAerospike(t *testing.T) {
+	t.Parallel()
+
+	got, err := V2ToRuntime(&schema.Extension{
+		Version: schema.SupportedVersion,
+		Capture: schema.Capture{
+			Instrumentation: schema.Instrumentation{
+				Aerospike: &schema.AerospikeInstrumentation{
+					Enabled: schema.ProtocolEnablement{Traces: false, Metrics: false},
+				},
+			},
+		},
+	})
+	require.NoError(t, err)
+
+	require.NotContains(t, got.Traces.Instrumentations, instrumentations.InstrumentationAerospike)
+	require.NotContains(t, got.OTELMetrics.Instrumentations, instrumentations.InstrumentationAerospike)
+	require.NotContains(t, got.Prometheus.Instrumentations, instrumentations.InstrumentationAerospike)
+}
+
+func TestV2ToRuntimePartialAerospikeDefaultsOmittedSignals(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name           string
+		aerospike      string
+		tracesEnabled  bool
+		metricsEnabled bool
+	}{
+		{
+			name:           "empty section",
+			aerospike:      "{}",
+			tracesEnabled:  true,
+			metricsEnabled: true,
+		},
+		{
+			name:           "metrics disabled",
+			aerospike:      "{enabled: {metrics: false}}",
+			tracesEnabled:  true,
+			metricsEnabled: false,
+		},
+		{
+			name:           "both disabled",
+			aerospike:      "{enabled: {traces: false, metrics: false}}",
+			tracesEnabled:  false,
+			metricsEnabled: false,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ext, err := schema.ParseReceiverYAML([]byte("version: \"2.0\"\ninstrumentation:\n  aerospike: " + test.aerospike + "\n"))
+			require.NoError(t, err)
+
+			got, err := V2ToRuntime(ext)
+			require.NoError(t, err)
+
+			require.Equal(t, test.tracesEnabled,
+				instrumentations.NewInstrumentationSelection(got.Traces.Instrumentations).AerospikeEnabled())
+			require.Equal(t, test.metricsEnabled,
+				instrumentations.NewInstrumentationSelection(got.OTELMetrics.Instrumentations).AerospikeEnabled())
+			require.Equal(t, test.metricsEnabled,
+				instrumentations.NewInstrumentationSelection(got.Prometheus.Instrumentations).AerospikeEnabled())
+		})
+	}
+}
+
+func TestV2ToRuntimeCompleteInstrumentationDefaultsMissingAerospike(t *testing.T) {
+	t.Parallel()
+
+	_, ext := RuntimeToV2(nil)
+	ext.Capture.Instrumentation.Aerospike = nil
+	ext.Capture.Instrumentation.HTTP.Enabled.Traces = false
+
+	got, err := V2ToRuntime(ext)
+	require.NoError(t, err)
+
+	require.NotContains(t, got.Traces.Instrumentations, instrumentations.InstrumentationHTTP)
+	require.Contains(t, got.Traces.Instrumentations, instrumentations.InstrumentationAerospike)
+}
+
+func TestV2ToRuntimeCustomFoundation(t *testing.T) {
+	t.Parallel()
+
+	cfg := defaultRuntimeConfig()
+	cfg.ChannelBufferLen = 77
+	cfg.ChannelSendTimeout = 2 * time.Second
+	cfg.ChannelSendTimeoutPanic = true
+	cfg.EnforceSysCaps = true
+
+	cfg.Discovery.PollInterval = 5 * time.Second
+	cfg.Discovery.MinProcessAge = 6 * time.Second
+	cfg.Discovery.BPFPidFilterOff = true
+	cfg.Discovery.SkipGoSpecificTracers = true
+	cfg.NodeJS.Enabled = false
+	cfg.Java.Enabled = false
+	cfg.Java.Debug = true
+	cfg.Java.DebugInstrumentation = true
+	cfg.Java.Timeout = 7 * time.Second
+
+	cfg.EBPF.BpfDebug = true
+	cfg.EBPF.ProtocolDebug = true
+	cfg.EBPF.WakeupLen = 8
+	cfg.EBPF.BatchLength = 9
+	cfg.EBPF.BatchTimeout = 10 * time.Second
+	cfg.EBPF.ContextPropagation = config.ContextPropagationAll
+	cfg.EBPF.OverrideBPFLoopEnabled = true
+	cfg.EBPF.DisableBlackBoxCP = true
+	cfg.EBPF.TCBackend = config.TCBackendTCX
+	cfg.EBPF.HighRequestVolume = true
+	cfg.EBPF.ForceBPFMapReader = config.MapReaderLegacy
+	cfg.EBPF.MapsConfig.GlobalScaleFactor = 2
+	cfg.EBPF.BPFFSPath = "/tmp/bpf"
+	cfg.EBPF.MaxTransactionTime = 11 * time.Second
+	cfg.EBPF.TrackRequestHeaders = true
+	cfg.EBPF.HTTPRequestTimeout = 12 * time.Second
+	cfg.EBPF.BufferSizes.HTTP = 100
+	cfg.EBPF.BufferSizes.MySQL = 101
+	cfg.EBPF.BufferSizes.Postgres = 102
+	cfg.EBPF.BufferSizes.MSSQL = 103
+	cfg.EBPF.BufferSizes.Kafka = 104
+	cfg.EBPF.BufferSizes.TCP = 105
+	cfg.EBPF.BufferSizes.Aerospike = 106
+	cfg.EBPF.HeuristicSQLDetect = true
+	cfg.EBPF.MySQLPreparedStatementsCacheSize = 200
+	cfg.EBPF.PostgresPreparedStatementsCacheSize = 201
+	cfg.EBPF.MSSQLPreparedStatementsCacheSize = 202
+	cfg.EBPF.RedisDBCache.Enabled = true
+	cfg.EBPF.RedisDBCache.MaxSize = 203
+	cfg.EBPF.KafkaTopicUUIDCacheSize = 204
+	cfg.EBPF.MongoRequestsCacheSize = 205
+	cfg.EBPF.CouchbaseDBCacheSize = 206
+	cfg.EBPF.DNSRequestTimeout = 13 * time.Second
+	cfg.EBPF.InstrumentCuda = config.CudaModeOn
+
+	cfg.Traces.ReportersCacheLen = 301
+	cfg.Traces.Instrumentations = []instrumentations.Instrumentation{
+		instrumentations.InstrumentationHTTP,
+		instrumentations.InstrumentationKafka,
+	}
+	cfg.OTELMetrics.ReportersCacheLen = 302
+	cfg.OTELMetrics.MetricsEndpoint = "http://localhost:4318"
+	cfg.OTELMetrics.TTL = 303 * time.Second
+	cfg.OTELMetrics.Instrumentations = []instrumentations.Instrumentation{
+		instrumentations.InstrumentationHTTP,
+	}
+	cfg.Prometheus.Instrumentations = []instrumentations.Instrumentation{
+		instrumentations.InstrumentationRedis,
+		instrumentations.InstrumentationDNS,
+	}
+	cfg.Prometheus.Port = 9090
+	cfg.Metrics.Features = export.FeatureApplicationRED |
+		export.FeatureNetwork |
+		export.FeatureStatsTCPRtt |
+		export.FeatureStatsTCPRetransmits
+
+	cfg.NetworkFlows.Enable = true
+	cfg.NetworkFlows.Source = obi.EbpfSourceTC
+	cfg.NetworkFlows.AgentIP = "192.0.2.1"
+	cfg.NetworkFlows.AgentIPIface = obi.NetworkAgentIPIfaceLocal
+	cfg.NetworkFlows.AgentIPType = "ipv4"
+	cfg.NetworkFlows.Interfaces = []string{"eth0"}
+	cfg.NetworkFlows.ExcludeInterfaces = []string{"lo", "docker0"}
+	cfg.NetworkFlows.Protocols = []string{"tcp"}
+	cfg.NetworkFlows.ExcludeProtocols = []string{"udp"}
+	cfg.NetworkFlows.CacheMaxFlows = 300
+	cfg.NetworkFlows.CacheActiveTimeout = 14 * time.Second
+	cfg.NetworkFlows.Deduper = "none"
+	cfg.NetworkFlows.DeduperFCTTL = 15 * time.Second
+	cfg.NetworkFlows.Direction = "egress"
+	cfg.NetworkFlows.Sampling = 16
+	cfg.NetworkFlows.ListenInterfaces = obi.NetworkListenInterfacesPoll
+	cfg.NetworkFlows.ListenPollPeriod = 17 * time.Second
+	cfg.NetworkFlows.Print = true
+	cfg.Attributes.MetricSpanNameAggregationLimit = 400
+
+	require.NoError(t, yaml.Unmarshal([]byte("- cidr: 192.0.2.0/24\n  name: docs\n"), &cfg.Stats.CIDRs))
+	cfg.Stats.AgentIP = "198.51.100.1"
+	cfg.Stats.AgentIPIface = obi.NetworkAgentIPIfaceLocal
+	cfg.Stats.AgentIPType = "ipv4"
+	cfg.Stats.GeoIP.IPInfo.Path = "/var/lib/stats-ipinfo.mmdb"
+	cfg.Stats.GeoIP.MaxMindInfo.CountryPath = "/var/lib/stats-country.mmdb"
+	cfg.Stats.GeoIP.MaxMindInfo.ASNPath = "/var/lib/stats-asn.mmdb"
+	cfg.Stats.GeoIP.CacheLen = 81
+	cfg.Stats.GeoIP.CacheTTL = 82 * time.Second
+	cfg.Stats.ReverseDNS.Type = "ebpf"
+	cfg.Stats.ReverseDNS.CacheLen = 83
+	cfg.Stats.ReverseDNS.CacheTTL = 84 * time.Second
+	cfg.Stats.Print = true
+	srtt := 1024
+	cfg.Filters.Stats = filter.AttributeFamilyConfig{
+		"srtt": {GreaterThan: &srtt},
+	}
+
+	cfg.NameResolver.Sources = []transform.Source{transform.SourceDNS, transform.SourceK8s}
+	cfg.NameResolver.CacheLen = 501
+	cfg.NameResolver.CacheTTL = 502 * time.Second
+	cfg.Attributes.RenameUnresolvedHosts = "unknown"
+	cfg.Attributes.RenameUnresolvedHostsOutgoing = "unknown-out"
+	cfg.Attributes.RenameUnresolvedHostsIncoming = "unknown-in"
+
+	cfg.EBPF.LogEnricher.Services = []config.LogEnricherServiceConfig{
+		{Service: services.GlobDefinitionCriteria{{Path: services.NewGlob("*")}}},
+	}
+	cfg.EBPF.LogEnricher.CacheTTL = 601 * time.Second
+	cfg.EBPF.LogEnricher.CacheSize = 602
+	cfg.EBPF.LogEnricher.AsyncWriterWorkers = 603
+	cfg.EBPF.LogEnricher.AsyncWriterChannelLen = 604
+	cfg.EBPF.LogEnricher.FieldNames = config.LogEnricherFieldNames{
+		TraceID: "trace.id",
+		SpanID:  "span.id",
+	}
+	cfg.EBPF.LogEnricher.PlainText = config.LogEnricherPlainTextConfig{
+		Enabled:   false,
+		Placement: config.LogEnricherPlacementPrefix,
+		Multiline: config.LogEnricherMultilineEachLine,
+	}
+
+	cfg.LogLevel = obi.LogLevelDebug
+	cfg.LogFormat = obi.LogFormatJSON
+	cfg.LogConfig = obi.LogConfigOptionYAML
+	cfg.TracePrinter = debug.TracePrinterJSON
+	cfg.ProfilePort = 6060
+	cfg.ShutdownTimeout = 18 * time.Second
+	cfg.InternalMetrics.Exporter = imetrics.InternalMetricsExporterPrometheus
+	cfg.InternalMetrics.Prometheus.Port = 9090
+	cfg.InternalMetrics.Prometheus.Path = "/debug/metrics"
+	cfg.InternalMetrics.BpfMetricScrapeInterval = 19 * time.Second
+	cfg.Prometheus.AllowServiceGraphSelfReferences = true
+	cfg.Prometheus.SpanMetricsServiceCacheSize = 701
+	cfg.Prometheus.ExtraResourceLabels = []string{"cloud.region"}
+	cfg.Prometheus.ExtraSpanResourceLabels = []string{"service.version"}
+
+	_, ext := RuntimeToV2(&cfg)
+
+	got, err := V2ToRuntime(ext)
+	require.NoError(t, err)
+
+	require.Equal(t, 77, got.ChannelBufferLen)
+	require.Equal(t, 2*time.Second, got.ChannelSendTimeout)
+	require.True(t, got.ChannelSendTimeoutPanic)
+	require.True(t, got.EnforceSysCaps)
+	require.Equal(t, 5*time.Second, got.Discovery.PollInterval)
+	require.Equal(t, 6*time.Second, got.Discovery.MinProcessAge)
+	require.True(t, got.Discovery.BPFPidFilterOff)
+	require.True(t, got.Discovery.SkipGoSpecificTracers)
+	require.False(t, got.NodeJS.Enabled)
+	require.False(t, got.Java.Enabled)
+	require.True(t, got.Java.DebugInstrumentation)
+	require.Equal(t, 7*time.Second, got.Java.Timeout)
+
+	require.Equal(t, config.ContextPropagationAll, got.EBPF.ContextPropagation)
+	require.Equal(t, config.TCBackendTCX, got.EBPF.TCBackend)
+	require.Equal(t, config.MapReaderLegacy, got.EBPF.ForceBPFMapReader)
+	require.Equal(t, 2, got.EBPF.MapsConfig.GlobalScaleFactor)
+	require.Equal(t, uint32(100), got.EBPF.BufferSizes.HTTP)
+	require.Equal(t, uint32(103), got.EBPF.BufferSizes.MSSQL)
+	require.Equal(t, 202, got.EBPF.MSSQLPreparedStatementsCacheSize)
+	require.Equal(t, config.CudaModeOn, got.EBPF.InstrumentCuda)
+
+	require.Contains(t, got.Traces.Instrumentations, instrumentations.InstrumentationKafka)
+	require.NotContains(t, got.Traces.Instrumentations, instrumentations.InstrumentationRedis)
+	require.Contains(t, got.OTELMetrics.Instrumentations, instrumentations.InstrumentationHTTP)
+	require.NotContains(t, got.OTELMetrics.Instrumentations, instrumentations.InstrumentationKafka)
+	require.Contains(t, got.Prometheus.Instrumentations, instrumentations.InstrumentationDNS)
+	require.Equal(t,
+		export.FeatureApplicationRED|
+			export.FeatureNetwork|
+			export.FeatureStatsTCPRtt|
+			export.FeatureStatsTCPRetransmits,
+		got.Metrics.Features,
+	)
+
+	require.True(t, got.NetworkFlows.Enable)
+	require.Equal(t, obi.EbpfSourceTC, got.NetworkFlows.Source)
+	require.Equal(t, "192.0.2.1", got.NetworkFlows.AgentIP)
+	require.Equal(t, obi.AgentTypeIface(obi.NetworkAgentIPIfaceLocal), got.NetworkFlows.AgentIPIface)
+	require.Equal(t, []string{"eth0"}, got.NetworkFlows.Interfaces)
+	require.Equal(t, []string{"udp"}, got.NetworkFlows.ExcludeProtocols)
+	require.Equal(t, 300, got.NetworkFlows.CacheMaxFlows)
+	require.Equal(t, 14*time.Second, got.NetworkFlows.CacheActiveTimeout)
+	require.Equal(t, "none", got.NetworkFlows.Deduper)
+	require.Equal(t, 15*time.Second, got.NetworkFlows.DeduperFCTTL)
+	require.Equal(t, "egress", got.NetworkFlows.Direction)
+	require.Equal(t, 16, got.NetworkFlows.Sampling)
+	require.True(t, got.NetworkFlows.Print)
+	require.Equal(t, 400, got.Attributes.MetricSpanNameAggregationLimit)
+	require.Equal(t, 301, got.Traces.ReportersCacheLen)
+	require.Equal(t, 302, got.OTELMetrics.ReportersCacheLen)
+	require.Equal(t, 303*time.Second, got.OTELMetrics.TTL)
+
+	require.Equal(t, "198.51.100.1", got.Stats.AgentIP)
+	require.Equal(t, obi.AgentTypeIface(obi.NetworkAgentIPIfaceLocal), got.Stats.AgentIPIface)
+	require.Equal(t, "ipv4", got.Stats.AgentIPType)
+	require.Len(t, got.Stats.CIDRs, 1)
+	require.Equal(t, "192.0.2.0/24", got.Stats.CIDRs[0].CIDR)
+	require.Equal(t, "docs", got.Stats.CIDRs[0].Name)
+	require.Equal(t, filter.MatchDefinition{GreaterThan: &srtt}, got.Filters.Stats["srtt"])
+	require.Equal(t, "/var/lib/stats-ipinfo.mmdb", got.Stats.GeoIP.IPInfo.Path)
+	require.Equal(t, "/var/lib/stats-country.mmdb", got.Stats.GeoIP.MaxMindInfo.CountryPath)
+	require.Equal(t, "/var/lib/stats-asn.mmdb", got.Stats.GeoIP.MaxMindInfo.ASNPath)
+	require.Equal(t, 81, got.Stats.GeoIP.CacheLen)
+	require.Equal(t, 82*time.Second, got.Stats.GeoIP.CacheTTL)
+	require.Equal(t, "ebpf", got.Stats.ReverseDNS.Type)
+	require.Equal(t, 83, got.Stats.ReverseDNS.CacheLen)
+	require.Equal(t, 84*time.Second, got.Stats.ReverseDNS.CacheTTL)
+	require.True(t, got.Stats.Print)
+
+	require.Equal(t, []transform.Source{transform.SourceDNS, transform.SourceK8s}, got.NameResolver.Sources)
+	require.Equal(t, 501, got.NameResolver.CacheLen)
+	require.Equal(t, 502*time.Second, got.NameResolver.CacheTTL)
+	require.Equal(t, "unknown-out", got.Attributes.RenameUnresolvedHostsOutgoing)
+
+	require.True(t, got.EBPF.LogEnricher.Enabled())
+	require.Equal(t, 601*time.Second, got.EBPF.LogEnricher.CacheTTL)
+	require.Equal(t, 602, got.EBPF.LogEnricher.CacheSize)
+	require.Equal(t, 603, got.EBPF.LogEnricher.AsyncWriterWorkers)
+	require.Equal(t, 604, got.EBPF.LogEnricher.AsyncWriterChannelLen)
+	require.Equal(t, cfg.EBPF.LogEnricher.FieldNames, got.EBPF.LogEnricher.FieldNames)
+	require.Equal(t, cfg.EBPF.LogEnricher.PlainText, got.EBPF.LogEnricher.PlainText)
+
+	require.Equal(t, obi.DefaultConfig.LogLevel, got.LogLevel)
+	require.Equal(t, obi.LogFormatJSON, got.LogFormat)
+	require.Equal(t, obi.LogConfigOptionYAML, got.LogConfig)
+	require.Equal(t, debug.TracePrinterJSON, got.TracePrinter)
+	require.Equal(t, 6060, got.ProfilePort)
+	require.Equal(t, 18*time.Second, got.ShutdownTimeout)
+	require.Equal(t, imetrics.InternalMetricsExporterPrometheus, got.InternalMetrics.Exporter)
+	require.Equal(t, 9090, got.InternalMetrics.Prometheus.Port)
+	require.Equal(t, "/debug/metrics", got.InternalMetrics.Prometheus.Path)
+	require.Equal(t, 19*time.Second, got.InternalMetrics.BpfMetricScrapeInterval)
+	require.True(t, got.Prometheus.AllowServiceGraphSelfReferences)
+	require.Equal(t, 701, got.Prometheus.SpanMetricsServiceCacheSize)
+	require.Equal(t, []string{"cloud.region"}, got.Prometheus.ExtraResourceLabels)
+	require.Equal(t, []string{"service.version"}, got.Prometheus.ExtraSpanResourceLabels)
+}
+
+func TestV2ToRuntimeImportsRules(t *testing.T) {
+	t.Parallel()
+
+	openPorts := services.IntEnum{Ranges: []services.IntRange{{Start: 8080}}}
+	incomingPatterns := []string{"/orders/{id}"}
+	outgoingPatterns := []string{"/inventory/{id}"}
+	incomingIgnoredPatterns := []string{"/health"}
+	incomingUnmatched := services.UnmatchPath
+	got, err := V2ToRuntime(&schema.Extension{
+		Version: schema.SupportedVersion,
+		Capture: schema.Capture{
+			Policy: schema.CapturePolicy{
+				DefaultAction: schema.CaptureActionExclude,
+				MatchOrder:    schema.MatchOrderFirstMatchWins,
+			},
+			Rules: []schema.Rule{
+				{
+					Action: schema.CaptureActionExclude,
+					Match: schema.RuleMatch{
+						Process: schema.RuleProcessMatch{
+							ExportsOTLP: &schema.RuleExportsOTLP{Port: 4317, Protocol: "protobuf"},
+						},
+					},
+				},
+				{
+					Action: schema.CaptureActionExclude,
+					Match: schema.RuleMatch{
+						Process: schema.RuleProcessMatch{
+							ExePathGlob: []string{"/usr/bin/*"},
+						},
+						Kubernetes: schema.RuleKubernetesMatch{
+							NamespaceGlob: []string{"kube-*"},
+						},
+					},
+				},
+				{
+					Action: schema.CaptureActionInclude,
+					Match: schema.RuleMatch{
+						Process: schema.RuleProcessMatch{
+							OpenPorts:      &openPorts,
+							TargetPIDs:     []uint32{1234},
+							LanguageGlob:   []string{"go", "python"},
+							CmdArgsGlob:    []string{"serve"},
+							ExePathGlob:    []string{"/srv/*"},
+							ContainersOnly: true,
+						},
+						Kubernetes: schema.RuleKubernetesMatch{
+							NamespaceGlob:  []string{"prod"},
+							MetadataGlob:   map[string][]string{"k8s.deployment.name": {"checkout*"}},
+							PodLabels:      map[string][]string{"app": {"checkout"}},
+							PodAnnotations: map[string][]string{"team": {"payments"}},
+						},
+					},
+					Refine: schema.RuleRefinement{
+						Exports: &schema.ExportModeRefinement{Traces: true, Metrics: false},
+						HTTP: &schema.HTTPRefinement{
+							Routes: schema.HTTPRefinementRoutes{
+								Incoming: &schema.HTTPRoutePolicy{
+									Patterns:        &incomingPatterns,
+									IgnoredPatterns: &incomingIgnoredPatterns,
+									Unmatched:       &incomingUnmatched,
+								},
+								Outgoing: &schema.HTTPRoutePolicy{Patterns: &outgoingPatterns},
+							},
+						},
+					},
+				},
+			},
+		},
+	})
+	require.NoError(t, err)
+	require.NotNil(t, got.Routes)
+	require.NotNil(t, got.Routes.Directional)
+	require.Equal(t, services.UnmatchDefault, got.Routes.Directional.Incoming.Unmatch)
+	require.Equal(t, services.UnmatchDefault, got.Routes.Directional.Outgoing.Unmatch)
+
+	require.Len(t, got.Discovery.Instrument, 1)
+	include := got.Discovery.Instrument[0]
+	require.Equal(t, []uint32{1234}, include.PIDs)
+	require.True(t, include.OpenPorts.Matches(8080))
+	require.Equal(t, "{go,python}", globString(include.Languages))
+	require.Equal(t, "serve", globString(include.CmdArgs))
+	require.Equal(t, "/srv/*", globString(include.Path))
+	require.True(t, include.ContainersOnly)
+	require.Equal(t, "prod", globString(*include.Metadata[services.AttrNamespace]))
+	require.Equal(t, "checkout*", globString(*include.Metadata["k8s.deployment.name"]))
+	require.Equal(t, "checkout", globString(*include.PodLabels["app"]))
+	require.True(t, include.ExportModes.CanExportTraces())
+	require.False(t, include.ExportModes.CanExportMetrics())
+	require.NotNil(t, include.Routes.PolicyOverrides)
+	require.Equal(t, []string{"/orders/{id}"}, *include.Routes.PolicyOverrides.Incoming.Patterns)
+	require.Equal(t, []string{"/health"}, *include.Routes.PolicyOverrides.Incoming.IgnorePatterns)
+	require.Equal(t, services.UnmatchPath, *include.Routes.PolicyOverrides.Incoming.Unmatch)
+	require.Equal(t, []string{"/inventory/{id}"}, *include.Routes.PolicyOverrides.Outgoing.Patterns)
+
+	require.True(t, got.Discovery.ExcludeOTelInstrumentedServices)
+	require.Equal(t, 4317, got.Discovery.DefaultOtlpGRPCPort)
+	require.Equal(
+		t,
+		obi.DefaultConfig.Discovery.ExcludedLinuxSystemPaths,
+		got.Discovery.ExcludedLinuxSystemPaths,
+	)
+	require.Len(t, got.Discovery.ExcludeInstrument, 1)
+	exclude := got.Discovery.ExcludeInstrument[0]
+	require.Equal(t, "/usr/bin/*", globString(exclude.Path))
+	require.Equal(t, "kube-*", globString(*exclude.Metadata[services.AttrNamespace]))
+}
+
+func TestV2ToRuntimeSupportsContainersOnlyRule(t *testing.T) {
+	t.Parallel()
+
+	got, err := V2ToRuntime(&schema.Extension{
+		Version: schema.SupportedVersion,
+		Capture: schema.Capture{
+			Policy: schema.CapturePolicy{DefaultAction: schema.CaptureActionExclude},
+			Rules: []schema.Rule{
+				{
+					Action: schema.CaptureActionInclude,
+					Match: schema.RuleMatch{
+						Process: schema.RuleProcessMatch{ContainersOnly: true},
+					},
+				},
+			},
+		},
+	})
+	require.NoError(t, err)
+	require.NoError(t, got.Discovery.Validate())
+	require.Len(t, got.Discovery.Instrument, 1)
+	require.True(t, got.Discovery.Instrument[0].ContainersOnly)
+}
+
+func TestV2ToRuntimeRejectsUnsupportedExportsOTLPRules(t *testing.T) {
+	t.Parallel()
+
+	for _, rule := range []schema.Rule{
+		{
+			Action: schema.CaptureActionInclude,
+			Match: schema.RuleMatch{Process: schema.RuleProcessMatch{
+				ExportsOTLP: &schema.RuleExportsOTLP{Port: 4317, Protocol: "protobuf"},
+			}},
+		},
+		{
+			Action: schema.CaptureActionExclude,
+			Match: schema.RuleMatch{Process: schema.RuleProcessMatch{
+				ExePathGlob: []string{"/srv/*"},
+				ExportsOTLP: &schema.RuleExportsOTLP{Port: 4317, Protocol: "protobuf"},
+			}},
+		},
+	} {
+		_, err := V2ToRuntime(&schema.Extension{
+			Version: schema.SupportedVersion,
+			Capture: schema.Capture{Rules: []schema.Rule{rule}},
+		})
+		require.ErrorContains(t, err, "capture.rules[0].match.process.exports_otlp")
+	}
+}
+
+func TestV2ToRuntimeRejectsMixedGlobRegexRules(t *testing.T) {
+	t.Parallel()
+
+	_, err := V2ToRuntime(&schema.Extension{
+		Version: schema.SupportedVersion,
+		Capture: schema.Capture{
+			Rules: []schema.Rule{
+				{
+					Action: schema.CaptureActionInclude,
+					Match: schema.RuleMatch{
+						Process: schema.RuleProcessMatch{
+							ExePathGlob: []string{"/srv/*"},
+						},
+						Kubernetes: schema.RuleKubernetesMatch{
+							NamespaceRegex: "prod-.*",
+						},
+					},
+				},
+			},
+		},
+	})
+	require.ErrorContains(t, err, "capture.rules[0].match cannot combine glob and regular-expression selectors")
+}
+
+func TestV2ToRuntimeImportsRegexRules(t *testing.T) {
+	t.Parallel()
+
+	got, err := V2ToRuntime(&schema.Extension{
+		Version: schema.SupportedVersion,
+		Capture: schema.Capture{
+			Policy: schema.CapturePolicy{
+				DefaultAction: schema.CaptureActionExclude,
+				MatchOrder:    schema.MatchOrderFirstMatchWins,
+			},
+			Rules: []schema.Rule{
+				{
+					Action: schema.CaptureActionInclude,
+					Match: schema.RuleMatch{
+						Process: schema.RuleProcessMatch{ExePathRegex: "^/srv/.*"},
+						Kubernetes: schema.RuleKubernetesMatch{
+							NamespaceRegex: "prod-.*",
+						},
+					},
+				},
+			},
+		},
+	})
+	require.NoError(t, err)
+	require.Len(t, got.Discovery.Services, 1)
+	require.Equal(t, "^/srv/.*", regexString(got.Discovery.Services[0].Path))
+	require.Equal(t, "prod-.*", regexString(*got.Discovery.Services[0].Metadata[services.AttrNamespace]))
+}
+
+func TestV2ToRuntimeAddsRegexCatchAll(t *testing.T) {
+	t.Parallel()
+
+	got, err := V2ToRuntime(&schema.Extension{
+		Version: schema.SupportedVersion,
+		Capture: schema.Capture{
+			Policy: schema.CapturePolicy{
+				DefaultAction: schema.CaptureActionInclude,
+				MatchOrder:    schema.MatchOrderFirstMatchWins,
+			},
+			Rules: []schema.Rule{{
+				Action: schema.CaptureActionExclude,
+				Match: schema.RuleMatch{Process: schema.RuleProcessMatch{
+					ExePathRegex: "^/tmp/.*",
+				}},
+			}},
+		},
+	})
+	require.NoError(t, err)
+	require.Len(t, got.Discovery.Services, 1)
+	require.Equal(t, ".*", regexString(got.Discovery.Services[0].Path))
+	require.Len(t, got.Discovery.ExcludeServices, 1)
+}
+
+func TestV2ToRuntimeSupportsLastMatchExclusionPrecedence(t *testing.T) {
+	t.Parallel()
+
+	got, err := V2ToRuntime(&schema.Extension{
+		Version: schema.SupportedVersion,
+		Capture: schema.Capture{
+			Policy: schema.CapturePolicy{
+				DefaultAction: schema.CaptureActionExclude,
+				MatchOrder:    schema.MatchOrderLastMatchWins,
+			},
+			Rules: []schema.Rule{
+				{
+					Action: schema.CaptureActionInclude,
+					Match: schema.RuleMatch{Process: schema.RuleProcessMatch{
+						ExePathGlob: []string{"*"},
+					}},
+				},
+				{
+					Action: schema.CaptureActionExclude,
+					Match: schema.RuleMatch{Process: schema.RuleProcessMatch{
+						ExePathGlob: []string{"/tmp/*"},
+					}},
+				},
+			},
+		},
+	})
+	require.NoError(t, err)
+	require.Len(t, got.Discovery.Instrument, 1)
+	require.Len(t, got.Discovery.ExcludeInstrument, 1)
+}
+
+func TestV2ToRuntimePreservesFirstMatchRefinement(t *testing.T) {
+	t.Parallel()
+
+	got, err := V2ToRuntime(&schema.Extension{
+		Version: schema.SupportedVersion,
+		Capture: schema.Capture{
+			Policy: schema.CapturePolicy{
+				DefaultAction: schema.CaptureActionExclude,
+				MatchOrder:    schema.MatchOrderFirstMatchWins,
+			},
+			Rules: []schema.Rule{
+				{
+					Action: schema.CaptureActionInclude,
+					Match: schema.RuleMatch{Process: schema.RuleProcessMatch{
+						ExePathGlob: []string{"/srv/*"},
+					}},
+					Refine: schema.RuleRefinement{
+						Exports: &schema.ExportModeRefinement{Traces: true},
+						HTTP: &schema.HTTPRefinement{Routes: schema.HTTPRefinementRoutes{
+							Incoming: testHTTPRoutePolicy("/first"),
+						}},
+					},
+				},
+				{
+					Action: schema.CaptureActionInclude,
+					Match: schema.RuleMatch{Process: schema.RuleProcessMatch{
+						ExePathGlob: []string{"*"},
+					}},
+					Refine: schema.RuleRefinement{
+						Exports: &schema.ExportModeRefinement{Metrics: true},
+						HTTP: &schema.HTTPRefinement{Routes: schema.HTTPRefinementRoutes{
+							Incoming: testHTTPRoutePolicy("/second"),
+						}},
+					},
+				},
+			},
+		},
+	})
+	require.NoError(t, err)
+	require.Len(t, got.Discovery.Instrument, 2)
+
+	require.Equal(t, "*", globString(got.Discovery.Instrument[0].Path))
+	require.True(t, got.Discovery.Instrument[0].ExportModes.CanExportMetrics())
+	require.Equal(t, []string{"/second"}, incomingRoutePatterns(got.Discovery.Instrument[0].Routes))
+	require.Equal(t, "/srv/*", globString(got.Discovery.Instrument[1].Path))
+	require.True(t, got.Discovery.Instrument[1].ExportModes.CanExportTraces())
+	require.Equal(t, []string{"/first"}, incomingRoutePatterns(got.Discovery.Instrument[1].Routes))
+}
+
+func TestV2ToRuntimeResetsLastMatchRefinement(t *testing.T) {
+	t.Parallel()
+
+	got, err := V2ToRuntime(&schema.Extension{
+		Version: schema.SupportedVersion,
+		Capture: schema.Capture{
+			Policy: schema.CapturePolicy{
+				DefaultAction: schema.CaptureActionExclude,
+				MatchOrder:    schema.MatchOrderLastMatchWins,
+			},
+			Rules: []schema.Rule{
+				{
+					Action: schema.CaptureActionInclude,
+					Match: schema.RuleMatch{Process: schema.RuleProcessMatch{
+						ExePathGlob: []string{"*"},
+					}},
+					Refine: schema.RuleRefinement{
+						Exports: &schema.ExportModeRefinement{Traces: true},
+						HTTP: &schema.HTTPRefinement{Routes: schema.HTTPRefinementRoutes{
+							Incoming: testHTTPRoutePolicy("/first"),
+						}},
+					},
+				},
+				{
+					Action: schema.CaptureActionInclude,
+					Match: schema.RuleMatch{Process: schema.RuleProcessMatch{
+						ExePathGlob: []string{"/srv/*"},
+					}},
+				},
+			},
+		},
+	})
+	require.NoError(t, err)
+	require.Len(t, got.Discovery.Instrument, 2)
+
+	reset := got.Discovery.Instrument[1]
+	require.Equal(t, "/srv/*", globString(reset.Path))
+	require.NotEqual(t, services.ExportModeUnset, reset.ExportModes)
+	require.True(t, reset.ExportModes.CanExportTraces())
+	require.True(t, reset.ExportModes.CanExportMetrics())
+	require.True(t, reset.ExportModes.CanExportLogs())
+	require.NotNil(t, reset.Routes)
+	require.Empty(t, reset.Routes.Incoming)
+	require.Empty(t, reset.Routes.Outgoing)
+}
+
+func TestV2ToRuntimeRejectsInvalidExportsOTLPPort(t *testing.T) {
+	t.Parallel()
+
+	for _, port := range []int{0, 65536} {
+		_, err := V2ToRuntime(&schema.Extension{
+			Version: schema.SupportedVersion,
+			Capture: schema.Capture{Rules: []schema.Rule{{
+				Action: schema.CaptureActionExclude,
+				Match: schema.RuleMatch{Process: schema.RuleProcessMatch{
+					ExportsOTLP: &schema.RuleExportsOTLP{Port: port, Protocol: "protobuf"},
+				}},
+			}}},
+		})
+		require.ErrorContains(t, err, "capture.rules[0].match.process.exports_otlp.port")
+	}
+}
+
+func TestV2ToRuntimeRejectsLossyRuleSemantics(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name    string
+		capture schema.Capture
+		wantErr string
+	}{
+		{
+			name: "selector families across rules",
+			capture: schema.Capture{Rules: []schema.Rule{
+				{
+					Action: schema.CaptureActionExclude,
+					Match: schema.RuleMatch{Process: schema.RuleProcessMatch{
+						ExePathGlob: []string{"/tmp/*"},
+					}},
+				},
+				{
+					Action: schema.CaptureActionInclude,
+					Match: schema.RuleMatch{Process: schema.RuleProcessMatch{
+						ExePathRegex: "^/srv/.*",
+					}},
+				},
+			}},
+			wantErr: "cannot mix selector families across capture.rules",
+		},
+		{
+			name: "first match precedence",
+			capture: schema.Capture{
+				Policy: schema.CapturePolicy{
+					DefaultAction: schema.CaptureActionExclude,
+					MatchOrder:    schema.MatchOrderFirstMatchWins,
+				},
+				Rules: []schema.Rule{
+					{
+						Action: schema.CaptureActionInclude,
+						Match: schema.RuleMatch{Process: schema.RuleProcessMatch{
+							ExePathGlob: []string{"*"},
+						}},
+					},
+					{
+						Action: schema.CaptureActionExclude,
+						Match: schema.RuleMatch{Process: schema.RuleProcessMatch{
+							ExePathGlob: []string{"/tmp/*"},
+						}},
+					},
+				},
+			},
+			wantErr: "first_match_wins cannot preserve runtime exclusion precedence",
+		},
+		{
+			name: "missing action",
+			capture: schema.Capture{Rules: []schema.Rule{{
+				Match: schema.RuleMatch{Process: schema.RuleProcessMatch{
+					ExePathGlob: []string{"*"},
+				}},
+			}}},
+			wantErr: "capture.rules[0].action",
+		},
+		{
+			name: "missing match",
+			capture: schema.Capture{Rules: []schema.Rule{{
+				Action: schema.CaptureActionInclude,
+			}}},
+			wantErr: "capture.rules[0].match must define at least one selector",
+		},
+		{
+			name: "additional selector",
+			capture: schema.Capture{Rules: []schema.Rule{{
+				Action: schema.CaptureActionInclude,
+				Match: schema.RuleMatch{
+					AdditionalProperties: map[string]any{"custom_selector": true},
+				},
+			}}},
+			wantErr: "capture.rules[0].match.custom_selector",
+		},
+		{
+			name: "exclude refinement",
+			capture: schema.Capture{Rules: []schema.Rule{{
+				Action: schema.CaptureActionExclude,
+				Match: schema.RuleMatch{Process: schema.RuleProcessMatch{
+					ExePathGlob: []string{"/tmp/*"},
+				}},
+				Refine: schema.RuleRefinement{
+					Exports: &schema.ExportModeRefinement{Traces: true},
+				},
+			}}},
+			wantErr: "capture.rules[0].refine is not supported for exclude rules",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			_, err := V2ToRuntime(&schema.Extension{
+				Version: schema.SupportedVersion,
+				Capture: tc.capture,
+			})
+			require.ErrorContains(t, err, tc.wantErr)
+		})
+	}
+}
+
+func TestV2ToRuntimeRejectsMalformedRulePatterns(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name    string
+		match   schema.RuleMatch
+		wantErr string
+	}{
+		{
+			name: "glob",
+			match: schema.RuleMatch{
+				Process: schema.RuleProcessMatch{ExePathGlob: []string{"["}},
+			},
+			wantErr: "capture.rules[0].match.process.exe_path_glob",
+		},
+		{
+			name: "regex",
+			match: schema.RuleMatch{
+				Process: schema.RuleProcessMatch{ExePathRegex: "["},
+			},
+			wantErr: "capture.rules[0].match.process.exe_path_regex",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			_, err := V2ToRuntime(&schema.Extension{
+				Version: schema.SupportedVersion,
+				Capture: schema.Capture{
+					Rules: []schema.Rule{
+						{
+							Action: schema.CaptureActionInclude,
+							Match:  tc.match,
+						},
+					},
+				},
+			})
+			require.Error(t, err)
+			require.Contains(t, err.Error(), tc.wantErr)
+		})
+	}
+}
+
+func TestV2ToRuntimeRejectsUnsupportedFilters(t *testing.T) {
+	t.Parallel()
+
+	filter := schema.AttributeFilters{
+		"service.name": {Match: "checkout"},
+	}
+	for _, tc := range []struct {
+		name   string
+		path   string
+		mutate func(*schema.Extension)
+	}{
+		{
+			name: "Go runtime",
+			path: "capture.runtimes.go.filter",
+			mutate: func(extension *schema.Extension) {
+				extension.Capture.Runtimes.Go.Filter = filter
+			},
+		},
+		{
+			name: "Node.js runtime",
+			path: "capture.runtimes.nodejs.filter",
+			mutate: func(extension *schema.Extension) {
+				extension.Capture.Runtimes.NodeJS.Filter = filter
+			},
+		},
+		{
+			name: "Java runtime",
+			path: "capture.runtimes.java.filter",
+			mutate: func(extension *schema.Extension) {
+				extension.Capture.Runtimes.Java.Filter = filter
+			},
+		},
+		{
+			name: "log trace annotation",
+			path: "correlation.log_trace_annotation.filter",
+			mutate: func(extension *schema.Extension) {
+				extension.Correlation = &schema.Correlation{
+					LogTraceAnnotation: schema.LogTraceAnnotation{Filter: filter},
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			extension := &schema.Extension{Version: schema.SupportedVersion}
+			tc.mutate(extension)
+
+			_, err := V2ToRuntime(extension)
+			require.ErrorContains(t, err, tc.path)
+		})
+	}
+}
+
+func TestV2ToRuntimeDefaultIncludeAddsCatchAll(t *testing.T) {
+	t.Parallel()
+
+	got, err := V2ToRuntime(&schema.Extension{
+		Version: schema.SupportedVersion,
+		Capture: schema.Capture{
+			Policy: schema.CapturePolicy{
+				DefaultAction: schema.CaptureActionInclude,
+				MatchOrder:    schema.MatchOrderFirstMatchWins,
+			},
+			Rules: []schema.Rule{
+				{
+					Action: schema.CaptureActionExclude,
+					Match: schema.RuleMatch{
+						Process: schema.RuleProcessMatch{
+							ExePathGlob: []string{"*/obi", "obi"},
+						},
+					},
+				},
+			},
+		},
+	})
+	require.NoError(t, err)
+
+	require.Len(t, got.Discovery.Instrument, 1)
+	require.Equal(t, "*", globString(got.Discovery.Instrument[0].Path))
+	require.Empty(t, got.Discovery.Services)
+	require.Len(t, got.Discovery.ExcludeInstrument, 1)
+	require.Equal(t, "{*/obi,obi}", globString(got.Discovery.ExcludeInstrument[0].Path))
+	require.Empty(t, got.Discovery.ExcludeServices)
+}
+
+func TestV2ToRuntimeRulesPresenceControlsSelectorReplacement(t *testing.T) {
+	t.Parallel()
+
+	missing, err := V2ToRuntime(&schema.Extension{Version: schema.SupportedVersion})
+	require.NoError(t, err)
+	require.Equal(t, obi.DefaultConfig.Discovery.DefaultExcludeInstrument, missing.Discovery.DefaultExcludeInstrument)
+	require.Equal(t, obi.DefaultConfig.Discovery.DefaultExcludeServices, missing.Discovery.DefaultExcludeServices)
+	require.Equal(t,
+		obi.DefaultConfig.Discovery.ExcludeOTelInstrumentedServices,
+		missing.Discovery.ExcludeOTelInstrumentedServices,
+	)
+
+	empty, err := V2ToRuntime(&schema.Extension{
+		Version: schema.SupportedVersion,
+		Capture: schema.Capture{
+			Policy: schema.CapturePolicy{
+				DefaultAction: schema.CaptureActionExclude,
+				MatchOrder:    schema.MatchOrderFirstMatchWins,
+			},
+			Rules: []schema.Rule{},
+		},
+	})
+	require.NoError(t, err)
+	require.Empty(t, empty.Discovery.Instrument)
+	require.Empty(t, empty.Discovery.ExcludeInstrument)
+	require.Empty(t, empty.Discovery.DefaultExcludeInstrument)
+	require.Empty(t, empty.Discovery.Services)
+	require.Empty(t, empty.Discovery.ExcludeServices)
+	require.Empty(t, empty.Discovery.DefaultExcludeServices)
+	require.False(t, empty.Discovery.ExcludeOTelInstrumentedServices)
+}
+
+func TestV2ToRuntimePreservesDefaultsForMissingSections(t *testing.T) {
+	t.Parallel()
+
+	got, err := V2ToRuntime(&schema.Extension{Version: schema.SupportedVersion})
+	require.NoError(t, err)
+
+	require.Equal(t, obi.DefaultConfig.ChannelBufferLen, got.ChannelBufferLen)
+	require.Equal(t, obi.DefaultConfig.EBPF.BatchLength, got.EBPF.BatchLength)
+	require.Equal(t, obi.DefaultConfig.Metrics.Features, got.Metrics.Features)
+	require.Equal(t, obi.DefaultConfig.NetworkFlows.Enable, got.NetworkFlows.Enable)
+}
+
+func TestV2ToRuntimePartialInstrumentationPreservesDefaults(t *testing.T) {
+	t.Parallel()
+
+	got, err := V2ToRuntime(&schema.Extension{
+		Version: schema.SupportedVersion,
+		Capture: schema.Capture{
+			Instrumentation: schema.Instrumentation{
+				HTTP: schema.HTTPInstrumentation{
+					TrackRequestHeaders: true,
+				},
+			},
+		},
+	})
+	require.NoError(t, err)
+
+	require.True(t, got.EBPF.TrackRequestHeaders)
+	require.Equal(t, obi.DefaultConfig.Traces.Instrumentations, got.Traces.Instrumentations)
+	require.Equal(t, obi.DefaultConfig.OTELMetrics.Instrumentations, got.OTELMetrics.Instrumentations)
+	require.Equal(t, obi.DefaultConfig.Prometheus.Instrumentations, got.Prometheus.Instrumentations)
+	require.Equal(t, obi.DefaultConfig.Metrics.Features, got.Metrics.Features)
+	require.Equal(t, obi.DefaultConfig.EBPF.MySQLPreparedStatementsCacheSize, got.EBPF.MySQLPreparedStatementsCacheSize)
+}
+
+func TestV2ToRuntimePartialCaptureSectionsPreserveDefaults(t *testing.T) {
+	t.Parallel()
+
+	got, err := V2ToRuntime(&schema.Extension{
+		Version: schema.SupportedVersion,
+		Capture: schema.Capture{
+			Policy: schema.CapturePolicy{
+				MinProcessAge: schema.Duration(6 * time.Second),
+			},
+			Limits: schema.CaptureLimits{
+				MetricSpanNames: 400,
+			},
+			Safety: schema.CaptureSafety{
+				EnforceSystemCapabilities: true,
+			},
+			Channels: schema.CaptureChannels{
+				BufferLen: 77,
+			},
+			Engine: schema.CaptureEngine{
+				Debug: schema.EngineDebug{
+					BPF: true,
+				},
+			},
+			Network: schema.CaptureNetwork{
+				Capture: schema.NetworkCapture{
+					Enabled: true,
+				},
+				Stats: schema.NetworkStats{
+					EndpointIdentity: schema.EndpointIdentity{
+						AgentIP: "198.51.100.1",
+					},
+					Diagnostics: schema.StatsDiagnostics{
+						PrintStats: true,
+					},
+				},
+			},
+			Runtimes: schema.CaptureRuntimes{
+				Java: schema.JavaRuntime{
+					Debug: schema.JavaDebug{
+						Enabled: true,
+					},
+				},
+			},
+			Telemetry: schema.CaptureTelemetry{
+				Traces: schema.TracesTelemetry{
+					ReportersCacheLen: 301,
+				},
+			},
+		},
+	})
+	require.NoError(t, err)
+
+	require.Equal(t, 6*time.Second, got.Discovery.MinProcessAge)
+	require.Equal(t, obi.DefaultConfig.Discovery.PollInterval, got.Discovery.PollInterval)
+	require.Equal(t, 400, got.Attributes.MetricSpanNameAggregationLimit)
+	require.Equal(t, obi.DefaultConfig.NetworkFlows.CacheMaxFlows, got.NetworkFlows.CacheMaxFlows)
+	require.True(t, got.EnforceSysCaps)
+
+	require.Equal(t, 77, got.ChannelBufferLen)
+	require.Equal(t, obi.DefaultConfig.ChannelSendTimeout, got.ChannelSendTimeout)
+	require.Equal(t, obi.DefaultConfig.ChannelSendTimeoutPanic, got.ChannelSendTimeoutPanic)
+
+	require.True(t, got.EBPF.BpfDebug)
+	require.Equal(t, obi.DefaultConfig.EBPF.WakeupLen, got.EBPF.WakeupLen)
+	require.Equal(t, obi.DefaultConfig.EBPF.BatchLength, got.EBPF.BatchLength)
+	require.Equal(t, obi.DefaultConfig.EBPF.TCBackend, got.EBPF.TCBackend)
+	require.Equal(t, obi.DefaultConfig.EBPF.ForceBPFMapReader, got.EBPF.ForceBPFMapReader)
+	require.Equal(t, obi.DefaultConfig.EBPF.MaxTransactionTime, got.EBPF.MaxTransactionTime)
+
+	require.True(t, got.NetworkFlows.Enable)
+	require.Equal(t, obi.DefaultConfig.NetworkFlows.Source, got.NetworkFlows.Source)
+	require.Equal(t, obi.DefaultConfig.NetworkFlows.ExcludeInterfaces, got.NetworkFlows.ExcludeInterfaces)
+	require.Equal(t, obi.DefaultConfig.NetworkFlows.CacheActiveTimeout, got.NetworkFlows.CacheActiveTimeout)
+	require.Equal(t, obi.DefaultConfig.NetworkFlows.Deduper, got.NetworkFlows.Deduper)
+	require.Equal(t, obi.DefaultConfig.NetworkFlows.ListenInterfaces, got.NetworkFlows.ListenInterfaces)
+	require.Equal(t, export.FeatureApplicationRED|export.FeatureNetwork, got.Metrics.Features)
+	require.Equal(t, "198.51.100.1", got.Stats.AgentIP)
+	require.Equal(t, obi.DefaultConfig.Stats.AgentIPIface, got.Stats.AgentIPIface)
+	require.Equal(t, obi.DefaultConfig.Stats.AgentIPType, got.Stats.AgentIPType)
+	require.True(t, got.Stats.Print)
+	require.Equal(t, obi.DefaultConfig.Stats.ReverseDNS.CacheTTL, got.Stats.ReverseDNS.CacheTTL)
+
+	require.True(t, got.Java.Debug)
+	require.Equal(t, obi.DefaultConfig.Discovery.SkipGoSpecificTracers, got.Discovery.SkipGoSpecificTracers)
+	require.Equal(t, obi.DefaultConfig.NodeJS.Enabled, got.NodeJS.Enabled)
+	require.Equal(t, obi.DefaultConfig.Java.Enabled, got.Java.Enabled)
+	require.Equal(t, obi.DefaultConfig.Java.Timeout, got.Java.Timeout)
+
+	require.Equal(t, 301, got.Traces.ReportersCacheLen)
+	require.Equal(t, obi.DefaultConfig.OTELMetrics.ReportersCacheLen, got.OTELMetrics.ReportersCacheLen)
+	require.Equal(t, obi.DefaultConfig.OTELMetrics.TTL, got.OTELMetrics.TTL)
+}
+
+func TestV2ToRuntimeOmittedCaptureSiblingsPreserveDefaults(t *testing.T) {
+	t.Parallel()
+
+	_, ext := RuntimeToV2(nil)
+	ext.Capture.Limits = schema.CaptureLimits{}
+	ext.Capture.Channels = schema.CaptureChannels{}
+	ext.Capture.Runtimes = schema.CaptureRuntimes{}
+	ext.Capture.Telemetry = schema.CaptureTelemetry{}
+
+	got, err := V2ToRuntime(ext)
+	require.NoError(t, err)
+
+	require.Equal(t, obi.DefaultConfig.Attributes.MetricSpanNameAggregationLimit, got.Attributes.MetricSpanNameAggregationLimit)
+	require.Equal(t, obi.DefaultConfig.NetworkFlows.CacheMaxFlows, got.NetworkFlows.CacheMaxFlows)
+	require.Equal(t, obi.DefaultConfig.ChannelBufferLen, got.ChannelBufferLen)
+	require.Equal(t, obi.DefaultConfig.ChannelSendTimeout, got.ChannelSendTimeout)
+	require.Equal(t, obi.DefaultConfig.ChannelSendTimeoutPanic, got.ChannelSendTimeoutPanic)
+	require.Equal(t, obi.DefaultConfig.Discovery.SkipGoSpecificTracers, got.Discovery.SkipGoSpecificTracers)
+	require.Equal(t, obi.DefaultConfig.NodeJS.Enabled, got.NodeJS.Enabled)
+	require.Equal(t, obi.DefaultConfig.Java.Enabled, got.Java.Enabled)
+	require.Equal(t, obi.DefaultConfig.Java.Timeout, got.Java.Timeout)
+	require.Equal(t, obi.DefaultConfig.Traces.ReportersCacheLen, got.Traces.ReportersCacheLen)
+	require.Equal(t, obi.DefaultConfig.OTELMetrics.ReportersCacheLen, got.OTELMetrics.ReportersCacheLen)
+	require.Equal(t, obi.DefaultConfig.OTELMetrics.TTL, got.OTELMetrics.TTL)
+}
+
+func TestV2ToRuntimeCompleteDaemonOmittedLoggingFieldsPreserveDefaults(t *testing.T) {
+	t.Parallel()
+
+	_, ext := RuntimeToV2(nil)
+	ext.Daemon.Logging = schema.Logging{
+		ConfigFormat: schema.ConfigFormatYAML,
+	}
+	ext.Daemon.Telemetry.Metrics.Prometheus.AllowServiceGraphSelfReferences = true
+	ext.Daemon.Telemetry.Metrics.Prometheus.SpanMetricsServiceCacheSize = 0
+
+	got, err := V2ToRuntime(ext)
+	require.NoError(t, err)
+
+	require.Equal(t, obi.DefaultConfig.LogLevel, got.LogLevel)
+	require.Equal(t, obi.DefaultConfig.LogFormat, got.LogFormat)
+	require.Equal(t, obi.LogConfigOptionYAML, got.LogConfig)
+	require.Equal(t, obi.DefaultConfig.TracePrinter, got.TracePrinter)
+	require.True(t, got.Prometheus.AllowServiceGraphSelfReferences)
+	require.Equal(t, obi.DefaultConfig.Prometheus.SpanMetricsServiceCacheSize, got.Prometheus.SpanMetricsServiceCacheSize)
+}
+
+func TestV2ToRuntimePartialStandaloneSectionsPreserveDefaults(t *testing.T) {
+	t.Parallel()
+
+	got, err := V2ToRuntime(&schema.Extension{
+		Version: schema.SupportedVersion,
+		Correlation: &schema.Correlation{
+			LogTraceAnnotation: schema.LogTraceAnnotation{
+				Enabled: true,
+			},
+		},
+		Daemon: &schema.Daemon{
+			Logging: schema.Logging{
+				Format: schema.LogFormatJSON,
+			},
+		},
+	})
+	require.NoError(t, err)
+
+	require.Equal(t, obi.DefaultConfig.LogLevel, got.LogLevel)
+	require.Equal(t, obi.LogFormatJSON, got.LogFormat)
+	require.Equal(t, obi.DefaultConfig.ShutdownTimeout, got.ShutdownTimeout)
+	require.Equal(t, obi.DefaultConfig.InternalMetrics, got.InternalMetrics)
+	require.Equal(t, obi.DefaultConfig.Prometheus.SpanMetricsServiceCacheSize, got.Prometheus.SpanMetricsServiceCacheSize)
+	require.True(t, got.EBPF.LogEnricher.Enabled())
+	require.Equal(t, obi.DefaultConfig.EBPF.LogEnricher.CacheTTL, got.EBPF.LogEnricher.CacheTTL)
+	require.Equal(t, obi.DefaultConfig.EBPF.LogEnricher.AsyncWriterWorkers, got.EBPF.LogEnricher.AsyncWriterWorkers)
+}
+
+func TestV2ToRuntimePartialPlainTextDisablePreservesOtherDefaults(t *testing.T) {
+	t.Parallel()
+
+	disabled := false
+	got, err := V2ToRuntime(&schema.Extension{
+		Version: schema.SupportedVersion,
+		Correlation: &schema.Correlation{
+			LogTraceAnnotation: schema.LogTraceAnnotation{
+				PlainText: schema.PlainText{Enabled: &disabled},
+			},
+		},
+	})
+	require.NoError(t, err)
+
+	require.False(t, got.EBPF.LogEnricher.PlainText.Enabled)
+	require.Equal(t, obi.DefaultConfig.EBPF.LogEnricher.PlainText.Placement, got.EBPF.LogEnricher.PlainText.Placement)
+	require.Equal(t, obi.DefaultConfig.EBPF.LogEnricher.PlainText.Multiline, got.EBPF.LogEnricher.PlainText.Multiline)
+}
+
+func TestV2ToRuntimePartialCorrelationCachePreservesDefaults(t *testing.T) {
+	t.Parallel()
+
+	traceField := "trace.id"
+	spanField := "span.id"
+	plainTextEnabled := true
+	placement := config.LogEnricherPlacementPrefix
+	multiline := config.LogEnricherMultilineEachLine
+	got, err := V2ToRuntime(&schema.Extension{
+		Version: schema.SupportedVersion,
+		Correlation: &schema.Correlation{
+			LogTraceAnnotation: schema.LogTraceAnnotation{
+				FieldNames: schema.FieldNames{
+					TraceID: &traceField,
+					SpanID:  &spanField,
+				},
+				PlainText: schema.PlainText{
+					Enabled:   &plainTextEnabled,
+					Placement: &placement,
+					Multiline: &multiline,
+				},
+				Cache: schema.Cache{TTL: schema.Duration(2 * time.Minute)},
+				AsyncWriter: schema.AsyncWriter{
+					Workers: 1,
+				},
+			},
+		},
+	})
+	require.NoError(t, err)
+
+	require.Equal(t, traceField, got.EBPF.LogEnricher.FieldNames.TraceID)
+	require.Equal(t, spanField, got.EBPF.LogEnricher.FieldNames.SpanID)
+	require.True(t, got.EBPF.LogEnricher.PlainText.Enabled)
+	require.Equal(t, placement, got.EBPF.LogEnricher.PlainText.Placement)
+	require.Equal(t, multiline, got.EBPF.LogEnricher.PlainText.Multiline)
+	require.Equal(t, 2*time.Minute, got.EBPF.LogEnricher.CacheTTL)
+	require.Equal(t, obi.DefaultConfig.EBPF.LogEnricher.CacheSize, got.EBPF.LogEnricher.CacheSize)
+	require.Equal(t, 1, got.EBPF.LogEnricher.AsyncWriterWorkers)
+	require.Equal(t, obi.DefaultConfig.EBPF.LogEnricher.AsyncWriterChannelLen, got.EBPF.LogEnricher.AsyncWriterChannelLen)
+}
+
+func TestV2ToRuntimeRejectsInvalidLogFieldName(t *testing.T) {
+	t.Parallel()
+
+	invalid := "trace id"
+	_, err := V2ToRuntime(&schema.Extension{
+		Version: schema.SupportedVersion,
+		Correlation: &schema.Correlation{
+			LogTraceAnnotation: schema.LogTraceAnnotation{
+				FieldNames: schema.FieldNames{TraceID: &invalid},
+			},
+		},
+	})
+	require.ErrorContains(t, err, "invalid log trace annotation")
+}
+
+func TestV2ToRuntimeRejectsNullLogAnnotationFields(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		config  string
+		wantErr string
+	}{
+		{
+			name: "trace ID",
+			config: `
+        field_names:
+          trace_id: null`,
+			wantErr: "correlation.log_trace_annotation.field_names.trace_id must not be null",
+		},
+		{
+			name: "span ID",
+			config: `
+        field_names:
+          span_id: null`,
+			wantErr: "correlation.log_trace_annotation.field_names.span_id must not be null",
+		},
+		{
+			name: "plain text enabled",
+			config: `
+        plain_text:
+          enabled: null`,
+			wantErr: "correlation.log_trace_annotation.plain_text.enabled must not be null",
+		},
+		{
+			name: "plain text placement",
+			config: `
+        plain_text:
+          placement: null`,
+			wantErr: "correlation.log_trace_annotation.plain_text.placement must not be null",
+		},
+		{
+			name: "plain text multiline",
+			config: `
+        plain_text:
+          multiline: null`,
+			wantErr: "correlation.log_trace_annotation.plain_text.multiline must not be null",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			_, extension, err := schema.ParseStandaloneYAML([]byte(`
+file_format: "1.0"
+extensions:
+  obi:
+    version: "2.0"
+    correlation:
+      log_trace_annotation:` + test.config + "\n"))
+			require.NoError(t, err)
+
+			_, err = V2ToRuntime(extension)
+			require.EqualError(t, err, test.wantErr)
+		})
+	}
+}
+
+func testHTTPRoutePolicy(patterns ...string) *schema.HTTPRoutePolicy {
+	return &schema.HTTPRoutePolicy{Patterns: &patterns}
+}
+
+func incomingRoutePatterns(routes *services.CustomRoutesConfig) []string {
+	if routes == nil || routes.PolicyOverrides == nil ||
+		routes.PolicyOverrides.Incoming == nil ||
+		routes.PolicyOverrides.Incoming.Patterns == nil {
+		return nil
+	}
+	return *routes.PolicyOverrides.Incoming.Patterns
+}

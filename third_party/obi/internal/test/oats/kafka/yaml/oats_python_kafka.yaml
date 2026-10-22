@@ -1,0 +1,37 @@
+oats-schema-version: 2
+docker-compose:
+  files:
+  - ../docker-compose-obi-python-kafka.yml
+  - ../../weaver/docker-compose-weaver.yml
+input:
+- path: /message
+interval: 500ms
+expected:
+  traces:
+  - traceql: '{ .messaging.operation.type = "process" }'
+    equals: process my-topic
+    attributes:
+      messaging.destination.name: my-topic
+      messaging.operation.type: process
+      messaging.system: kafka
+      server.port: '9092'
+  - traceql: '{ .messaging.operation.type = "publish" }'
+    equals: publish my-topic
+    attributes:
+      messaging.destination.name: my-topic
+      messaging.operation.type: publish
+      messaging.system: kafka
+      server.port: '9092'
+  metrics:
+  - promql: messaging_client_operation_duration_seconds_count{messaging_system="kafka", messaging_destination_name="my-topic"}
+    value: '> 0'
+  - promql: messaging_client_operation_duration_seconds_bucket{le="0"}
+    value: == 0
+  - promql: messaging_client_operation_duration_seconds_bucket{le="10"}
+    value: '> 0'
+  - promql: messaging_process_duration_seconds_count{messaging_system="kafka", messaging_destination_name="my-topic"}
+    value: '> 0'
+  - promql: messaging_process_duration_seconds_bucket{le="0"}
+    value: == 0
+  - promql: messaging_process_duration_seconds_bucket{le="10"}
+    value: '> 0'

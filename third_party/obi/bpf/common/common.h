@@ -1,0 +1,328 @@
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
+
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#pragma once
+
+#include <bpfcore/vmlinux.h>
+#include <bpfcore/utils.h>
+
+#include <common/connection_info.h>
+#include <common/event_source.h>
+#include <common/http_types.h>
+#include <common/tp_info.h>
+
+#include <pid/types/pid_info.h>
+
+enum : u32 {
+    k_tcp_max_len = 256,
+    k_tcp_res_len = 128,
+    k_path_max_len = 100,
+    k_query_max_len = 100,
+    k_pattern_max_len = 96,
+    k_method_max_len = 7, // Longest method: OPTIONS
+    k_remote_addr_max_len =
+        50, // We need 48: 39(ip v6 max) + 1(: separator) + 7(port length max value 65535) + 1(null terminator)
+    k_host_len = 64, // can be a fully qualified DNS name
+    k_traceparent_len = 55,
+    k_sql_max_len = 500,
+    k_sql_hostname_max_len = 96,
+    k_kafka_max_len = 256,
+    k_redis_max_len = 256,
+    k_mongo_max_len = 256,
+    k_max_topic_name_len = 64,
+    k_host_max_len = 100,
+    k_scheme_max_len = 10,
+    k_http_body_max_len = 64,
+    k_http_header_max_len = 100,
+    k_http_content_type_max_len = 16,
+};
+
+enum large_buf_action : u8 {
+    k_large_buf_action_init = 0,
+    k_large_buf_action_append = 1,
+};
+
+enum large_buf_kind : u8 {
+    k_large_buf_layer_wire =
+        0, // <--- wire format as seen by kprobes or socket ingress programs/xdp
+    k_large_buf_layer_app =
+        1, // <--- as seen by the app layer, e.g. ssl uprobes, detected protocols in eBPF or sk_msg on egress
+};
+
+enum {
+    k_dns_max_len = 512, // must be a power of 2
+};
+
+enum : u64 {
+    k_max_span_name_len = 64,
+    k_max_status_description_len = 64,
+    k_go_auto_span_json_max_len = 16 * 1024,
+};
+
+// Trace of an HTTP call invocation. It is instantiated by the return uprobe and forwarded to the
+// user space through the events ringbuffer.
+typedef struct http_request_trace {
+    u8 type; // Must be first
+    bool is_jsonrpc;
+    u16 status;
+    unsigned char method[k_method_max_len];
+    unsigned char scheme[k_scheme_max_len];
+    u8 _pad[11];
+    u64 go_start_monotime_ns;
+    u64 start_monotime_ns;
+    u64 end_monotime_ns;
+    s64 content_length;
+    s64 response_length;
+    unsigned char path[k_path_max_len];
+    unsigned char raw_query[k_query_max_len];
+    unsigned char pattern[k_pattern_max_len];
+    unsigned char host[k_host_max_len];
+    u8 _pad1[4];
+    tp_info_t tp;
+    connection_info_t conn;
+    pid_info pid;
+} http_request_trace_t;
+
+typedef struct sql_request_trace {
+    u8 type; // Must be first
+    u8 sub_type;
+    u16 status;
+    pid_info pid;
+    u64 start_monotime_ns;
+    u64 end_monotime_ns;
+    tp_info_t tp;
+    connection_info_t conn;
+    unsigned char sql[k_sql_max_len];
+    unsigned char hostname[k_sql_hostname_max_len];
+} sql_request_trace_t;
+
+typedef struct kafka_client_req {
+    u8 type; // Must be first
+    u8 _pad[7];
+    u64 start_monotime_ns;
+    u64 end_monotime_ns;
+    unsigned char buf[k_kafka_max_len];
+    connection_info_t conn;
+    pid_info pid;
+} kafka_client_req_t;
+
+typedef struct kafka_go_req {
+    u8 type; // Must be first
+    u8 op;
+    u8 _pad0[2];
+    pid_info pid;
+    connection_info_t conn;
+    u8 _pad1[4];
+    tp_info_t tp;
+    u64 start_monotime_ns;
+    u64 end_monotime_ns;
+    unsigned char topic[k_max_topic_name_len];
+} kafka_go_req_t;
+
+typedef struct redis_client_req {
+    u8 type; // Must be first
+    u8 err;
+    u16 buf_len;
+    u8 _pad[4];
+    u64 start_monotime_ns;
+    u64 end_monotime_ns;
+    pid_info pid;
+    unsigned char buf[k_redis_max_len];
+    connection_info_t conn;
+    tp_info_t tp;
+} redis_client_req_t;
+
+// Here we track unknown TCP requests that are not HTTP, HTTP2 or gRPC
+typedef struct tcp_req {
+    u8 flags; // Must be first, we use it to tell what kind of packet we have on the ring buffer
+    u8 ssl;
+    u8 direction;
+    u8 has_large_buffers;
+    enum protocol_type protocol_type;
+    bool is_server;
+    enum parent_status parent_status;
+    u8 _pad1[1];
+    connection_info_t conn_info;
+    u32 len;
+    u64 start_monotime_ns;
+    u64 end_monotime_ns;
+    u64 extra_id;
+    u32 task_tid;
+    u8 _pad3[4];
+    u32 req_len;
+    u32 resp_len;
+    u32 lb_req_bytes;
+    u32 lb_res_bytes;
+    enum event_source_type event_source;
+    u8 _pad2[3];
+    unsigned char buf[k_tcp_max_len];
+    unsigned char rbuf[k_tcp_res_len];
+    // we need this to filter traces from unsolicited processes that share the executable
+    // with other instrumented processes
+    pid_info pid;
+    tp_info_t tp;
+} tcp_req_t;
+
+typedef struct tcp_large_buffer {
+    u8 type; // Must be first
+    u8 packet_type;
+    enum large_buf_action action;
+    u8 direction;
+    u32 len;
+    connection_info_t conn_info;
+    enum large_buf_kind kind;
+    u8 source;
+    u8 _pad[2];
+    tp_info_t tp;
+    u8 buf[];
+} tcp_large_buffer_t;
+
+typedef struct span_name {
+    unsigned char buf[k_max_span_name_len];
+} span_name_t;
+
+typedef struct span_description {
+    unsigned char buf[k_max_status_description_len];
+} span_description_t;
+
+typedef struct go_string {
+    char *str;
+    s64 len;
+} go_string_t;
+
+typedef struct go_slice {
+    void *array;
+    s64 len;
+    s64 cap;
+} go_slice_t;
+
+typedef struct go_iface {
+    void *type;
+    void *data;
+} go_iface_t;
+
+/* Definitions should mimic structs defined in go.opentelemetry.io/otel/attribute */
+
+typedef struct go_otel_attr_value {
+    u64 vtype;
+    u64 numeric;
+    struct go_string string;
+    struct go_iface slice;
+} go_otel_attr_value_t;
+
+typedef struct go_otel_key_value {
+    struct go_string key;
+    go_otel_attr_value_t value;
+} go_otel_key_value_t;
+
+#define OTEL_ATTRIBUTE_KEY_MAX_LEN (32)
+#define OTEL_ATTRIBUTE_VALUE_MAX_LEN (128)
+#define OTEL_ATTRIBUTE_MAX_COUNT (16)
+
+typedef struct otel_attribute {
+    u16 val_length;
+    u8 vtype;
+    u8 reserved;
+    unsigned char key[OTEL_ATTRIBUTE_KEY_MAX_LEN];
+    unsigned char value[OTEL_ATTRIBUTE_VALUE_MAX_LEN];
+} otel_attribute_t;
+
+typedef struct otel_attributes {
+    otel_attribute_t attrs[OTEL_ATTRIBUTE_MAX_COUNT];
+    u8 valid_attrs;
+    u8 _apad;
+} otel_attributes_t;
+
+typedef struct otel_span {
+    u8 type; // Must be first
+    u8 _pad[7];
+    u64 start_time;
+    u64 end_time;
+    u64 parent_go;
+    tp_info_t tp;
+    tp_info_t prev_tp;
+    u32 status;
+    span_name_t span_name;
+    span_description_t span_description;
+    pid_info pid;
+    otel_attributes_t span_attrs;
+    u8 _epad[6];
+} otel_span_t;
+
+// Manual span emitted by the Node.js span bridge (spanbridge.js): the span
+// itself travels as a JSON document smuggled through a sentinel uv_fs_access
+// path (see bpf/generictracer/nodejs.c); BPF only adds timing, pid and the
+// current request trace context so user space can parent the span under
+// OBI's automatic server span.
+#define NODE_SPAN_PAYLOAD_MAX_LEN (2048)
+
+typedef struct node_span_event {
+    u8 type; // Must be first, EVENT_NODE_SPAN
+    u8 has_parent_ctx;
+    u8 _pad[2];
+    u32 payload_len; // bytes of payload actually written (excluding NUL)
+    u64 end_ktime;   // bpf_ktime_get_ns() when the sentinel fired (~span end)
+    unsigned char parent_trace_id[TRACE_ID_SIZE_BYTES];
+    unsigned char parent_span_id[SPAN_ID_SIZE_BYTES];
+    pid_info pid;
+    unsigned char payload[NODE_SPAN_PAYLOAD_MAX_LEN]; // JSON, see spanbridge.js
+    u8 _epad[4];
+} node_span_event_t;
+
+typedef struct channel_link_trace {
+    u8 type; // Must be first
+    u8 _pad[7];
+    tp_info_t sender_tp;
+    tp_info_t receiver_tp;
+} channel_link_trace_t;
+
+typedef struct go_auto_span {
+    u8 type; // Must be first
+    u8 _pad[3];
+    u32 size;
+    pid_info pid;
+    unsigned char buf[];
+} go_auto_span_t;
+
+typedef struct mongo_go_client_req {
+    u8 type; // Must be first
+    u8 err;
+    u8 _pad[6];
+    u64 start_monotime_ns;
+    u64 end_monotime_ns;
+    pid_info pid;
+    unsigned char op[32];
+    unsigned char db[32];
+    unsigned char coll[32];
+    connection_info_t conn;
+    tp_info_t tp;
+} mongo_go_client_req_t;
+
+typedef struct dns_req {
+    u8 flags; // Must be first, we use it to tell what kind of packet we have on the ring buffer
+    u8 dns_q;
+    enum parent_status parent_status;
+    u8 _pad1[1];
+    u32 len;
+    connection_info_t conn;
+    u16 id;
+    u8 _pad2[2];
+    tp_info_t tp;
+    // we need this to filter traces from unsolicited processes that share the executable
+    // with other instrumented processes
+    pid_info pid;
+    unsigned char buf[k_dns_max_len];
+    u8 _pad3[4];
+} dns_req_t;

@@ -1,0 +1,50 @@
+[Unit]
+Description=Triage agent (Linux host mode)
+Documentation=https://github.com/triageagent-dev/agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Root is what makes the capabilities below effective: file capabilities on
+# the binary are blocked by NoNewPrivileges. Root here keeps only the six
+# capabilities of the cluster DaemonSet and a read-only file system.
+User=root
+CapabilityBoundingSet=CAP_BPF CAP_PERFMON CAP_NET_RAW CAP_SYS_PTRACE CAP_DAC_READ_SEARCH CAP_CHECKPOINT_RESTORE
+AmbientCapabilities=CAP_BPF CAP_PERFMON CAP_NET_RAW CAP_SYS_PTRACE CAP_DAC_READ_SEARCH CAP_CHECKPOINT_RESTORE
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+# The control groups are only read (unit cgroups, PSI), never written.
+ProtectControlGroups=yes
+# No module loading. A host kernel without /sys/kernel/btf/vmlinux has the
+# agent look for a BTF file under /lib/modules, which this hides.
+ProtectKernelModules=yes
+# AF_PACKET is the network-flow socket (CAP_NET_RAW above); AF_NETLINK is
+# interface and route lookups.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK AF_PACKET
+# The eBPF loader needs bpf and perf_event_open; process discovery and the
+# namespace-entering probes need ptrace, setns, unshare and capset. A call
+# outside the list fails with EPERM rather than killing the agent.
+SystemCallFilter=@system-service bpf perf_event_open ptrace setns unshare capset
+SystemCallErrorNumber=EPERM
+MemoryMax=1G
+# Left out on purpose: ProtectKernelTunables (it hides /sys/kernel/debug and
+# /sys/kernel/tracing, which the tracepoint attach needs) and ProcSubset=pid
+# (process discovery reads /proc outside the agent's own PID).
+# The join identity (agent key, certificate, saved core CA). Keep in step with
+# --join-state-dir (default in host mode: /var/lib/triage-agent/join).
+ReadWritePaths=/var/lib/triage-agent/join
+StateDirectory=triage-agent/join
+StateDirectoryMode=0700
+# Every flag but --mode comes from the environment file: each variable below
+# holds a whole flag (for example TA_ENDPOINT=--triage-endpoint=wss://...), and
+# a variable left unset expands to nothing.
+EnvironmentFile=/etc/triage-agent/env
+ExecStart=/usr/bin/triage-agent --mode=host $TA_ENDPOINT $TA_TENANT $TA_JOIN_CA_FINGERPRINT $TA_JOIN_STATE_DIR $TA_CLUSTER_NAME $TA_NAMESPACE $TA_UNITS $TA_LOG_FILES $TA_CGROUP_ROOT $TA_COLLECTORS $TA_EXTRA
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

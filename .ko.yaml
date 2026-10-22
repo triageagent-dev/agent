@@ -1,0 +1,35 @@
+# ko build configuration
+# Pinned by digest for reproducible builds; tag (cgr.dev/chainguard/static:latest-glibc) kept for readability.
+#
+# Built with `-tags obi`: this is what makes `--mode role "ebpf"` real instead
+# of the fail-fast stub in ebpf_stub.go — see docs/todo/obi-embed.md. The
+# controller Deployment and the eBPF DaemonSet both run this one image; the
+# DaemonSet's own pod spec sets runAsUser: 0
+# (charts/triage-agent/templates/ebpf-daemonset.yaml), so the base image's
+# default user doesn't matter for it, and the controller doesn't need root
+# either.
+#
+# Requires third_party/obi/pkg/**/*_bpfel.{go,o} to already be generated —
+# gitignored, docker-only prerequisite, NOT run by this build. See
+# hack/build-obi.sh and docs/todo/obi-embed.md. Without them this build
+# fails loudly with `undefined: Bpf...` compile errors — never a binary that
+# silently falls back to the stub.
+defaultBaseImage: cgr.dev/chainguard/static:latest-glibc@sha256:77d8b8925dc27970ec2f48243f44c7a260d52c49cd778288e4ee97566e0cb75b
+builds:
+- id: triage-agent
+  main: ./cmd/triage-agent
+  flags:
+  - -tags
+  - obi
+  env:
+  - CGO_ENABLED=0
+  # Mirrors the Makefile's LDFLAGS (and the sibling triageagent-dev/core .ko.yaml).
+  # Without these every image reports version "dev" and two different builds are
+  # indistinguishable in logs and in the push hello frame. VERSION/GIT_COMMIT/
+  # BUILD_DATE are exported by the Makefile's ko-image / ko-push targets.
+  ldflags:
+  - -s -w
+  - -X main.version={{.Env.VERSION}}
+  - -X main.gitCommit={{.Env.GIT_COMMIT}}
+  - -X main.buildDate={{.Env.BUILD_DATE}}
+  kodata: false

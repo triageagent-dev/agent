@@ -1,0 +1,188 @@
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
+
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//go:build obi_bpf_ignore
+
+#include <bpfcore/utils.h>
+#include <bpfcore/bpf_builtins.h>
+
+#include <common/preempt_guard.h>
+#include <common/ringbuf.h>
+
+#include <gotracer/go_common.h>
+
+#include <gotracer/maps/kafka.h>
+
+#include <gotracer/types/kafka.h>
+
+#include <logger/bpf_dbg.h>
+
+SEC("uprobe/sarama_sendInternal")
+int GUARDED_PROG(obi_uprobe_sarama_sendInternal, struct pt_regs *, ctx) {
+    bpf_dbg_printk("=== uprobe/sarama_sendInternal ===");
+    void *goroutine_addr = GOROUTINE_PTR(ctx);
+    void *b_ptr = GO_PARAM1(ctx);
+    void *promise = GO_PARAM4(ctx);
+
+    off_table_t *ot = get_offsets_table();
+
+    bpf_dbg_printk("goroutine_addr=%lx", goroutine_addr);
+    go_addr_key_t g_key = {};
+    go_addr_key_from_id(&g_key, goroutine_addr);
+
+    send_event_t event = {
+        .correlation_id = 0,
+        .start_monotime_ns = bpf_ktime_get_ns(),
+        .promise = (u64)promise,
+    };
+
+    if (b_ptr) {
+        bpf_probe_read(&event.correlation_id,
+                       sizeof(u32),
+                       b_ptr + go_offset_of(ot, (go_offset){.v = _sarama_broker_corr_id_pos}));
+        bpf_dbg_printk("correlation_id=%d", event.correlation_id);
+
+        if (bpf_map_update_elem(&ongoing_kafka_requests, &g_key, &event, BPF_ANY)) {
+            bpf_dbg_printk("can't update kafka requests element");
+        }
+    }
+
+    return 0;
+}
+
+SEC("uprobe/sarama_broker_write")
+int GUARDED_PROG(obi_uprobe_sarama_broker_write, struct pt_regs *, ctx) {
+    bpf_dbg_printk("=== uprobe/sarama_broker_write ===");
+    void *goroutine_addr = GOROUTINE_PTR(ctx);
+
+    bpf_dbg_printk("goroutine_addr=%lx", goroutine_addr);
+    go_addr_key_t g_key = {};
+    go_addr_key_from_id(&g_key, goroutine_addr);
+
+    send_event_t *invocation = bpf_map_lookup_elem(&ongoing_kafka_requests, &g_key);
+    void *b_ptr = GO_PARAM1(ctx);
+    void *buf_ptr = GO_PARAM2(ctx);
+    off_table_t *ot = get_offsets_table();
+
+    if (invocation) {
+        unsigned char small_buf[8];
+        bpf_probe_read(small_buf, 8, buf_ptr);
+        // the api key is 2 bytes, but num APIs at the moment is max 50.
+        // instead of reading 2 bytes and then doing ntohs, we just read
+        // the second byte of the api key, assuming the first is 0.
+        const u8 api_key = small_buf[k_kafka_api_key_pos];
+
+        bpf_dbg_printk("api_key=%d", api_key);
+
+        // We only care about fetch and produce
+        if (api_key == k_kafka_api_fetch || api_key == k_kafka_api_produce) {
+            u32 correlation_id = invocation->correlation_id;
+            kafka_client_req_t req = {
+                .type = EVENT_GO_KAFKA,
+                .start_monotime_ns = invocation->start_monotime_ns,
+            };
+
+            void *conn_conn_ptr =
+                (void *)(b_ptr + go_offset_of(ot, (go_offset){.v = _sarama_broker_conn_pos}));
+            bpf_dbg_printk("conn_conn_ptr=%llx", conn_conn_ptr);
+            if (conn_conn_ptr) {
+                void *tcp_conn_ptr = 0;
+                bpf_probe_read(
+                    &tcp_conn_ptr,
+                    sizeof(tcp_conn_ptr),
+                    (void *)(conn_conn_ptr +
+                             go_offset_of(ot, (go_offset){.v = _sarama_bufconn_conn_pos}) +
+                             8)); // find conn
+                bpf_dbg_printk("tcp_conn_ptr=%llx", tcp_conn_ptr);
+                if (tcp_conn_ptr) {
+                    void *conn_ptr = 0;
+                    bpf_probe_read(
+                        &conn_ptr, sizeof(conn_ptr), (void *)(tcp_conn_ptr + 8)); // find conn
+                    bpf_dbg_printk("conn_ptr=%llx", conn_ptr);
+                    if (conn_ptr) {
+                        const u8 ok = get_conn_info(conn_ptr, &req.conn);
+                        if (!ok) {
+                            __builtin_memset(&req.conn, 0, sizeof(connection_info_t));
+                        }
+                    }
+                }
+            }
+
+            bpf_dbg_printk("correlation_id=%d, promise=%llx", correlation_id, invocation->promise);
+
+            bpf_probe_read(req.buf, k_kafka_max_len, buf_ptr);
+
+            // if there's no callback we report the event right away, there's no
+            // easy way to correlate with the response
+            if (!invocation->promise) {
+                req.end_monotime_ns = bpf_ktime_get_ns();
+                kafka_client_req_t *trace =
+                    bpf_ringbuf_reserve(&events, sizeof(kafka_client_req_t), 0);
+                if (trace) {
+                    bpf_dbg_printk("Sending kafka client go trace");
+
+                    bpf_memcpy(trace, &req, sizeof(kafka_client_req_t));
+                    task_pid(&trace->pid);
+                    bpf_ringbuf_submit(trace, get_flags());
+                }
+            } else {
+                go_addr_key_t k_key = {};
+                go_addr_key_from_id(&k_key, (void *)(uintptr_t)invocation->promise);
+                bpf_map_update_elem(&kafka_requests, &k_key, &req, BPF_ANY);
+            }
+        }
+    }
+
+    bpf_map_delete_elem(&ongoing_kafka_requests, &g_key);
+
+    return 0;
+}
+
+SEC("uprobe/sarama_response_promise_handle")
+int GUARDED_PROG(obi_uprobe_sarama_response_promise_handle, struct pt_regs *, ctx) {
+    bpf_dbg_printk("=== uprobe/sarama_response_promise_handle ===");
+
+    void *p = GO_PARAM1(ctx);
+    off_table_t *ot = get_offsets_table();
+
+    if (p) {
+        u32 correlation_id = 0;
+
+        bpf_probe_read(&correlation_id,
+                       sizeof(u32),
+                       p + go_offset_of(ot, (go_offset){.v = _sarama_response_corr_id_pos}));
+
+        bpf_dbg_printk("correlation_id=%d", correlation_id);
+
+        go_addr_key_t k_key = {};
+        go_addr_key_from_id(&k_key, (void *)(uintptr_t)p);
+        kafka_client_req_t *req = bpf_map_lookup_elem(&kafka_requests, &k_key);
+
+        if (req) {
+            req->end_monotime_ns = bpf_ktime_get_ns();
+            kafka_client_req_t *trace = bpf_ringbuf_reserve(&events, sizeof(kafka_client_req_t), 0);
+            if (trace) {
+                bpf_dbg_printk("Sending kafka client go trace");
+
+                __builtin_memcpy(trace, req, sizeof(kafka_client_req_t));
+                task_pid(&trace->pid);
+                bpf_ringbuf_submit(trace, get_flags());
+            }
+        }
+        bpf_map_delete_elem(&kafka_requests, &k_key);
+    }
+
+    return 0;
+}

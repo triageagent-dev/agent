@@ -1,0 +1,38 @@
+triage-agent {{ .Chart.AppVersion }} installed as release "{{ .Release.Name }}" in namespace "{{ .Release.Namespace }}".
+
+The triage agent is running: grouping workloads into applications from their
+labels and annotations (virtual apps) and, when enabled, pushing cluster
+state to the triage core.
+
+{{- if and .Values.otlp.enabled .Values.otlp.ownCA }}
+
+Remote OTLP senders: issue a certificate from the agent's own client CA, then
+hand the Secret it prints to the sender:
+  kubectl -n {{ .Release.Namespace }} exec deploy/{{ include "triage-agent.fullname" . }}-controller -- triage-agent otlp-cert \
+    --client-ca-secret {{ include "triage-agent.fullname" . }}-otlp-client-ca \
+    --serving-ca-configmap {{ include "triage-agent.fullname" . }}-sensor-ca \
+    --tenant <tenant[,tenant]> --cn <sender> > sender-secret.yaml
+{{- end }}
+{{- $core := include "triage-agent.core" . | fromYaml }}
+{{- if $core.enabled }}
+
+Connected to the triage core:
+  {{ include "triage-agent.triageEndpoint" . }}  (cluster: {{ $core.clusterName | default "<unset>" }})
+
+Check the connection:
+  kubectl logs -n {{ .Release.Namespace }} deploy/{{ include "triage-agent.fullname" . }} | grep push
+{{- else }}
+
+No triage core is set. To stream applications + Kubernetes Warning events to
+the triage core, set:
+  --set core.host=<triage-host> \
+  --set core.clusterName=<name> \
+  --set core.caFingerprint=<SHA256:... from GET /v2/agents on the core>
+
+Or use the command the core prints when it mints an agent key (it adds
+core.agentKey and needs no approval).
+
+Without a key the agent joins by an admin-approved certificate: it logs
+`join pending` with its key fingerprint; approve that fingerprint in the
+core's sources panel or with POST /v2/agents/approve.
+{{- end }}

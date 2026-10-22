@@ -1,0 +1,224 @@
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
+
+#pragma once
+
+#include <bpfcore/vmlinux.h>
+#include <bpfcore/bpf_helpers.h>
+#include <bpfcore/bpf_core_read.h>
+#include <common/pin_internal.h>
+#include <gotracer/go_constants.h>
+
+// To be injected from the user space during the eBPF program load & initialization
+typedef enum {
+    // go common
+    _conn_fd_pos = 1, // start at 1, must match what's in structmembers.go
+    _fd_laddr_pos,
+    _fd_raddr_pos,
+    _tcp_addr_port_ptr_pos,
+    _tcp_addr_ip_ptr_pos,
+    // http
+    _url_ptr_pos,
+    _path_ptr_pos,
+    _raw_query_ptr_pos,
+    _host_ptr_pos,
+    _scheme_ptr_pos,
+    _method_ptr_pos,
+    _status_code_ptr_pos,
+    _response_length_ptr_pos,
+    _content_length_ptr_pos,
+    _req_header_ptr_pos,
+    _io_writer_buf_ptr_pos,
+    _io_writer_n_pos,
+    _io_writer_wr_pos,
+    _cc_next_stream_id_pos,
+    _cc_next_stream_id_vendored_pos,
+    _cc_framer_pos,
+    _cc_framer_vendored_pos,
+    _framer_w_pos,
+    _pc_conn_pos,
+    _pc_tls_pos,
+    _net_conn_pos,
+    _cc_tconn_pos,
+    _cc_tconn_vendored_pos,
+    _sc_conn_pos,
+    _c_rwc_pos,
+    _c_tls_pos,
+    _text_reader_r_pos,
+    _buf_reader_buf_pos,
+    _buf_reader_w_pos,
+    // grpc
+    _grpc_stream_st_ptr_pos,
+    _grpc_stream_method_ptr_pos,
+    _grpc_status_s_pos,
+    _grpc_status_code_ptr_pos,
+    _meta_headers_frame_fields_ptr_pos,
+    _value_context_val_ptr_pos,
+    _grpc_st_conn_pos,
+    _grpc_t_conn_pos,
+    _grpc_t_scheme_pos,
+    _grpc_transport_stream_id_pos,
+    _grpc_transport_buf_writer_buf_pos,
+    _grpc_transport_buf_writer_offset_pos,
+    _grpc_transport_buf_writer_conn_pos,
+    // redis
+    _redis_conn_bw_pos,
+    // kafka go
+    _kafka_go_writer_topic_pos,
+    _kafka_go_protocol_conn_pos,
+    _kafka_go_reader_topic_pos,
+    // kafka sarama
+    _sarama_broker_corr_id_pos,
+    _sarama_response_corr_id_pos,
+    _sarama_broker_conn_pos,
+    _sarama_bufconn_conn_pos,
+    // grpc versioning
+    _grpc_one_six_zero,
+    _grpc_one_six_nine,
+    _grpc_one_seven_seven,
+    // http2 versioning
+    _http2_zero_forty_five_zero,
+    // grpc 1.69
+    _grpc_server_stream_stream,
+    _grpc_server_stream_st_ptr_pos,
+    _grpc_client_stream_stream,
+    // go manual spans
+    _tracer_delegate_pos,
+    _tracer_attribute_opt_off,
+    _error_string_off,
+    _span_context_trace_id_pos,
+    _span_context_span_id_pos,
+    _span_context_trace_flags_pos,
+    _auto_sdk_span_context_pos,
+    _auto_sdk_activation_supported,
+    // go runtime channels
+    _hchan_qcount_pos,
+    _hchan_dataqsiz_pos,
+    _hchan_sendx_pos,
+    _hchan_recvx_pos,
+    // go jsonrpc
+    _jsonrpc_request_header_service_method_pos,
+    // go mongodb
+    _mongo_conn_name_pos,
+    _mongo_op_name_pos,
+    _mongo_db_name_pos,
+    _mongo_op_name_new,
+    // database/sql stdlib
+    _driverconn_ci_pos,
+    // lib/pq driver
+    _pq_conn_cfg_pos,
+    _pq_config_host_pos,
+    _pq_one_eleven_zero,
+    _pq_conn_type_off,
+    // mysql driver
+    _mysql_conn_cfg_pos,
+    _mysql_config_addr_pos,
+    _mysql_conn_type_off,
+    // pgx driver
+    _pgx_conn_config_pos,
+    _pgx_config_host_pos,
+    // route resolution
+    _mux_template_pos,
+    _gin_fullpath_pos,
+    // Go runtime metrics
+    _runtime_memstats_numgc_pos,
+    _runtime_gc_controller_memory_limit_pos,
+    _runtime_gc_controller_gc_percent_pos,
+    _runtime_work_cpu_stats_pos,
+    _runtime_cpu_stats_gc_assist_time_pos,
+    _runtime_cpu_stats_gc_dedicated_time_pos,
+    _runtime_cpu_stats_gc_idle_time_pos,
+    _runtime_cpu_stats_gc_pause_time_pos,
+    _runtime_cpu_stats_scavenge_assist_time_pos,
+    _runtime_cpu_stats_scavenge_bg_time_pos,
+    _runtime_cpu_stats_idle_time_pos,
+    _runtime_cpu_stats_user_time_pos,
+    _runtime_memstats_heap_stats_pos,
+    _runtime_memstats_stacks_sys_pos,
+    _runtime_memstats_mspan_sys_pos,
+    _runtime_memstats_mcache_sys_pos,
+    _runtime_memstats_buckhash_sys_pos,
+    _runtime_memstats_gc_misc_sys_pos,
+    _runtime_memstats_other_sys_pos,
+    _runtime_consistent_heap_stats_stats_pos,
+    _runtime_heap_stats_delta_committed_pos,
+    _runtime_heap_stats_delta_in_stacks_pos,
+    _runtime_heap_stats_delta_large_alloc_pos,
+    _runtime_heap_stats_delta_large_alloc_count_pos,
+    _runtime_heap_stats_delta_small_alloc_count_pos,
+    _runtime_heap_stats_delta_small_free_count_pos,
+    _runtime_sched_ngsys_pos,
+    _runtime_sched_gfree_stack_pos,
+    _runtime_sched_gfree_no_stack_pos,
+    _runtime_p_gfree_pos,
+    _runtime_glist_size_pos,
+    _runtime_gc_controller_heap_goal_pos,
+    _runtime_sched_time_to_run_pos,
+    _runtime_sched_stw_total_time_gc_pos,
+    _runtime_time_histogram_underflow_pos,
+    _runtime_time_histogram_overflow_pos,
+    _last_go_offset,
+} go_offset_const;
+
+enum {
+    _gin_fullpath_off_pre_17 = 56,
+    _gin_fullpath_off_post_17 = 40,
+};
+
+// Fixed offsets defined by the Go runtime type layout.
+enum : u32 {
+    k_go_string_len_offset = 8,
+    k_go_slice_len_offset = 8,
+    k_go_iface_data_offset = 8,
+};
+
+typedef struct go_offset_t {
+    go_offset_const v;
+} go_offset;
+
+typedef struct off_table {
+    u64 table[_last_go_offset];
+} off_table_t;
+
+typedef struct go_executable_key {
+    u64 dev;
+    u64 ino;
+} go_executable_key_t;
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __type(key, go_executable_key_t);
+    __type(value, off_table_t); // the offset table
+    __uint(max_entries, MAX_GO_PROGRAMS);
+    __uint(pinning, OBI_PIN_INTERNAL);
+} go_offsets_map SEC(".maps");
+
+static __always_inline bool go_executable_key(struct inode *inode, go_executable_key_t *key) {
+    if (!inode) {
+        return false;
+    }
+
+    key->dev = (u64)BPF_CORE_READ(inode, i_sb, s_dev);
+    key->ino = (u64)BPF_CORE_READ(inode, i_ino);
+    return key->ino != 0;
+}
+
+static __always_inline off_table_t *get_offsets_table() {
+    struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+
+    struct inode *inode = BPF_CORE_READ(task, mm, exe_file, f_inode);
+    go_executable_key_t key = {};
+    if (!go_executable_key(inode, &key)) {
+        return NULL;
+    }
+
+    return (off_table_t *)bpf_map_lookup_elem(&go_offsets_map, &key);
+}
+
+static __always_inline u64 go_offset_of(off_table_t *ot, go_offset off) {
+    if (ot && off.v < _last_go_offset) {
+        return ot->table[off.v];
+    }
+
+    return -1;
+}

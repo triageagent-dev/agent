@@ -1,0 +1,37 @@
+# nfpm package definition for the Linux host agent (deb and rpm).
+# `make packages` fills ARCH and VERSION and runs nfpm once per architecture.
+name: triage-agent
+arch: ${ARCH}
+platform: linux
+version: ${VERSION}
+section: admin
+priority: optional
+maintainer: Triage Agent maintainers <noreply@example.invalid>
+description: |
+  Triage agent for a Linux host. Runs as a systemd service, discovers the
+  host's systemd units as virtual apps and streams their state and metrics
+  to the Triage core over an outbound WebSocket.
+homepage: https://github.com/triageagent-dev/agent
+license: Apache-2.0
+contents:
+  - src: ${BINARY}
+    dst: /usr/bin/triage-agent
+    # nfpm expands ${BINARY} in src only when the entry opts in.
+    expand: true
+    file_info:
+      mode: 0755
+  - src: packaging/systemd/triage-agent.service
+    dst: /usr/lib/systemd/system/triage-agent.service
+    file_info:
+      mode: 0644
+  - src: packaging/systemd/env.example
+    dst: /etc/triage-agent/env
+    type: config|noreplace
+    file_info:
+      mode: 0600
+  - dst: /var/lib/triage-agent/join
+    type: dir
+    file_info:
+      mode: 0700
+scripts:
+  postinstall: packaging/postinstall.sh

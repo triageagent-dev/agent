@@ -1,0 +1,440 @@
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
+
+#pragma once
+
+#include <bpfcore/vmlinux.h>
+#include <bpfcore/bpf_helpers.h>
+
+#include <common/common.h>
+#include <common/connection_info.h>
+#include <common/http_types.h>
+#include <common/large_buffers.h>
+#include <common/lw_thread.h>
+#include <common/preempt_guard.h>
+#include <common/protocol_defs.h>
+#include <common/ringbuf.h>
+#include <common/trace_helpers.h>
+#include <common/trace_lifecycle.h>
+#include <common/trace_parent.h>
+
+#include <maps/ongoing_tcp_req.h>
+#include <maps/tp_info_mem.h>
+
+#include <generictracer/failed_connect.h>
+#include <generictracer/protocol_aerospike.h>
+#include <generictracer/protocol_common.h>
+#include <generictracer/tcp_trace_cleanup.h>
+#include <generictracer/protocol_kafka.h>
+#include <generictracer/protocol_mysql.h>
+#include <generictracer/protocol_postgres.h>
+#include <generictracer/protocol_mssql.h>
+
+#include <generictracer/maps/tcp_req_mem.h>
+
+#include <logger/bpf_dbg.h>
+
+static __always_inline tcp_req_t *empty_tcp_req() {
+    int zero = 0;
+    tcp_req_t *value = bpf_map_lookup_elem(&tcp_req_mem, &zero);
+    if (value) {
+        __builtin_memset(value, 0, sizeof(tcp_req_t));
+    }
+    return value;
+}
+
+static __always_inline void set_tcp_trace_info(u32 type,
+                                               connection_info_t *conn,
+                                               lw_thread_t lw_thread,
+                                               tp_info_t *tp,
+                                               u32 pid,
+                                               u8 ssl,
+                                               u16 orig_dport) {
+    tp_info_pid_t *tp_p = (tp_info_pid_t *)tp_info_mem();
+
+    if (!tp_p) {
+        return;
+    }
+
+    unsigned char tp_buf[TP_MAX_VAL_LENGTH];
+    make_tp_string(tp_buf, tp);
+    bpf_d_printk("tp_buf=[%s] [%s]", tp_buf, __FUNCTION__);
+
+    tp_p->tp = *tp;
+    tp_p->tp.flags = 1;
+    tp_p->valid = 1;
+    tp_p->pid = pid; // used for avoiding finding stale server requests with client port reuse
+    tp_p->req_type = EVENT_TCP_REQUEST;
+
+    set_trace_info_for_connection(conn, type, tp_p);
+    dbg_print_http_connection_info(conn);
+
+    server_or_client_trace(type, conn, lw_thread, tp_p, ssl, orig_dport, 0, BPF_ANY);
+}
+
+static __always_inline void tcp_get_or_set_trace_info(tcp_req_t *req,
+                                                      pid_connection_info_t *pid_conn,
+                                                      lw_thread_t lw_thread,
+                                                      u8 ssl,
+                                                      u16 orig_dport) {
+    if (req->direction == TCP_SEND) { // Client
+        const u8 found = find_trace_for_client_request(pid_conn, orig_dport, lw_thread, &req->tp);
+        bpf_dbg_printk("Looking up client trace info, found=%d", found);
+        req->parent_status = found;
+        if (found) {
+            urand_bytes(req->tp.span_id, SPAN_ID_SIZE_BYTES);
+        } else {
+            init_new_trace(&req->tp);
+        }
+
+        set_tcp_trace_info(TRACE_TYPE_CLIENT,
+                           &pid_conn->conn,
+                           lw_thread,
+                           &req->tp,
+                           pid_conn->pid,
+                           ssl,
+                           orig_dport);
+    } else { // Server
+        const u8 found =
+            find_trace_for_server_request(&pid_conn->conn, &req->tp, EVENT_TCP_REQUEST);
+        bpf_dbg_printk("Looking up server trace info, found=%d", found);
+        if (found) {
+            urand_bytes(req->tp.span_id, SPAN_ID_SIZE_BYTES);
+        } else {
+            init_new_trace(&req->tp);
+        }
+        set_tcp_trace_info(TRACE_TYPE_SERVER,
+                           &pid_conn->conn,
+                           lw_thread,
+                           &req->tp,
+                           pid_conn->pid,
+                           ssl,
+                           orig_dport);
+    }
+}
+
+static __always_inline void finish_ongoing_tcp_req(pid_connection_info_t *pid_conn) {
+    tcp_req_t *existing_tcp = bpf_map_lookup_elem(&ongoing_tcp_req, pid_conn);
+    if (!existing_tcp) {
+        return;
+    }
+
+    if (existing_tcp->end_monotime_ns == 0 &&
+        existing_tcp->protocol_type == k_protocol_type_unknown) {
+        existing_tcp->end_monotime_ns = bpf_ktime_get_ns();
+        existing_tcp->resp_len = 0;
+
+        bpf_dbg_printk("Sending pending TCP trace on close: len=%d", existing_tcp->len);
+        bpf_ringbuf_output(&events, existing_tcp, sizeof(*existing_tcp), get_flags());
+    }
+
+    cleanup_trace_info(existing_tcp, pid_conn);
+    bpf_map_delete_elem(&ongoing_tcp_req, pid_conn);
+}
+
+static __always_inline void unknown_send_large_buffer(tcp_req_t *req,
+                                                      pid_connection_info_t *pid_conn,
+                                                      const void *u_buf,
+                                                      u32 bytes_len,
+                                                      u8 packet_type,
+                                                      u8 direction,
+                                                      enum large_buf_action action) {
+    tcp_large_buffer_t *lb = (tcp_large_buffer_t *)tcp_large_buffers_mem();
+
+    if (!lb) {
+        bpf_dbg_printk("failed to reserve space for generic TCP large buffer");
+        return;
+    }
+
+    lb->type = EVENT_TCP_LARGE_BUFFER;
+    lb->packet_type = packet_type;
+    lb->action = action;
+    lb->kind = k_large_buf_layer_wire;
+    lb->direction = direction;
+    lb->conn_info = pid_conn->conn;
+    lb->tp = req->tp;
+    lb->source = k_large_buffer_source_kprobes;
+
+    const u32 bytes_sent =
+        packet_type == PACKET_TYPE_REQUEST ? req->lb_req_bytes : req->lb_res_bytes;
+
+    u32 max_available_bytes = tcp_max_captured_bytes - bytes_sent;
+    u32 consumed_bytes = 0;
+
+    bpf_clamp_umax(max_available_bytes, k_large_buf_max_tcp_captured_bytes);
+
+    const u32 available_bytes = min(bytes_len, max_available_bytes);
+    consumed_bytes += large_buf_emit_chunks(lb, u_buf, available_bytes, k_large_buf_read_kernel);
+
+    if (packet_type == PACKET_TYPE_REQUEST) {
+        req->lb_req_bytes += consumed_bytes;
+    } else {
+        req->lb_res_bytes += consumed_bytes;
+    }
+
+    if (consumed_bytes > 0) {
+        req->has_large_buffers = true;
+    }
+}
+
+static __always_inline int tcp_send_large_buffer(tcp_req_t *req,
+                                                 pid_connection_info_t *pid_conn,
+                                                 void *u_buf,
+                                                 int bytes_len,
+                                                 u8 direction,
+                                                 enum protocol_type protocol_type,
+                                                 enum large_buf_action action) {
+    const u8 packet_type = infer_packet_type(direction, req->is_server);
+
+    switch (protocol_type) {
+    case k_protocol_type_mysql:
+        return mysql_send_large_buffer(
+            req, pid_conn, u_buf, bytes_len, packet_type, direction, action);
+    case k_protocol_type_postgres:
+        return postgres_send_large_buffer(req, u_buf, bytes_len, packet_type, direction, action);
+    case k_protocol_type_kafka:
+        return kafka_send_large_buffer(req, pid_conn, u_buf, bytes_len, direction, action);
+    case k_protocol_type_mssql:
+        mssql_send_large_buffer(req, u_buf, bytes_len, packet_type, direction, action);
+        if (packet_type == PACKET_TYPE_RESPONSE) {
+            return mssql_response_eom(req, u_buf, bytes_len);
+        }
+        return 0;
+    case k_protocol_type_http:
+    case k_protocol_type_mqtt:
+        break;
+    case k_protocol_type_sunrpc:
+        unknown_send_large_buffer(req, pid_conn, u_buf, bytes_len, packet_type, direction, action);
+        break;
+    case k_protocol_type_aerospike:
+        return aerospike_send_large_buffer(
+            req, pid_conn, u_buf, bytes_len, packet_type, direction, action);
+    case k_protocol_type_nats:
+    case k_protocol_type_amqp:
+    case k_protocol_type_unknown:
+        unknown_send_large_buffer(req, pid_conn, u_buf, bytes_len, packet_type, direction, action);
+        break;
+    }
+
+    return 0;
+}
+
+static __always_inline void failed_to_connect_event(pid_connection_info_t *pid_conn,
+                                                    lw_thread_t lw_thread,
+                                                    u16 orig_dport,
+                                                    u64 connect_ts) {
+    tcp_req_t *req = bpf_ringbuf_reserve(&events, sizeof(tcp_req_t), 0);
+    if (req) {
+        pid_info pid = {};
+        task_pid(&pid);
+        const u64 event_ts = bpf_ktime_get_ns();
+        const u64 extra_id = extra_runtime_id();
+        init_failed_connect_tcp_req(
+            req, pid_conn, orig_dport, connect_ts, event_ts, event_ts, extra_id, &pid);
+
+        bpf_dbg_printk("TCP connect failed event");
+
+        tcp_get_or_set_trace_info(req, pid_conn, lw_thread, 0, orig_dport);
+        bpf_ringbuf_submit(req, get_flags());
+    }
+}
+
+// Unix sockets information is not a real connection info, we cannot tell the server or client
+// other than with the directional flow of information at request creation time. Essentially,
+// if we are just creating a new request and it's TCP_RECV direction then it's a server.
+static __always_inline bool is_unix_sock_server(u8 direction, u16 orig_dport) {
+    return (direction == TCP_RECV && orig_dport == 0);
+}
+
+static __always_inline void handle_unknown_tcp_connection(pid_connection_info_t *pid_conn,
+                                                          void *u_buf,
+                                                          int bytes_len,
+                                                          u8 direction,
+                                                          u8 ssl,
+                                                          u16 orig_dport,
+                                                          lw_thread_t lw_thread,
+                                                          enum protocol_type protocol_type) {
+    tcp_req_t *existing = bpf_map_lookup_elem(&ongoing_tcp_req, pid_conn);
+    // NOTE: this shouldn't happen, but the is_server value may be incorrect,
+    // for example if an unrelated service is bound to the process port (like the metrics server)
+    const u32 netns = task_netns();
+    if (existing) {
+        if (existing->direction == direction && existing->end_monotime_ns != 0) {
+            bpf_map_delete_elem(&ongoing_tcp_req, pid_conn);
+            existing = 0;
+        }
+    }
+    if (!existing) {
+        // Determining the server information for unix sockets is only valid on request creation
+        const bool is_server = is_listening(pid_conn->conn.d_port, netns) ||
+                               is_unix_sock_server(direction, orig_dport);
+        if (direction == TCP_RECV) {
+            cp_support_data_t *tk = bpf_map_lookup_elem(&cp_support_connect_info, pid_conn);
+            if (tk && tk->real_client) {
+                bpf_dbg_printk("Got receive as first operation for client connection, ignoring...");
+                return;
+            }
+            connection_info_part_t client_part = {};
+            populate_ephemeral_info(
+                &client_part, &pid_conn->conn, orig_dport, pid_conn->pid, FD_CLIENT);
+            fd_info_t *fd_info = fd_info_for_conn(&client_part);
+            if (fd_info) {
+                bpf_dbg_printk(
+                    "Got receive as first operation for part client connection, ignoring...");
+                return;
+            }
+            // pre-agent client connection: receive-first here is a spontaneous reply,
+            // registering it would invert the request/response roles
+            if (!is_server) {
+                connection_info_part_t server_part = {};
+                populate_ephemeral_info(
+                    &server_part, &pid_conn->conn, orig_dport, pid_conn->pid, FD_SERVER);
+                if (!fd_info_for_conn(&server_part)) {
+                    bpf_dbg_printk("Got receive as first operation for stale client "
+                                   "connection, ignoring...");
+                    return;
+                }
+            }
+        } else {
+            connection_info_part_t server_part = {};
+            populate_ephemeral_info(
+                &server_part, &pid_conn->conn, orig_dport, pid_conn->pid, FD_SERVER);
+            fd_info_t *fd_info = fd_info_for_conn(&server_part);
+            if (fd_info) {
+                bpf_dbg_printk(
+                    "Got send as first operation for part server connection, ignoring...");
+                return;
+            }
+        }
+
+        tcp_req_t *req = empty_tcp_req();
+        if (req) {
+            req->is_server = is_server;
+            int original_bytes_len = bytes_len;
+            bpf_clamp_umax(bytes_len, k_tcp_max_len);
+            req->flags = EVENT_TCP_REQUEST;
+            req->conn_info = pid_conn->conn;
+            fixup_connection_info(&req->conn_info, direction, orig_dport);
+            req->ssl = ssl;
+            req->direction = direction;
+            req->start_monotime_ns = bpf_ktime_get_ns();
+            req->end_monotime_ns = 0;
+            req->resp_len = 0;
+            req->len = bytes_len;
+            req->event_source = event_source(lw_thread); // generic events generated from Go
+            req->req_len = original_bytes_len;
+            req->extra_id = extra_runtime_id();
+            pid_key_t req_task = {0};
+            task_tid(&req_task);
+            java_vt_translate_tid(&req_task);
+            req->task_tid = req_task.tid;
+            req->protocol_type = protocol_type;
+            task_pid(&req->pid);
+            bpf_probe_read(req->buf, bytes_len, u_buf);
+
+            req->tp.ts = bpf_ktime_get_ns();
+
+            bpf_dbg_printk("TCP request start, direction=%d, ssl=%d, protocol=%d",
+                           direction,
+                           ssl,
+                           protocol_type);
+
+            tcp_get_or_set_trace_info(req, pid_conn, lw_thread, ssl, orig_dport);
+
+            tcp_send_large_buffer(req,
+                                  pid_conn,
+                                  u_buf,
+                                  original_bytes_len,
+                                  direction,
+                                  protocol_type,
+                                  k_large_buf_action_init);
+
+            bpf_map_update_elem(&ongoing_tcp_req, pid_conn, req, BPF_ANY);
+        }
+    } else if (existing->direction != direction) {
+        const enum large_buf_action response_action =
+            (existing->lb_res_bytes > 0) ? k_large_buf_action_append : k_large_buf_action_init;
+        if (tcp_send_large_buffer(
+                existing, pid_conn, u_buf, bytes_len, direction, protocol_type, response_action) <
+            0) {
+            bpf_dbg_printk("waiting additional response data");
+            return;
+        }
+
+        if (existing->end_monotime_ns == 0) {
+            bpf_clamp_umax(bytes_len, k_tcp_res_len);
+            existing->end_monotime_ns = bpf_ktime_get_ns();
+            existing->resp_len = bytes_len;
+            tcp_req_t *trace = bpf_ringbuf_reserve(&events, sizeof(tcp_req_t), 0);
+            if (trace) {
+                bpf_dbg_printk("Sending TCP trace: existing=%lx, resp_length=%d",
+                               existing,
+                               existing->resp_len);
+
+                __builtin_memcpy(trace, existing, sizeof(tcp_req_t));
+                bpf_probe_read(trace->rbuf, bytes_len, u_buf);
+
+                bpf_ringbuf_submit(trace, get_flags());
+            } else {
+                bpf_dbg_printk("failed to reserve space on the ringbuf");
+            }
+            cleanup_trace_info(existing, pid_conn);
+        }
+    } else {
+        if (existing->len > 0 && existing->len < (k_tcp_max_len / 2)) {
+            // Attempt to append one more packet. I couldn't convince the verifier
+            // to use a variable (k_tcp_max_len-existing->len). If needed we may need
+            // to try harder. Mainly needed for userspace detection of missed gRPC, where
+            // the protocol may sent a RST frame after we've done creating the event, so
+            // the next event has an RST frame prepended.
+            u32 off = existing->len;
+            bpf_clamp_umax(off, (k_tcp_max_len / 2));
+            bpf_probe_read(existing->buf + off, (k_tcp_max_len / 2), u_buf);
+        }
+        existing->len += bytes_len;
+        existing->req_len = existing->len;
+
+        tcp_send_large_buffer(existing,
+                              pid_conn,
+                              u_buf,
+                              bytes_len,
+                              direction,
+                              protocol_type,
+                              k_large_buf_action_append);
+    }
+}
+
+// k_tail_protocol_tcp
+SEC("kprobe/tcp")
+int GUARDED_PROG(obi_protocol_tcp, void *, ctx) {
+    (void)ctx;
+
+    // it assumes that the actual protocol_args have been previously set
+    // from another BPF function.
+    // If that's not the case, the connection details might be empty.
+    // If the same thread manages multiple connections at the same thread,
+    // in principle we should be anyway safe as this is part of a
+    // tail-call chain, so the current thread is currently inside the kernel
+    // (or blocked waiting for the kernel to complete) before it can service another connection.
+    call_protocol_args_t *args = protocol_args();
+
+    if (!args) {
+        return 0;
+    }
+
+    bpf_dbg_printk("=== kprobe/tcp len=%d, pid=%d, protocol_type=%d ===",
+                   args->bytes_len,
+                   args->pid_conn.pid,
+                   args->protocol_type);
+
+    handle_unknown_tcp_connection(&args->pid_conn,
+                                  (void *)args->u_buf,
+                                  args->bytes_len,
+                                  args->direction,
+                                  args->ssl,
+                                  args->orig_dport,
+                                  args->lw_thread,
+                                  args->protocol_type);
+
+    return 0;
+}

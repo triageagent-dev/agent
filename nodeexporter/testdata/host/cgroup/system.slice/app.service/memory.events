@@ -1,0 +1,2 @@
+oom_kill 2
+oom_group_kill 1

@@ -1,0 +1,183 @@
+version: "3.8"
+
+services:
+  testservergrpcgo:
+    build:
+      context: ../../..
+      dockerfile: internal/test/integration/components/go_simple_grpc/Dockerfile
+    image: hatest-testserver-logenricher-grpc-go
+    networks:
+      - shared
+    ports:
+      - "8382:8080"
+
+  testserverhttp:
+    build:
+      context: ../../..
+      dockerfile: internal/test/integration/components/pythonserver/Dockerfile
+    image: hatest-testserver-logenricher-http
+    networks:
+      - shared
+    ports:
+      - "8381:8380"
+
+  testservernodejs:
+    build:
+      context: ../../..
+      dockerfile: internal/test/integration/components/nodejsserver/Dockerfile
+    image: hatest-testserver-node
+    networks:
+      - shared
+    ports:
+      - "8383:3030"
+
+  testserverjava:
+    build:
+      context: ../../..
+      dockerfile: internal/test/integration/components/javatestserver/Dockerfile_jar
+    image: hatest-testserver-logenricher-java
+    networks:
+      - shared
+    ports:
+      - "8384:8085"
+
+  testserverruby:
+    build:
+      context: ../../..
+      dockerfile: internal/test/integration/components/rubytestserver/testapi/Dockerfile
+    image: hatest-testserver-logenricher-ruby
+    networks:
+      - shared
+    ports:
+      - "8385:3040"
+    environment:
+      PORT: "3040"
+      RAILS_MAX_THREADS: "2"
+
+  testserverdotnet:
+    build:
+      context: ../../..
+      dockerfile: internal/test/integration/components/dotnetserver/Dockerfile
+    image: hatest-testserver-logenricher-dotnet
+    networks:
+      - shared
+    ports:
+      - "8386:5266"
+
+  testserverpythonasync:
+    build:
+      context: ../../..
+      dockerfile: internal/test/integration/components/pythonasync-uvloop/Dockerfile-3.14
+    image: hatest-testserver-logenricher-pythonasync
+    networks:
+      - shared
+    ports:
+      - "8387:8391"
+    environment:
+      PYTHONUNBUFFERED: "1"
+      UVICORN_LOOP: "uvloop"
+      BACKEND_URL: "http://testserverhttp:8380"
+
+  testservermultisegwritev:
+    build:
+      context: ../../..
+      dockerfile: internal/test/integration/components/logenricher_writev/Dockerfile
+    image: hatest-testserver-logenricher-multiseg-writev
+    networks:
+      - shared
+    ports:
+      - "8388:8388"
+    environment:
+      PORT: "8388"
+
+  testservershellsubst:
+    build:
+      context: ../../..
+      dockerfile: internal/test/integration/components/shellsubst/Dockerfile
+    image: hatest-testserver-logenricher-shellsubst
+    networks:
+      - shared
+
+  multisegwritev_otelcol:
+    image: otel/opentelemetry-collector-contrib:0.159.0@sha256:1f2c54a30e713fac6b3ae77a1ec84010c2007e29ced8ec666214fc2f6739c1cc
+    user: "0:0"
+    volumes:
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - ./configs/otelcol-multiseg-filter.yaml:/etc/otelcol-contrib/config.yaml:ro
+      - ../../../testoutput/multiseg-shipper-output:/output
+    command: ["--config=/etc/otelcol-contrib/config.yaml"]
+    networks:
+      - shared
+    depends_on:
+      testservermultisegwritev:
+        condition: service_started
+
+  multisegwritev_fluentbit:
+    image: fluent/fluent-bit:5.1.0@sha256:bf09d620b6b45c080b4da86ac5d98fd3739c1213a148f93dec884fdcc64084cb
+    user: "0:0"
+    volumes:
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - ./configs/fluentbit-multiseg-filter.conf:/fluent-bit/etc/fluent-bit.conf:ro
+      - ../../../testoutput/multiseg-shipper-output:/output
+    networks:
+      - shared
+    depends_on:
+      testservermultisegwritev:
+        condition: service_started
+
+  obi:
+    build:
+      context: ../../..
+      dockerfile: ./internal/test/integration/components/obi/Dockerfile
+    volumes:
+      - ./configs/:/configs
+      - /sys/kernel/security:/sys/kernel/security:ro
+      - ../../../testoutput:/coverage
+      - ../../../testoutput/run-python:/var/run/obi
+      - /sys/fs/bpf:/sys/fs/bpf
+    image: hatest-obi
+    privileged: true # in some environments (not GH Pull Requests) you can set it to false and then cap_add: [ SYS_ADMIN ]
+    networks:
+      - shared
+    pid: "host"
+    environment:
+      OTEL_EBPF_CONFIG_PATH: "/configs/obi-config-log-enricher.yml"
+      GOCOVERDIR: "/coverage"
+      OTEL_EBPF_TRACE_PRINTER: "text"
+      OTEL_EBPF_OPEN_PORT: "${OTEL_EBPF_OPEN_PORT}"
+      OTEL_EBPF_DISCOVERY_POLL_INTERVAL: 500ms
+      OTEL_EBPF_EXECUTABLE_PATH: "${OTEL_EBPF_EXECUTABLE_PATH}"
+      OTEL_EBPF_SERVICE_NAMESPACE: "integration-test"
+      OTEL_EBPF_METRICS_INTERVAL: "10ms"
+      OTEL_EBPF_BPF_BATCH_TIMEOUT: "10ms"
+      OTEL_EBPF_LOG_LEVEL: "DEBUG"
+      OTEL_EBPF_BPF_DEBUG: "TRUE"
+      OTEL_EBPF_HOSTNAME: "obi"
+      OTEL_EBPF_OTLP_TRACES_BATCH_TIMEOUT: "1ms"
+      OTEL_EBPF_BPF_HTTP_REQUEST_TIMEOUT: "5s"
+      OTEL_EBPF_BPF_TRACK_REQUEST_HEADERS: "true"
+      OTEL_EBPF_PROCESSES_INTERVAL: "100ms"
+      OTEL_EBPF_METRICS_FEATURES: "application,application_span_otel,application_service_graph"
+      OTEL_EBPF_PROMETHEUS_FEATURES: "application,application_span_otel,application_service_graph"
+    depends_on:
+      testserverhttp:
+        condition: service_started
+      testservergrpcgo:
+        condition: service_started
+      testservernodejs:
+        condition: service_started
+      testserverjava:
+        condition: service_started
+      testserverruby:
+        condition: service_started
+      testserverdotnet:
+        condition: service_started
+      testserverpythonasync:
+        condition: service_started
+      testservermultisegwritev:
+        condition: service_started
+      testservershellsubst:
+        condition: service_started
+
+networks:
+  shared:

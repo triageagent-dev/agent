@@ -1,0 +1,129 @@
+{
+  "events": [
+    {
+      "category": "INCIDENT",
+      "description": "Our engineering team had identified a backlog created by a delay in routing a small percentage of log entries into our backend analytics platform. This delay is specific to analytics ingestion, and all logs remain fully accessible without delay through the Logs Explorer.\n\nWe have scaled up internal processing capacity and restarted backend components, which has resulted in the backlog steadily decreasing. \n\nWe will provide more information by Sunday, 2026-07-26 07:00 PDT.",
+      "detailedCategory": "CONFIRMED_INCIDENT",
+      "detailedState": "CONFIRMED",
+      "eventImpacts": [
+        {
+          "location": {
+            "locationName": "africa-south1"
+          },
+          "product": {
+            "id": "PuCJ6W2ovoDhLcyvZ1xa",
+            "productName": "Cloud Logging"
+          }
+        },
+        {
+          "location": {
+            "locationName": "africa-south1-a"
+          },
+          "product": {
+            "id": "PuCJ6W2ovoDhLcyvZ1xa",
+            "productName": "Cloud Logging"
+          }
+        },
+        {
+          "location": {
+            "locationName": "africa-south1-b"
+          },
+          "product": {
+            "id": "PuCJ6W2ovoDhLcyvZ1xa",
+            "productName": "Cloud Logging"
+          }
+        }
+      ],
+      "name": "projects/example-project-0000/locations/global/events/KQFHVGL",
+      "nextUpdateTime": "2026-07-26T14:00:00Z",
+      "relevance": "PARTIALLY_RELATED",
+      "startTime": "2026-07-25T04:07:30Z",
+      "state": "ACTIVE",
+      "title": "Cloud Logging customers may experience delays in logs ingestion into Logs Analytics",
+      "updateTime": "2026-07-26T06:39:43.386141Z"
+    },
+    {
+      "category": "INCIDENT",
+      "description": "Storage Insights Datasets are experiencing ingestion delays, but all datasets through the 2026-07-24 snapshots are up to date and are available for querying. \n\nIngestion of buckets/objects was previously delayed in multiregions/us, us-central1, and us-east5 for snapshots from 2026-07-04 through 2026-07-23, but has since recovered. \n\nThe engineering team continues to work on mitigation.\n\nWe will provide more information by Sunday, 2026-07-26 21:00 PDT",
+      "detailedCategory": "CONFIRMED_INCIDENT",
+      "detailedState": "CONFIRMED",
+      "eventImpacts": [
+        {
+          "location": {
+            "locationName": "europe-west1"
+          },
+          "product": {
+            "id": "UwaYoXQ5bHYHG6EdiPB8",
+            "productName": "Google Cloud Storage"
+          }
+        },
+        {
+          "location": {
+            "locationName": "us"
+          },
+          "product": {
+            "id": "UwaYoXQ5bHYHG6EdiPB8",
+            "productName": "Google Cloud Storage"
+          }
+        },
+        {
+          "location": {
+            "locationName": "us-central1"
+          },
+          "product": {
+            "id": "UwaYoXQ5bHYHG6EdiPB8",
+            "productName": "Google Cloud Storage"
+          }
+        }
+      ],
+      "name": "projects/example-project-0000/locations/global/events/NHLVNDD",
+      "nextUpdateTime": "2026-07-27T04:00:00Z",
+      "relevance": "RELATED",
+      "startTime": "2026-07-06T18:08:55.145Z",
+      "state": "ACTIVE",
+      "title": "Google Cloud Storage: Storage Insights Datasets are experiencing ingestion delays for metadata snapshots.",
+      "updateTime": "2026-07-25T22:46:09.161931Z"
+    },
+    {
+      "category": "INCIDENT",
+      "description": "Google Engineers have confirmed an issue with Virtual Private Cloud (VPC). There is an issue with:\n* VM to VM communication\n\nIn the following locations:\n* asia-south1\n* asia-south2\n* australia-southeast1\n* europe-north1\n* northamerica-northeast1 (active)\n* southamerica-west1 (active)\n* us-east1 (active)\n* us-east4 (active)\n* us-east5 (active)\n* us-south1 (active)\n* us-west1\n\n",
+      "detailedCategory": "EMERGING_INCIDENT",
+      "detailedState": "EMERGING",
+      "eventImpacts": [
+        {
+          "location": {
+            "locationName": "asia-south1"
+          },
+          "product": {
+            "id": "BSGtCUnz6ZmyajsjgTKv",
+            "productName": "Virtual Private Cloud (VPC)"
+          }
+        },
+        {
+          "location": {
+            "locationName": "asia-south2"
+          },
+          "product": {
+            "id": "BSGtCUnz6ZmyajsjgTKv",
+            "productName": "Virtual Private Cloud (VPC)"
+          }
+        },
+        {
+          "location": {
+            "locationName": "australia-southeast1"
+          },
+          "product": {
+            "id": "BSGtCUnz6ZmyajsjgTKv",
+            "productName": "Virtual Private Cloud (VPC)"
+          }
+        }
+      ],
+      "name": "projects/example-project-0000/locations/global/events/SLSBGLN",
+      "relevance": "PARTIALLY_RELATED",
+      "startTime": "2026-06-30T10:24:54Z",
+      "state": "ACTIVE",
+      "title": "VM to VM communication",
+      "updateTime": "2026-07-26T09:34:39.182612Z"
+    }
+  ]
+}

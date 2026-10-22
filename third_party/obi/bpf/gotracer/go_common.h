@@ -1,0 +1,550 @@
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
+
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#pragma once
+
+#include <bpfcore/utils.h>
+#include <bpfcore/bpf_helpers.h>
+
+#include <common/go_addr_key.h>
+#include <common/map_sizing.h>
+#include <common/pin_internal.h>
+#include <common/strings.h>
+#include <common/trace_helpers.h>
+#include <common/trace_util.h>
+#include <common/tracing.h>
+#include <common/tp_info.h>
+
+#include <gotracer/go_offsets.h>
+
+#include <gotracer/maps/handled_by_go.h>
+
+#include <logger/bpf_dbg.h>
+
+#include <maps/incoming_trace_map.h>
+
+#include <pid/pid_helpers.h>
+
+enum { W3C_KEY_LENGTH = 11, W3C_VAL_LENGTH = 55 };
+
+static unsigned char tp_encoded[] = {
+    0x4d, 0x83, 0x21, 0x6b, 0x1d, 0x85, 0xa9, 0x3f}; // hpack encoded "traceparent"
+
+// Temporary information about a function invocation. It stores the invocation time of a function
+// as well as the value of registers at the invocation time. This way we can retrieve them at the
+// return uprobes so we can know the values of the function arguments (which are passed as registers
+// since Go 1.17).
+// This element is created in the function start probe and stored in the ongoing_http_requests hashmaps.
+// Then it is retrieved in the return uprobes and used to know the HTTP call duration as well as its
+// attributes (method, path, and status code).
+
+typedef struct goroutine_metadata_t {
+    go_addr_key_t parent;
+    u64 timestamp;
+} goroutine_metadata;
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __type(key, go_addr_key_t);        // key: pointer to the goroutine
+    __type(value, goroutine_metadata); // value: timestamp of the goroutine creation
+    __uint(max_entries, MAX_CONCURRENT_SHARED_REQUESTS);
+    __uint(pinning, OBI_PIN_INTERNAL);
+} ongoing_goroutines SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __type(key, go_addr_key_t); // key: pointer to the request goroutine
+    __type(value, connection_info_t);
+    __uint(max_entries, MAX_CONCURRENT_SHARED_REQUESTS);
+    __uint(pinning, OBI_PIN_INTERNAL);
+} ongoing_server_connections SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __type(key, go_addr_key_t); // key: pointer to the request goroutine
+    __type(value, connection_info_t);
+    __uint(max_entries, MAX_CONCURRENT_REQUESTS);
+} ongoing_client_connections SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __type(key, go_addr_key_t); // key: pointer to the goroutine
+    __type(value, tp_info_t);   // value: traceparent info
+    __uint(max_entries, MAX_CONCURRENT_SHARED_REQUESTS);
+    __uint(pinning, OBI_PIN_INTERNAL);
+} go_trace_map SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __type(key, go_addr_key_t); // key: goroutine
+    __type(value, void *);      // the transport *
+    __uint(max_entries, MAX_CONCURRENT_REQUESTS);
+} ongoing_grpc_operate_headers SEC(".maps");
+
+typedef struct grpc_transports {
+    connection_info_t conn;
+    u8 type;
+    u8 pad[3];
+    tp_info_t tp;
+} grpc_transports_t;
+
+// TODO: use go_addr_key_t as key
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __type(key, void *); // key: pointer to the transport pointer
+    __type(value, grpc_transports_t);
+    __uint(max_entries, MAX_CONCURRENT_REQUESTS);
+} ongoing_grpc_transports SEC(".maps");
+
+#define SQL_CONN_TYPE_DATABASE_SQL 0 // database/sql (mysql, pq)
+#define SQL_CONN_TYPE_PGX 1          // github.com/jackc/pgx/v5
+
+typedef struct sql_func_invocation {
+    u64 start_monotime_ns;
+    u64 sql_param;
+    u64 query_len;
+    u64 driver_conn_ptr;
+    tp_info_t tp;
+    connection_info_t conn;
+    u8 _pad[4];
+} sql_func_invocation_t;
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __type(key, go_addr_key_t); // key: pointer to the request goroutine
+    __type(value, sql_func_invocation_t);
+    __uint(max_entries, MAX_CONCURRENT_REQUESTS);
+} ongoing_sql_queries SEC(".maps");
+
+typedef struct grpc_header_field {
+    u8 *key_ptr;
+    u64 key_len;
+    u8 *val_ptr;
+    u64 val_len;
+    u64 sensitive;
+} grpc_header_field_t;
+
+static __always_inline void
+go_addr_key_from_id_and_pid(go_addr_key_t *current, void *addr, const u32 pid) {
+    current->addr = (u64)addr;
+    current->pid = pid;
+}
+
+static __always_inline void go_addr_key_from_id(go_addr_key_t *current, void *addr) {
+    const u64 pid_tid = bpf_get_current_pid_tgid();
+    const u32 pid = pid_from_pid_tgid(pid_tid);
+
+    go_addr_key_from_id_and_pid(current, addr, pid);
+}
+
+static __always_inline u64 find_parent_goroutine(go_addr_key_t *current) {
+    if (!current) {
+        return 0;
+    }
+
+    u64 r_addr = current->addr;
+    go_addr_key_t *parent = current;
+
+    int attempts = 0;
+    do {
+        tp_info_t *p_inv = bpf_map_lookup_elem(&go_trace_map, parent);
+        if (!p_inv) { // not this goroutine running the server request processing
+            // Let's find the parent scope
+            goroutine_metadata *g_metadata =
+                (goroutine_metadata *)bpf_map_lookup_elem(&ongoing_goroutines, parent);
+            if (g_metadata) {
+                // Lookup now to see if the parent was a request
+                // Debug here commented out on purpose to avoid prints in loops.
+                // bpf_printk("lookup %llx -> %llx", r_addr, g_metadata->parent.addr);
+                r_addr = g_metadata->parent.addr;
+                parent = &g_metadata->parent;
+            } else {
+                break;
+            }
+        } else {
+            bpf_dbg_printk("Found parent, r_addr=%lx", r_addr);
+            return r_addr;
+        }
+
+        attempts++;
+        // We loop far back because some clients, e.g. Kafka Franz-Go really nest the
+        // client calls.
+    } while (attempts < 6); // Up to 6 levels of goroutine nesting allowed
+
+    return 0;
+}
+
+static __always_inline u64 find_parent_goroutine_in_chain(go_addr_key_t *current) {
+    if (!current) {
+        return 0;
+    }
+
+    // Let's find the parent scope
+    goroutine_metadata *g_metadata =
+        (goroutine_metadata *)bpf_map_lookup_elem(&ongoing_goroutines, current);
+    if (g_metadata) {
+        // Lookup now to see if the parent was a request
+        return g_metadata->parent.addr;
+    }
+
+    return 0;
+}
+
+static __always_inline void decode_go_traceparent(const unsigned char *buf,
+                                                  unsigned char *trace_id,
+                                                  unsigned char *span_id,
+                                                  unsigned char *flags) {
+    const unsigned char *t_id = buf + 2 + 1; // strlen(ver) + strlen("-")
+    const unsigned char *s_id =
+        buf + 2 + 1 + 32 + 1; // strlen(ver) + strlen("-") + strlen(trace_id) + strlen("-")
+    const unsigned char *f_id =
+        buf + 2 + 1 + 32 + 1 + 16 +
+        1; // strlen(ver) + strlen("-") + strlen(trace_id) + strlen("-") + strlen(span_id) + strlen("-")
+
+    decode_hex(trace_id, t_id, TRACE_ID_CHAR_LEN);
+    decode_hex(span_id, s_id, SPAN_ID_CHAR_LEN);
+    decode_hex(flags, f_id, FLAGS_CHAR_LEN);
+}
+
+static __always_inline void tp_from_parent(tp_info_t *tp, tp_info_t *parent) {
+    *((u64 *)tp->trace_id) = *((u64 *)parent->trace_id);
+    *((u64 *)(tp->trace_id + 8)) = *((u64 *)(parent->trace_id + 8));
+    *((u64 *)tp->parent_id) = *((u64 *)parent->span_id);
+    tp->flags = parent->flags;
+}
+
+static __always_inline void tp_clone(tp_info_t *dest, tp_info_t *src) {
+    *((u64 *)dest->trace_id) = *((u64 *)src->trace_id);
+    *((u64 *)(dest->trace_id + 8)) = *((u64 *)(src->trace_id + 8));
+    *((u64 *)dest->span_id) = *((u64 *)src->span_id);
+    *((u64 *)dest->parent_id) = *((u64 *)src->parent_id);
+    dest->flags = src->flags;
+}
+
+static __always_inline void
+server_trace_parent(void *goroutine_addr, tp_info_t *tp, tp_info_t *found_tp) {
+    // May get overridden when decoding existing traceparent, but otherwise we set sample ON
+    tp->flags = k_flag_sampled;
+    tp->ts = bpf_ktime_get_ns();
+    go_addr_key_t g_key = {};
+    go_addr_key_from_id(&g_key, goroutine_addr);
+    if (found_tp) {
+        bpf_dbg_printk("Decoded from existing traceparent");
+        __builtin_memcpy(tp, found_tp, sizeof(tp_info_t));
+    } else {
+        connection_info_t *info = bpf_map_lookup_elem(&ongoing_server_connections, &g_key);
+        u8 found_info = 0;
+
+        if (info) {
+            connection_info_t conn = *info;
+            // Must sort here, Go connection info retains the original ordering.
+            sort_connection_info(&conn);
+
+            // First we look-up if we have information passed down to us from
+            // TCP/IP context propagation.
+            tp_info_pid_t *existing_tp = bpf_map_lookup_elem(&incoming_trace_map, &conn);
+            if (existing_tp) {
+                bpf_dbg_printk("Found incoming (TCP) tp for server request");
+                found_info = 1;
+                tp_from_parent(tp, &existing_tp->tp);
+                bpf_map_delete_elem(&incoming_trace_map, &conn);
+            } else {
+                // If not, we then look up the information in the black-box context map - same node.
+                bpf_dbg_printk("Looking up traceparent for connection info");
+                tp_info_pid_t *tp_p = trace_info_for_connection(&conn, TRACE_TYPE_CLIENT);
+                if (!disable_black_box_cp && tp_p) {
+                    if (correlated_request_with_current(tp_p)) {
+                        bpf_dbg_printk("Found traceparent from trace map, another process.");
+                        found_info = 1;
+                        tp_from_parent(tp, &tp_p->tp);
+                    }
+                }
+            }
+        }
+
+        if (!found_info) {
+            bpf_dbg_printk("No traceparent in headers, generating");
+            urand_bytes(tp->trace_id, TRACE_ID_SIZE_BYTES);
+            *((u64 *)tp->parent_id) = 0;
+        }
+    }
+
+    urand_bytes(tp->span_id, SPAN_ID_SIZE_BYTES);
+    // found_tp memcpy clobbered ts; reset before go_trace_map store
+    tp->ts = bpf_ktime_get_ns();
+    bpf_map_update_elem(&go_trace_map, &g_key, tp, BPF_ANY);
+
+    unsigned char tp_buf[TP_MAX_VAL_LENGTH];
+    make_tp_string(tp_buf, tp);
+    bpf_dbg_printk("tp_buf=[%s]", tp_buf);
+}
+
+static __always_inline tp_info_t *tp_info_from_parent_go(go_addr_key_t *g_key, u64 *parent_found) {
+    tp_info_t *tp = 0;
+
+    const u64 parent_id = find_parent_goroutine(g_key);
+    go_addr_key_t p_key = {};
+    go_addr_key_from_id(&p_key, (void *)parent_id);
+
+    if (parent_id) { // we found a parent request
+        tp = (tp_info_t *)bpf_map_lookup_elem(&go_trace_map, &p_key);
+    }
+
+    if (tp) {
+        bpf_dbg_printk("Found parent request, tp=%llx", tp);
+        if (parent_found) {
+            *parent_found = parent_id;
+        }
+    }
+
+    return tp;
+}
+
+static __always_inline void update_tp_parent_go(go_addr_key_t *gp_key, tp_info_t *tp) {
+    bpf_map_update_elem(&go_trace_map, gp_key, tp, BPF_ANY);
+}
+
+static __always_inline u8 client_trace_parent(void *goroutine_addr, tp_info_t *tp_i) {
+    u8 found_trace_id = 0;
+
+    // May get overridden when decoding existing traceparent or finding a server span, but otherwise we set sample ON
+    tp_i->flags = k_flag_sampled;
+    // We set the time of the current client trace parent
+    tp_i->ts = bpf_ktime_get_ns();
+
+    go_addr_key_t g_key = {};
+    go_addr_key_from_id(&g_key, goroutine_addr);
+
+    // We first check for Cloud web databases (like snowflake), which wrap HTTP calls with SQL
+    // statements.
+    if (!found_trace_id) {
+        sql_func_invocation_t *invocation = bpf_map_lookup_elem(&ongoing_sql_queries, &g_key);
+        if (invocation) {
+            tp_from_parent(tp_i, &invocation->tp);
+            found_trace_id = 1;
+        }
+    }
+
+    if (!found_trace_id) {
+        tp_info_t *tp = tp_info_from_parent_go(&g_key, 0);
+
+        if (tp) {
+            if (should_be_in_same_transaction(tp, tp_i)) {
+                tp_from_parent(tp_i, tp);
+                found_trace_id = 1;
+            } else {
+                bpf_dbg_printk("Parent and child are too far apart, ignoring parent trace_id");
+            }
+        }
+
+        if (!found_trace_id) {
+            urand_bytes(tp_i->trace_id, TRACE_ID_SIZE_BYTES);
+        }
+
+        urand_bytes(tp_i->span_id, SPAN_ID_SIZE_BYTES);
+    }
+
+    return found_trace_id;
+}
+
+static __always_inline void read_ip_and_port(void *src, u8 *dst_ip, u16 *dst_port) {
+    s64 addr_len = 0;
+    void *addr_ip = 0;
+    off_table_t *ot = get_offsets_table();
+
+    bpf_probe_read_user(dst_port,
+                        sizeof(u16),
+                        (void *)(src + go_offset_of(ot, (go_offset){.v = _tcp_addr_port_ptr_pos})));
+    bpf_probe_read_user(&addr_ip,
+                        sizeof(addr_ip),
+                        (void *)(src + go_offset_of(ot, (go_offset){.v = _tcp_addr_ip_ptr_pos})));
+    if (addr_ip) {
+        bpf_probe_read_user(
+            &addr_len,
+            sizeof(addr_len),
+            (void *)(src + go_offset_of(ot, (go_offset){.v = _tcp_addr_ip_ptr_pos}) + 8));
+        if (addr_len == 4) {
+            __builtin_memcpy(dst_ip, ip4ip6_prefix, sizeof(ip4ip6_prefix));
+            bpf_probe_read_user(dst_ip + sizeof(ip4ip6_prefix), 4, addr_ip);
+        } else if (addr_len == 16) {
+            bpf_probe_read_user(dst_ip, 16, addr_ip);
+        }
+    }
+}
+
+static __always_inline u8 get_conn_info_from_fd(void *fd_ptr,
+                                                connection_info_t *info,
+                                                const bool mark_handled) {
+    if (fd_ptr) {
+        void *laddr_ptr = 0;
+        void *raddr_ptr = 0;
+        off_table_t *ot = get_offsets_table();
+        const u64 fd_laddr_pos = go_offset_of(ot, (go_offset){.v = _fd_laddr_pos});
+
+        bpf_probe_read_user(
+            &laddr_ptr, sizeof(laddr_ptr), (void *)(fd_ptr + fd_laddr_pos + 8)); // find laddr
+        bpf_probe_read_user(
+            &raddr_ptr,
+            sizeof(raddr_ptr),
+            (void *)(fd_ptr + go_offset_of(ot, (go_offset){.v = _fd_raddr_pos}) + 8)); // find raddr
+
+        bpf_dbg_printk("laddr_field_ptr=%llx, laddr_ptr=%llx, raddr_ptr=%llx",
+                       fd_ptr + fd_laddr_pos + 8, //laddr_field_ptr
+                       laddr_ptr,
+                       raddr_ptr);
+        if (laddr_ptr && raddr_ptr) {
+
+            // read local
+            read_ip_and_port(laddr_ptr, info->s_addr, &info->s_port);
+
+            // read remote
+            read_ip_and_port(raddr_ptr, info->d_addr, &info->d_port);
+
+            //dbg_print_http_connection_info(info);
+
+            // IMPORTANT: Unlike kprobes, where we track the sorted connection info
+            // in Go we keep the original connection info order, since we only need it
+            // sorted when we make server requests or when we populate the trace_map for
+            // black box context propagation.
+
+            if (mark_handled) {
+                store_go_handled_connection_info(info);
+            }
+
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+static __always_inline void *fd_ptr_from_conn(void *conn_ptr) {
+    if (conn_ptr) {
+        void *fd_ptr = 0;
+        off_table_t *ot = get_offsets_table();
+
+        bpf_probe_read_user(
+            &fd_ptr,
+            sizeof(fd_ptr),
+            (void *)(conn_ptr + go_offset_of(ot, (go_offset){.v = _conn_fd_pos}))); // find fd
+
+        return fd_ptr;
+    }
+
+    return 0;
+}
+
+// HTTP black-box context propagation
+static __always_inline u8 get_conn_info(void *conn_ptr, connection_info_t *info) {
+    if (conn_ptr) {
+        void *fd_ptr = fd_ptr_from_conn(conn_ptr);
+        bpf_dbg_printk("Found fd, fd_ptr=%llx", fd_ptr);
+
+        if (fd_ptr) {
+            return get_conn_info_from_fd(fd_ptr, info, true);
+        }
+    }
+
+    return 0;
+}
+
+static __always_inline void *unwrap_tls_conn_info(void *conn_ptr, void *tls_state) {
+    if (conn_ptr && tls_state) {
+        void *c_ptr = 0;
+        bpf_probe_read(&c_ptr, sizeof(c_ptr), conn_ptr); // unwrap conn
+
+        bpf_dbg_printk("unwrapped conn, c_ptr=%llx", c_ptr);
+
+        if (c_ptr) {
+            return c_ptr + 8;
+        }
+    }
+
+    return conn_ptr;
+}
+
+static __always_inline void process_meta_frame_headers(void *frame, tp_info_t *tp) {
+    if (!frame) {
+        return;
+    }
+
+    off_table_t *ot = get_offsets_table();
+
+    void *fields = 0;
+    const u64 fields_off = go_offset_of(ot, (go_offset){.v = _meta_headers_frame_fields_ptr_pos});
+    bpf_probe_read(&fields, sizeof(fields), (void *)(frame + fields_off));
+    u64 fields_len = 0;
+    bpf_probe_read(&fields_len, sizeof(fields_len), (void *)(frame + fields_off + 8));
+    bpf_dbg_printk("fields=%llx, fields_len=%d", fields, fields_len);
+    if (fields && fields_len > 0) {
+        // 32: gRPC HEADERS + forwarded metadata + tpinjector-appended TP
+        for (u8 i = 0; i < 32; i++) {
+            if (i >= fields_len) {
+                break;
+            }
+            void *field_ptr = fields + (i * sizeof(grpc_header_field_t));
+            grpc_header_field_t field = {};
+            bpf_probe_read(&field, sizeof(grpc_header_field_t), field_ptr);
+            if (field.key_len == W3C_KEY_LENGTH && field.val_len == W3C_VAL_LENGTH) {
+                unsigned char temp[W3C_VAL_LENGTH];
+
+                bpf_probe_read(&temp, W3C_KEY_LENGTH, field.key_ptr);
+                if (stricmp((const char *)temp, "traceparent", W3C_KEY_LENGTH)) {
+                    //bpf_dbg_printk("found grpc traceparent header");
+                    bpf_probe_read(&temp, W3C_VAL_LENGTH, field.val_ptr);
+                    decode_go_traceparent(temp, tp->trace_id, tp->parent_id, &tp->flags);
+                    break;
+                }
+            }
+        }
+    }
+}
+
+// Reads the StreamID of the HeadersFrameParam passed to
+// golang.org/x/net/http2.(*Framer).WriteHeaders.
+//
+// Whether that struct is register- or stack-assigned depends on the Go internal
+// ABI's register budget. Counting the receiver, the call needs 11 integer
+// argument registers. amd64 offers 9, so from x/net/http2 v0.45.0 on — when the
+// struct grew past the budget — Go assigns it entirely to the stack, with
+// StreamID as its first field one word above SP (the CALL instruction pushed the
+// return address). arm64 offers 16 (R0-R15), so the struct still fits in
+// registers there and StreamID stays in R1.
+// https://github.com/golang/go/blob/master/src/cmd/compile/abi-internal.md
+static __always_inline u64 golang_stream_id(struct pt_regs *ctx, off_table_t *ot) {
+#ifdef __TARGET_ARCH_x86
+    const u64 on_stack = go_offset_of(ot, (go_offset){.v = _http2_zero_forty_five_zero});
+
+    if (on_stack) {
+        const void *sp = (const void *)PT_REGS_SP(ctx);
+
+        bpf_dbg_printk("sp=%llx", sp);
+
+        // StreamID is a u32; reading it as such avoids depending on the
+        // struct's alignment padding.
+        u32 stream_id = 0;
+        const u8 k_stream_id_offset = 0x8;
+
+        if (bpf_probe_read_user(&stream_id, sizeof(stream_id), sp + k_stream_id_offset) != 0) {
+            bpf_dbg_printk("couldn't read stream_id");
+            return 0;
+        }
+
+        return stream_id;
+    }
+#endif
+
+    return (u64)GO_PARAM2(ctx);
+}

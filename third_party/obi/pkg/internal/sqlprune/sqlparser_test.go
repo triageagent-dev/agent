@@ -1,0 +1,393 @@
+/*
+ * Copyright The OpenTelemetry Authors
+ * SPDX-License-Identifier: Apache-2.0
+ * Copyright Grafana Labs
+ * SPDX-License-Identifier: Apache-2.0
+ */
+package sqlprune
+
+import (
+	"strings"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+
+	"go.opentelemetry.io/obi/pkg/appolly/app/request"
+)
+
+func TestSQLExtraction(t *testing.T) {
+	type result struct {
+		op    string
+		table string
+	}
+
+	t.Run("test SELECT", func(t *testing.T) {
+		// a SELECT over several distinct tables has no single db.collection.name
+		tests := map[string]result{
+			"SELECT t.id, t.name FROM ACCESS_TOKENS t, SECURITY_POLICIES sp WHERE sp.id=t.security_policy_id AND sp.org_id=?": {op: "SELECT", table: ""},
+			"SELECT * FROM TABLE WHERE FIELD=1234": {op: "SELECT", table: ""},
+			"SELECT * FROM ZOOM WHERE FIELD=1234":  {op: "SELECT", table: "ZOOM"},
+			`SELECT
+				t.id,
+				t.name,
+			FROM
+				ACCESS_TOKENS t
+			INNER JOIN
+				security_policies sp ON sp.id = t.security_policy_id AND sp.org_id = ?
+			WHERE
+				1=1 AND t.org_id = ? AND (t.expired IS NULL OR t.expired = 0)
+			ORDER BY
+				t.date ASC,
+				t.id ASC
+			LIMIT 1`: {op: "SELECT", table: ""},
+			`SELECT
+			t.id,
+			t.name,
+		FROM
+			front.ACCESS_TOKENS t
+		INNER JOIN
+			back.security_policies sp ON sp.id = t.security_policy_id AND sp.org_id = ?
+		WHERE
+			1=1 AND t.org_id = ? AND (t.expired IS NULL OR t.expired = 0)
+		ORDER BY
+			t.date ASC,
+			t.id ASC
+		LIMIT 1`: {op: "SELECT", table: ""},
+			`SELECT
+				p.id,
+				p.name,
+				(
+					SELECT
+						JSON_ARRAYAGG(
+							JSON_OBJECT(
+								'id',
+								'type',
+							)
+						)
+					FROM
+						customers c
+					WHERE c.is = p.id AND c.inactive IS NULL
+				) as bananas`: {op: "SELECT", table: "customers"},
+			"SELECT 1.2":                              {op: "SELECT", table: ""},
+			"SELECT 0xdeadBEEF":                       {op: "SELECT", table: ""},
+			"SELECT A + B":                            {op: "SELECT", table: ""},
+			"SELECT * FROM TABLE123":                  {op: "SELECT", table: "TABLE123"},
+			"SELECT FIELD2 FROM TABLE_123 WHERE X<>7": {op: "SELECT", table: "TABLE_123"},
+			"SELECT * FROM TABLE t WHERE FIELD = ' an escaped '' quote mark inside' JOIN ABC ON t.id=ABC.id": {op: "SELECT", table: ""},
+			"select col from table_a where col in (select * from anotherTable)":                              {op: "SELECT", table: ""},
+			"SELECT * FROM TABLE123; SELECT * FROM USERS":                                                    {op: "SELECT", table: ""},
+			// self-references collapse to the one table
+			"select a.col from users a join users b on a.id=b.parent": {op: "SELECT", table: "users"},
+			// ANSI/Postgres quoted identifiers keep the part after the dot
+			`SELECT "id" FROM "public"."Users" WHERE "id" = 1`:                                   {op: "SELECT", table: "public.Users"},
+			`SELECT u."id" FROM "public"."Users" u JOIN "public"."Orders" o ON o."uid" = u."id"`: {op: "SELECT", table: ""},
+		}
+
+		for q, r := range tests {
+			op, tab := SQLParseOperationAndTable(q)
+			assert.Equal(t, result{op: op, table: tab}, r)
+		}
+	})
+
+	t.Run("test INSERT", func(t *testing.T) {
+		tests := map[string]result{
+			" insert into users where lalala":                              {op: "INSERT", table: "users"},
+			"insert into `db table` where lalala":                          {op: "INSERT", table: "db table"},
+			"insert without i-n-t-o":                                       {op: "INSERT", table: ""},
+			"insert into db.table where lalala":                            {op: "INSERT", table: "db"},
+			"insert into db.users where lalala":                            {op: "INSERT", table: "db.users"},
+			"INSERT INTO table1 (column1) SELECT col1 FROM table2":         {op: "INSERT", table: "table1"},
+			"INSERT INTO db1.table1 (column1) SELECT col1 FROM db2.table2": {op: "INSERT", table: "db1.table1"},
+		}
+
+		for q, r := range tests {
+			op, tab := SQLParseOperationAndTable(q)
+			assert.Equal(t, result{op: op, table: tab}, r)
+		}
+	})
+
+	t.Run("test DELETE", func(t *testing.T) {
+		tests := map[string]result{
+			"delete from table where something something":      {op: "DELETE", table: ""},
+			"delete from `my table` where something something": {op: "DELETE", table: "my table"},
+			"delete from db.users where something something":   {op: "DELETE", table: "db.users"},
+			"delete from 12345678":                             {op: "DELETE", table: ""},
+			"delete   (((":                                     {op: "DELETE", table: ""},
+		}
+
+		for q, r := range tests {
+			op, tab := SQLParseOperationAndTable(q)
+			assert.Equal(t, result{op: op, table: tab}, r)
+		}
+	})
+
+	t.Run("test UPDATE", func(t *testing.T) {
+		tests := map[string]result{
+			"update table set answer=42":         {op: "UPDATE", table: ""},
+			"update `my table` set answer=42":    {op: "UPDATE", table: "my table"},
+			"update db.`my table` set answer=42": {op: "UPDATE", table: "db.my table"},
+			"update /*table":                     {op: "UPDATE", table: ""},
+		}
+
+		for q, r := range tests {
+			op, tab := SQLParseOperationAndTable(q)
+			assert.Equal(t, result{op: op, table: tab}, r)
+		}
+	})
+
+	t.Run("test Non-sense", func(t *testing.T) {
+		tests := map[string]result{
+			"and now for something completely different": {op: "", table: ""},
+			"ąś∂ń© from źćļńĶ order by col, col2":        {op: "", table: ""},
+			"":         {op: "", table: ""},
+			"//select": {op: "", table: ""},
+		}
+
+		for q, r := range tests {
+			op, tab := SQLParseOperationAndTable(q)
+			assert.Equal(t, result{op: op, table: tab}, r)
+		}
+	})
+}
+
+func TestSQLQuerySummary(t *testing.T) {
+	for q, expected := range map[string]string{
+		"SELECT * FROM users": "SELECT users",
+		`SELECT u."id" FROM "public"."Users" u JOIN "public"."Orders" o ON o."uid" = u."id"`: "SELECT public.Users public.Orders",
+		"SELECT t.id FROM ACCESS_TOKENS t, SECURITY_POLICIES sp":                             "SELECT ACCESS_TOKENS SECURITY_POLICIES",
+		"select a.col from users a join users b on a.id=b.parent":                            "SELECT users",
+		"INSERT INTO table1 (column1) SELECT col1 FROM table2":                               "INSERT table1 table2",
+		"BEGIN":      "",
+		"SELECT 1":   "",
+		"not sql at": "",
+	} {
+		op, tables := SQLParseOperationAndTables(q)
+		assert.Equal(t, expected, SQLQuerySummary(op, tables), "query %q", q)
+	}
+
+	// truncation stops at a target boundary, never mid-name
+	longTables := make([]string, 50)
+	for i := range longTables {
+		longTables[i] = strings.Repeat("t", 10)
+	}
+	summary := SQLQuerySummary("SELECT", longTables)
+	assert.LessOrEqual(t, len(summary), 255)
+	assert.NotContains(t, summary+" ", "ttttttttttt") // no truncated 11-char run
+
+	// a single oversized target fits nothing: empty, not a bare operation
+	assert.Empty(t, SQLQuerySummary("SELECT", []string{strings.Repeat("t", 300)}))
+}
+
+func TestSQLParseError(t *testing.T) {
+	tests := []struct {
+		name     string
+		dbKind   request.SQLKind
+		buf      []uint8
+		expected *request.SQLError
+	}{
+		{
+			name:   "Valid MySQL error with SQL state",
+			dbKind: request.DBMySQL,
+			buf:    append([]uint8{0x00, 0x00, 0x00, 0x00}, []uint8{0xFF, 0x10, 0x04, '#', 'H', 'Y', '0', '0', '0', 'S', 'o', 'm', 'e', ' ', 'e', 'r', 'r', 'o', 'r'}...),
+			expected: &request.SQLError{
+				Code:     1040,
+				Message:  "Some error",
+				SQLState: "#HY000",
+			},
+		},
+		{
+			name:     "Truncated buffer",
+			dbKind:   request.DBMySQL,
+			buf:      append([]uint8{0x00, 0x00, 0x00, 0x00}, []uint8{0xFF, 0x10, 0x04, '#', 'H'}...),
+			expected: nil,
+		},
+		{
+			name:   "Valid MySQL error",
+			dbKind: request.DBMySQL,
+			buf:    append([]uint8{0x00, 0x00, 0x00, 0x00}, []uint8{0xFF, 0x10, 0x04, 'S', 'o', 'm', 'e', ' ', 'e', 'r', 'r', 'o', 'r'}...),
+			expected: &request.SQLError{
+				Code:     1040,
+				Message:  "Some error",
+				SQLState: "",
+			},
+		},
+		{
+			name:     "Invalid MySQL error",
+			dbKind:   request.DBMySQL,
+			buf:      append([]uint8{0x00, 0x00, 0x00, 0x00}, []uint8{0xFF, 0x99, 0x99, 'I', 'n', 'v', 'a', 'l', 'i', 'd'}...),
+			expected: nil,
+		},
+		{
+			name:     "Empty buffer",
+			dbKind:   request.DBMySQL,
+			buf:      []uint8{0x00, 0x00, 0x00, 0x00, 0x00},
+			expected: nil,
+		},
+		{
+			name:   "Valid Postgres error",
+			dbKind: request.DBPostgres,
+			buf: []uint8{
+				'E',                    // error response
+				0x00, 0x00, 0x00, 0x21, // length
+				'S', 'E', 'R', 'R', 'O', 'R', 0, // Severity
+				'C', '4', '2', '6', '0', '1', 0, // Code
+				'M', 's', 'y', 'n', 't', 'a', 'x', ' ', 'e', 'r', 'r', 'o', 'r', 0, // Message
+				0, // terminator
+			},
+			expected: &request.SQLError{
+				Code:     0,
+				Message:  "syntax error",
+				SQLState: "42601",
+			},
+		},
+		{
+			name:   "Postgres error with only message",
+			dbKind: request.DBPostgres,
+			buf: []uint8{
+				'E',
+				0x00, 0x00, 0x00, 0x0f,
+				'M', 'o', 'n', 'l', 'y', ' ', 'm', 's', 'g', 0,
+				0,
+			},
+			expected: nil, // SQL state not present -> fail
+		},
+		{
+			name:   "Invalid Postgres error (not E)",
+			dbKind: request.DBPostgres,
+			buf: []uint8{
+				0x00, 0x00, 0x00, 0x00,
+				'N', // Not an error response
+				'M', 'n', 'o', 't', ' ', 'e', 'r', 'r', 0,
+				0,
+			},
+			expected: nil,
+		},
+		{
+			name:     "Empty Postgres buffer",
+			dbKind:   request.DBPostgres,
+			buf:      []uint8{0x00, 0x00, 0x00, 0x00},
+			expected: nil,
+		},
+		{
+			name:   "Valid MSSQL error",
+			dbKind: request.DBMSSQL,
+			buf: []uint8{
+				0x04,       // Packet Type: Response
+				0x01,       // Status: EOM
+				0x00, 0x24, // Length: 36 bytes (8 header + 28 payload)
+				0x00, 0x00, // SPID
+				0x00,       // PacketID
+				0x00,       // Window
+				0xAA,       // Token: ERROR
+				0x12, 0x00, // Token length: 18 bytes (excluding token byte and length itself)
+				0x39, 0x30, 0x00, 0x00, // Number: 12345 (0x3039)
+				0x01,       // State
+				0x02,       // Class
+				0x05, 0x00, // MsgLen: 5 characters
+				'H', 0x00, 'e', 0x00, 'l', 0x00, 'l', 0x00, 'o', 0x00, // Message: "Hello" (UTF-16LE)
+			},
+			expected: &request.SQLError{
+				Code:     12345,
+				Message:  "Hello",
+				SQLState: "1",
+			},
+		},
+		{
+			name:   "MSSQL error with large code (exceeds uint16)",
+			dbKind: request.DBMSSQL,
+			buf: []uint8{
+				0x04,       // Packet Type: Response
+				0x01,       // Status: EOM
+				0x00, 0x24, // Length
+				0x00, 0x00, // SPID
+				0x00,       // PacketID
+				0x00,       // Window
+				0xAA,       // Token: ERROR
+				0x12, 0x00, // Token length
+				0x00, 0x00, 0x01, 0x00, // Number: 65536 (0x10000)
+				0x01,       // State
+				0x02,       // Class
+				0x05, 0x00, // MsgLen: 5 characters
+				'H', 0x00, 'e', 0x00, 'l', 0x00, 'l', 0x00, 'o', 0x00, // Message: "Hello" (UTF-16LE)
+			},
+			expected: &request.SQLError{
+				Code:     0, // Should be 0 because 65536 > 0xFFFF
+				Message:  "Hello",
+				SQLState: "1",
+			},
+		},
+		{
+			name:   "MSSQL non-response packet",
+			dbKind: request.DBMSSQL,
+			buf: []uint8{
+				0x01, // Packet Type: SQL Batch (not Response)
+				0x01, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00,
+				0xAA,
+			},
+			expected: nil,
+		},
+		{
+			name:   "MSSQL truncated error token",
+			dbKind: request.DBMSSQL,
+			buf: []uint8{
+				0x04, 0x01, 0x00, 0x0A, 0x00, 0x00, 0x00, 0x00,
+				0xAA, 0x01, // Missing length, etc.
+			},
+			expected: nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := SQLParseError(tt.dbKind, tt.buf)
+			assert.Equal(t, tt.expected, result)
+		})
+	}
+}
+
+func TestSQLParseStatementID(t *testing.T) {
+	tests := []struct {
+		name     string
+		dbKind   request.SQLKind
+		buf      []byte
+		expected uint32
+	}{
+		{
+			name:     "MySQL valid statement ID",
+			dbKind:   request.DBMySQL,
+			buf:      []byte{0x00, 0x00, 0x00, 0x00, 0x00, 0x1, 0x2, 0x3, 0x4},
+			expected: 0x4030201,
+		},
+		{
+			name:     "MySQL empty buffer",
+			dbKind:   request.DBMySQL,
+			buf:      []byte{},
+			expected: 0,
+		},
+		{
+			name:     "MySQL truncated packet (1 byte)",
+			dbKind:   request.DBMySQL,
+			buf:      []byte{0x01},
+			expected: 0,
+		},
+		{
+			name:     "MySQL truncated packet (5 bytes)",
+			dbKind:   request.DBMySQL,
+			buf:      []byte{0x01, 0x02, 0x03, 0x04, 0x05},
+			expected: 0,
+		},
+		{
+			name:     "MySQL truncated packet (7 bytes)",
+			dbKind:   request.DBMySQL,
+			buf:      []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07},
+			expected: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := SQLParseStatementID(tt.dbKind, tt.buf)
+			assert.Equal(t, tt.expected, result)
+		})
+	}
+}

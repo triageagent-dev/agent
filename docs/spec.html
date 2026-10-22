@@ -1,0 +1,880 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyMDAgMjAwIj48ZyB0cmFuc2Zvcm09InJvdGF0ZSgtOTAgMTAwIDEwMCkiPjxjaXJjbGUgY3g9IjEwMCIgY3k9IjEwMCIgcj0iODQiIGZpbGw9Im5vbmUiIHN0cm9rZT0iIzhiOGJmMCIgc3Ryb2tlLXdpZHRoPSIxNiIgc3Ryb2tlLWxpbmVjYXA9InJvdW5kIiBzdHJva2UtZGFzaGFycmF5PSI0MjIgNTI4Ii8+PGNpcmNsZSBjeD0iMTAwIiBjeT0iMTAwIiByPSI1NiIgZmlsbD0ibm9uZSIgc3Ryb2tlPSIjMjJkM2VlIiBzdHJva2Utd2lkdGg9IjE2IiBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1kYXNoYXJyYXk9IjI2NCAzNTIiLz48Y2lyY2xlIGN4PSIxMDAiIGN5PSIxMDAiIHI9IjI4IiBmaWxsPSJub25lIiBzdHJva2U9IiNlODc5ZjkiIHN0cm9rZS13aWR0aD0iMTYiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIgc3Ryb2tlLWRhc2hhcnJheT0iMTIzIDE3NiIvPjwvZz48L3N2Zz4=">
+<title>Triage Agent Specification</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Instrument+Sans:wght@400;500;600&family=Source+Serif+4:opsz,wght@8..60,600;8..60,700&display=swap">
+<style>
+:root {
+  color-scheme: light;
+  --paper:      #F0EEE6;
+  --surface:    #FFFFFF;
+  --surface-2:  #E4E0D4;
+  --ink:        #191919;
+  --ink-2:      #3D3B36;
+  --muted:      #736F65;
+  --rule:       #D9D5C8;
+  --rule-strong:#B3AE9E;
+  --accent:     #9C4A26;
+  --accent-soft:#EBDBBC;
+  --alt:        #3F6478;
+  --alt-soft:   #D3DEE3;
+  --serif: 'Source Serif 4', Georgia, serif;
+  --sans:  'Instrument Sans', ui-sans-serif, system-ui, -apple-system, sans-serif;
+  --mono:  'IBM Plex Mono', ui-monospace, Menlo, monospace;
+}
+* { box-sizing: border-box; }
+html { background: var(--paper); scroll-behavior: smooth; font-size: 17px; }
+body { margin: 0; background: var(--paper); color: var(--ink); font: 400 16px/1.62 var(--sans); -webkit-font-smoothing: antialiased; }
+a { color: var(--accent); }
+code { font: 400 .8em var(--mono); background: var(--surface-2); padding: .08em .35em; border-radius: 3px; hyphens: none; -webkit-hyphens: none; white-space: nowrap; }
+
+.shell { display: grid; grid-template-columns: 17rem minmax(0,1fr); max-width: 78rem; margin: 0 auto; align-items: start; }
+.sidebar { position: sticky; top: 0; max-height: 100vh; overflow-y: auto; border-right: 1px solid var(--rule); padding: 2.5rem 1.4rem 3rem 1.75rem; }
+.sidebar h2 { font: 500 .68rem var(--mono); letter-spacing: .12em; text-transform: uppercase; color: var(--muted); margin: 0 0 .7rem .6rem; }
+.sidebar h2.group { margin-top: 1.6rem; }
+.sidebar nav { display: flex; flex-direction: column; }
+.sidebar a { display: flex; align-items: baseline; gap: .7rem; padding: .45rem .6rem; border-radius: 6px; text-decoration: none; color: var(--ink); font: 500 .9rem var(--sans); }
+.sidebar a:hover, .sidebar a.on { background: var(--surface); }
+.sidebar a.on .n { color: var(--accent); }
+.sidebar .n { font: 400 .74rem var(--mono); color: var(--muted); width: 1.1rem; flex: none; }
+.sidebar .chev { margin-left: auto; color: var(--rule-strong); align-self: center; flex: none; }
+@media (max-width: 900px) {
+  .shell { grid-template-columns: 1fr; }
+  .sidebar { position: static; max-height: none; overflow: visible; border-right: 0; border-bottom: 1px solid var(--rule); padding: 1.5rem 1.25rem; }
+  .sidebar nav { display: grid; grid-template-columns: repeat(auto-fit, minmax(12rem, 1fr)); }
+  .sidebar .chev { display: none; }
+}
+
+main { padding: 3.5rem 3.5rem 6rem; min-width: 0; }
+@media (max-width: 900px) { main { padding: 2rem 16px 4rem; } }
+.eyebrow { font: 500 .72rem var(--mono); letter-spacing: .14em; text-transform: uppercase; color: var(--muted); margin: 0 0 1.2rem; }
+h1 { font: 700 clamp(2.1rem, 4.4vw, 3rem)/1.12 var(--serif); letter-spacing: -.018em; text-wrap: balance; margin: 0 0 1.2rem; }
+.standfirst strong { font-weight: 500; color: var(--ink); }
+.standfirst { font: 400 1.06rem/1.62 var(--sans); color: var(--ink-2); margin: 0 0 1.4rem; }
+.meta { font: 400 .95rem var(--sans); color: var(--ink-2); margin: 0 0 1rem; }
+
+.roles { display: grid; gap: 10px; margin: 2.2rem 0 0; }
+.role { display: grid; grid-template-columns: 9rem 1fr auto; gap: 1rem; align-items: baseline; padding: .9rem 1.1rem; border: 1px solid var(--rule); border-radius: 8px; }
+.role .tag { font: 500 .7rem var(--mono); letter-spacing: .12em; text-transform: uppercase; color: var(--accent); }
+.role .what { font: 400 .92rem/1.5 var(--sans); color: var(--ink-2); }
+.role .what b { color: var(--ink); font-weight: 600; }
+.role .where { font: 400 .72rem var(--mono); color: var(--muted); white-space: nowrap; }
+@media (max-width: 700px) { .role { grid-template-columns: 1fr; gap: .2rem; } .role .where { white-space: normal; } }
+
+section { margin-top: 4.5rem; scroll-margin-top: 1.5rem; }
+.sechead { display: grid; grid-template-columns: 3rem 1fr; align-items: baseline; border-bottom: 1px solid var(--rule-strong); padding-bottom: .6rem; margin-bottom: 1.6rem; }
+.ord { font: 400 .85rem var(--mono); color: var(--accent); }
+.sechead h2 { font: 600 1.65rem/1.25 var(--serif); letter-spacing: -.012em; margin: 0; }
+.owner { grid-column: 2; font: 400 .74rem var(--mono); color: var(--muted); margin-top: .35rem; }
+.faq { border-bottom: 1px solid var(--rule); }
+.faq summary { font: 600 1.02rem/1.4 var(--sans); padding: .9rem 0; cursor: pointer; list-style-position: outside; }
+.faq[open] summary { padding-bottom: .5rem; }
+h3 { font: 600 1.02rem/1.4 var(--sans); margin: 2.2rem 0 .6rem; }
+p { margin: 0 0 1.1rem; }
+ul { margin: 0 0 1.1rem; padding-left: 1.3em; }
+li { margin-bottom: .45rem; }
+p, li, figcaption, .standfirst { text-align: justify; hyphens: auto; -webkit-hyphens: auto; }
+@media (max-width: 640px) { p, li, figcaption, .standfirst { text-align: left; } }
+.src { font: 400 .7rem var(--mono); color: var(--muted); white-space: nowrap; margin-left: .25em; }
+
+figure { margin: 2rem 0 2.2rem; }
+figure svg { width: 100%; height: auto; display: block; }
+figcaption { font: 400 .85rem/1.55 var(--sans); color: var(--muted); margin-top: .8rem; }
+.figscroll { overflow-x: auto; }
+.figscroll svg { min-width: 640px; }
+
+.tablewrap { overflow-x: auto; margin: 1.4rem 0 2rem; }
+table { border-collapse: collapse; width: 100%; font: 400 .85rem/1.5 var(--sans); color: var(--ink-2); }
+th { font: 500 .66rem var(--mono); letter-spacing: .1em; text-transform: uppercase; color: var(--muted); text-align: left; padding: .5rem .7rem; border-bottom: 1px solid var(--rule-strong); vertical-align: bottom; }
+td { padding: .6rem .7rem; border-bottom: 1px solid var(--rule); vertical-align: top; text-align: left; }
+tr:hover td { background: var(--surface); }
+td code { white-space: normal; }
+td.k { font: 400 .78rem var(--mono); color: var(--ink); }
+.pill { font: 500 .66rem var(--mono); letter-spacing: .06em; text-transform: uppercase; padding: .15em .5em; border-radius: 4px; white-space: nowrap; }
+.pill.hi { background: var(--accent); color: #fff; }
+.pill.md { background: var(--accent-soft); color: var(--accent); }
+.pill.lo { background: var(--alt-soft); color: var(--alt); }
+.pill.ok { background: var(--surface-2); color: var(--ink-2); }
+
+pre { background: #191919; border: 1px solid #191919; border-radius: 8px; padding: 1rem 1.2rem; overflow-x: auto; margin: 1rem 0 1.6rem; }
+pre code { background: none; padding: 0; font: 400 .8rem/1.6 var(--mono); white-space: pre; color: #F0EEE6; }
+pre .token.keyword, pre .token.builtin { color: #E39A72; font-weight: 500; }
+pre .token.property { color: #9EC3D6; }
+pre .token.string { color: #C9D08F; }
+pre .token.number, pre .token.boolean { color: #E39A72; }
+pre .token.class-name { color: #FFFFFF; font-weight: 500; }
+pre .token.punctuation, pre .token.operator { color: #A8A398; }
+pre .token.comment { color: #8C877C; font-style: italic; }
+.sources { font: 400 .8rem/1.6 var(--mono); color: var(--ink-2); columns: 2; column-gap: 2.5rem; padding: 0; list-style: none; }
+.sources li { break-inside: avoid; text-align: left; margin: 0 0 .3rem; }
+@media (max-width: 700px) { .sources { columns: 1; } }
+
+/* svg vocabulary */
+.box   { fill: var(--surface); stroke: var(--rule-strong); stroke-width: 1; }
+.box.hot { stroke: var(--accent); stroke-width: 1.6; }
+.box.cool { stroke: var(--alt); stroke-width: 1.4; }
+.box.ghost { fill: none; stroke: var(--rule-strong); stroke-dasharray: 4 4; }
+.box.warn { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 1.4; }
+.zone  { fill: none; stroke: var(--rule); stroke-width: 1; }
+.well  { fill: var(--surface-2); stroke: none; }
+.bound { stroke: var(--muted); stroke-width: 1; stroke-dasharray: 4 5; }
+.e     { fill: none; stroke: var(--muted); stroke-width: 1.4; }
+.e.a   { stroke: var(--accent); stroke-width: 1.8; }
+.e.b   { stroke: var(--alt); stroke-width: 1.6; }
+.e.d   { stroke-dasharray: 5 4; }
+.t     { font: 600 13px var(--sans); fill: var(--ink); }
+.ts    { font: 400 11.5px var(--sans); fill: var(--muted); }
+.tl    { font: 400 11.5px var(--sans); fill: var(--ink-2); }
+.m     { font: 500 10.5px var(--mono); letter-spacing: .1em; fill: var(--muted); }
+.mb    { font: 500 10.5px var(--mono); letter-spacing: .1em; fill: var(--alt); }
+.ma    { font: 500 10.5px var(--mono); letter-spacing: .06em; fill: var(--accent); }
+.mi    { font: 400 11.5px var(--mono); fill: var(--ink); }
+.gn    { fill: #D9A441; stroke: var(--paper); stroke-width: 2; }
+.gxn   { fill: var(--rule-strong); stroke: var(--paper); stroke-width: 2; }
+.ge    { stroke: var(--rule-strong); stroke-width: 1.1; }
+.gx    { stroke: var(--rule-strong); stroke-width: 1.1; stroke-dasharray: 3 3; }
+.gd    { stroke: var(--accent); stroke-width: 1.8; stroke-dasharray: 5 4; }
+.gl    { font: 500 12px var(--sans); fill: var(--ink-2); text-anchor: middle; }
+.gl.gm { font: 400 10.5px var(--mono); fill: var(--muted); }
+.c     { text-anchor: middle; }
+.r     { text-anchor: end; }
+</style>
+</head>
+<body>
+<div class="shell">
+
+<aside class="sidebar">
+  <h2>Specification</h2>
+  <nav>
+    <a href="#s1"><span class="n">01</span>Architecture<svg class="chev" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18l6-6-6-6"/></svg></a>
+    <a href="#s2"><span class="n">02</span>Scope and tenants<svg class="chev" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18l6-6-6-6"/></svg></a>
+    <a href="#s3"><span class="n">03</span>Objects and signals<svg class="chev" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18l6-6-6-6"/></svg></a>
+    <a href="#s4"><span class="n">04</span>Data flow and frames<svg class="chev" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18l6-6-6-6"/></svg></a>
+    <a href="#s5"><span class="n">05</span>Log samples<svg class="chev" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18l6-6-6-6"/></svg></a>
+    <a href="#s6"><span class="n">06</span>Connections and trust<svg class="chev" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18l6-6-6-6"/></svg></a>
+    <a href="#s7"><span class="n">07</span>RBAC<svg class="chev" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18l6-6-6-6"/></svg></a>
+    <a href="#s8"><span class="n">08</span>Topology and drift<svg class="chev" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18l6-6-6-6"/></svg></a>
+    <a href="#s9"><span class="n">09</span>Connectors<svg class="chev" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18l6-6-6-6"/></svg></a>
+    <a href="#s10"><span class="n">10</span>Configuration<svg class="chev" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18l6-6-6-6"/></svg></a>
+    <a href="#s11"><span class="n">11</span>Local TUI and API<svg class="chev" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18l6-6-6-6"/></svg></a>
+  </nav>
+  <h2 class="group">Notes</h2>
+  <nav>
+    <a href="#s12"><span class="n">12</span>OBI note<svg class="chev" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18l6-6-6-6"/></svg></a>
+    <a href="#s13"><span class="n">13</span>FAQ<svg class="chev" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18l6-6-6-6"/></svg></a>
+  </nav>
+</aside>
+
+<main>
+<header>
+  <p class="eyebrow">Specification · agent repository · v3.2.96 · fd2a2d0</p>
+  <h1>Triage Agent</h1>
+  <p class="standfirst">The <strong>collection and aggregation layer</strong> of Triage: an agent on <strong>Kubernetes</strong> clusters, <strong>Linux</strong> hosts and <strong>cloud provider connectors</strong>. The agent discovers <strong>virtual apps</strong> from workloads, measures them with <strong>eBPF</strong>, <strong>cgroup</strong> and <strong>logs-based metrics</strong> as <strong>USE</strong>, <strong>RED</strong>, <strong>SIG</strong> and <strong>LOG</strong> frameworks, and streams the result to the <strong>core</strong> over one <strong>outbound secure WebSocket (WSS)</strong>. It sends signals only; drift, issues and root cause are decided in the <strong>core</strong>.</p>
+</header>
+  <figure class="figscroll">
+    <svg viewBox="0 -96 880 536" role="img" aria-label="Agent architecture: kernel and host sources feed three sensor roles on each node, which stream to sensorstream; push sends frames to the core.">
+      <defs>
+        <marker id="aa" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#9C4A26"/></marker>
+        <marker id="ab" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#3F6478"/></marker>
+        <marker id="am" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#736F65"/></marker>
+      </defs>
+      <text class="m" x="32" y="24">KERNEL AND HOST</text>
+      <text class="m" x="252" y="24">DAEMONSET · PER NODE</text>
+      <text class="m" x="472" y="24">CONTROLLER</text>
+      <text class="mb" x="692" y="24">CORE</text>
+      <line class="bound" x1="226" y1="36" x2="226" y2="332"/>
+      <line class="bound" x1="446" y1="36" x2="446" y2="332"/>
+      <rect x="4" y="6" width="652" height="426" rx="12" fill="none" stroke="#736F65" stroke-width="1.4" stroke-dasharray="1.5 4" stroke-linecap="round"/>
+      <rect x="664" y="6" width="212" height="426" rx="12" fill="none" stroke="#3F6478" stroke-width="1.4" stroke-dasharray="1.5 4" stroke-linecap="round"/>
+
+      <rect class="box" x="16" y="52" width="188" height="64" rx="8"/><text class="t" x="32" y="78">cgroup v2 and PSI</text><text class="ts" x="32" y="96">host files, read only</text>
+      <rect class="box" x="16" y="152" width="188" height="64" rx="8"/><text class="t" x="32" y="178">eBPF probes</text><text class="ts" x="32" y="196">uprobes, kprobes, socket filter</text>
+      <rect class="box" x="16" y="252" width="188" height="64" rx="8"/><text class="t" x="32" y="278">Container logs</text><text class="ts" x="32" y="296">/var/log/containers</text>
+
+      <rect class="box" x="236" y="52" width="188" height="64" rx="8"/><text class="t" x="252" y="78">resource metrics</text><text class="ts" x="252" y="96">USE · CPU, memory, PSI</text>
+      <rect class="box" x="236" y="152" width="188" height="64" rx="8"/><text class="t" x="252" y="178">OBI · traffic metrics</text><text class="ts" x="252" y="196">RED · SIG · L7/L4 topology</text>
+      <rect class="box" x="236" y="252" width="188" height="64" rx="8"/><text class="t" x="252" y="278">logs-based metrics</text><text class="ts" x="252" y="296">LOG · error and warn counts</text>
+
+      <rect class="box" x="456" y="52" width="188" height="64" rx="8"/><text class="t" x="472" y="78">sensorstream :9470</text><text class="ts" x="472" y="96">merged across replicas</text>
+      <rect class="box" x="456" y="152" width="188" height="64" rx="8"/><text class="t" x="472" y="178">Collectors</text><text class="ts" x="472" y="196">deltas, baseline gate</text>
+      <rect class="box hot" x="456" y="252" width="188" height="64" rx="8"/><text class="t" x="472" y="278">Per-tenant queues</text><text class="ts" x="472" y="296">push over WSS</text>
+      <rect class="box" x="16" y="352" width="408" height="64" rx="8"/><text class="t" x="32" y="378">Kubernetes API / Linux systemd</text><text class="ts" x="32" y="396">namespaces, workloads, pods, events · systemd units, journald</text>
+      <path class="e" d="M424 384H452" marker-end="url(#am)"/>
+      <rect class="box" x="456" y="352" width="188" height="64" rx="8"/><text class="t" x="472" y="378">Kubernetes watches</text><text class="ts" x="472" y="396">virtual apps, Warning events</text>
+
+      <rect class="box" x="676" y="52" width="188" height="164" rx="8"/><text class="t" x="692" y="78">Events API</text><text class="ts" x="692" y="96">HTTPS, bearer + X-Tenant</text><text class="tl" x="692" y="124">gcp-cost · gcp-alert</text><text class="tl" x="692" y="142">gcp-status · prometheus</text><text class="ts" x="692" y="170">429 when queue is full</text>
+      <path class="box ghost" d="M470 -32 A20 20 0 0 1 482 -64 A50 50 0 0 1 552 -84 A31 31 0 0 1 608 -64 A21 21 0 0 1 630 -32 Z"/><text class="t" x="551" y="-56" text-anchor="middle">Cloud providers</text><text class="ts" x="551" y="-40" text-anchor="middle">billing, alerts, health</text>
+      <rect class="box ghost" x="676" y="-88" width="188" height="56" rx="8"/><text class="t" x="692" y="-64">Connectors</text><text class="ts" x="692" y="-46">gcpevents · promevents · wiz</text>
+      <rect class="box" x="676" y="252" width="188" height="64" rx="8"/><text class="t" x="692" y="278">Event router</text><text class="ts" x="692" y="296">frames + events, per tenant</text>
+      <rect class="box" x="676" y="352" width="188" height="64" rx="8"/><text class="t" x="692" y="378">Event processing</text><text class="ts" x="692" y="396">classifies frames + events</text>
+
+      <g>
+        <path class="e" d="M204 84H232" marker-end="url(#am)"/>
+        <path class="e" d="M204 184H232" marker-end="url(#am)"/>
+        <path class="e" d="M204 284H232" marker-end="url(#am)"/>
+        <path class="e a" d="M424 84H452" marker-end="url(#aa)"/>
+        <path class="e a" d="M424 184H436"/>
+        <path class="e a" d="M424 284H436V84"/>
+        <path class="e a" d="M550 116V148" marker-end="url(#aa)"/>
+        <path class="e a" d="M550 216V248" marker-end="url(#aa)"/>
+        <path class="e a" d="M550 352V320" marker-end="url(#aa)"/>
+        <path class="e a" d="M644 276H672" marker-end="url(#aa)"/>
+        <path class="e b" d="M676 296H648" marker-end="url(#ab)"/>
+        <path class="e" d="M770 -32V48" marker-end="url(#am)"/>
+        <path class="e" d="M636 -50H672" marker-end="url(#am)"/>
+        <path class="e" d="M770 216V248" marker-end="url(#am)"/>
+        <path class="e" d="M770 316V348" marker-end="url(#am)"/>
+      </g>
+
+      <line x1="16" y1="-66" x2="40" y2="-66" class="e a"/><text class="tl" x="48" y="-62">Signal data (TLS 1.3, WSS)</text>
+      <line x1="228" y1="-66" x2="252" y2="-66" class="e b"/><text class="tl" x="260" y="-62">Snapshot request on graph load</text>
+      <line x1="16" y1="-38" x2="40" y2="-38" class="e"/><text class="tl" x="48" y="-34">Host reads, connector posts</text>
+      <rect x="228" y="-46" width="24" height="16" rx="4" class="box ghost"/><text class="tl" x="260" y="-34">Outside the agent</text>
+    </svg>
+    <figcaption>Figure 1. Components and boundaries.</figcaption>
+  </figure>
+
+
+
+<!-- 01 -->
+<section id="s1">
+  <div class="sechead"><span class="ord">01</span><h2>Architecture</h2></div>
+  <p>Data crosses three boundaries: from kernel and host files into the sensor roles, from the node into <code>sensorstream</code> over gRPC, and from the cluster to the core over a secure WebSocket (WSS) the agent opens. Nothing outside the cluster can open a connection into it.</p>
+  <p>The sensor roles send one OTLP snapshot per role every <code>--sensor-tick</code>, default 15 s. <code>sensorstream</code> keeps the latest per node and serves it to the collectors through <code>metricset.Source</code>. Collectors are <code>manager.Runnable</code>s that run only on the leader, and only the leader holds the connection to the core. The controller can run several replicas: every replica takes sensor streams and gossips what its own sensors send to the others over mutual TLS (headless Service <code>&lt;fullname&gt;-peers</code>, port 9471, pinned to the same sensor certificate), keeping the newest snapshot per node. The leader therefore sees every node whichever replica a sensor connected to, and a newly elected leader already holds the state.</p>
+  <p>The agent is one container image, run in two shapes. The <strong>DaemonSet</strong> hosts the <strong>sensor roles</strong>; the <strong>controller Deployment</strong> hosts everything that talks to the <strong>Kubernetes API</strong> or the <strong>core</strong>. A namespace is observed only when it is annotated with a tenant or listed in <code>--target-namespaces</code>, and every frame leaves stamped with that tenant.</p>
+  <p>Collectors are off by default. Virtual apps and Kubernetes Warning events flow as soon as the agent is connected to a core (<code>core.host</code>); RED, USE, log and topology collectors each need their own flag and the sensor stream.</p>
+  <p>Out of scope for the agent: comparing the observed topology with the declared graph, opening issues, and any model call. The core does those.</p>
+  <h3>High availability</h3>
+  <p>The controller runs as several replicas behind one leader. Leader election is on whenever <code>replicaCount</code> is above 1, through a Lease named <code>triage-agent</code> in the agent's namespace. Every replica serves the sensor stream and the OTLP receiver; only the leader runs the collectors and holds the connection to the core.</p>
+  <div class="tablewrap"><table>
+    <tr><th>Concern</th><th>Behaviour</th></tr>
+    <tr><td class="k">Intake</td><td>Sensors and OTLP senders reach any replica through the <code>&lt;fullname&gt;-sensors</code> Service; losing a replica drops only the streams it held, which reconnect to another within the 1 to 30 s backoff</td></tr>
+    <tr><td class="k">Shared state</td><td>Replicas gossip every sensor snapshot and OTLP source over mutual TLS on 9471, newest wins, so a new leader already holds the latest data from every node and sender</td></tr>
+    <tr><td class="k">Failover</td><td>controller-runtime defaults: a 15 s lease, renewed every 10 s, retried every 2 s. The lease is not released on shutdown, so a new leader takes over when it expires: within about 15 s for a crash or a rollout alike</td></tr>
+    <tr><td class="k">Core link</td><td>The new leader opens the connection with the same join certificate, kept in <code>--join-secret</code>, so it needs no new key and no new approval, and resends each tenant's virtual-app snapshot</td></tr>
+    <tr><td class="k">Baselines</td><td>Held in the leader's memory and not gossiped. After a failover every service is cold until it has the minimum windows again; the cold floors keep reporting a clear breach in that time</td></tr>
+    <tr><td class="k">Disruptions</td><td>A PodDisruptionBudget with <code>maxUnavailable: 1</code> when replicas are above 1, so a drain takes one controller at a time</td></tr>
+    <tr><td class="k">Placement</td><td>No anti-affinity by default; set <code>affinity</code> to spread replicas across nodes or zones</td></tr>
+  </table></div>
+  <p>A single replica runs without leader election and without a PodDisruptionBudget; a restart is a gap in intake and frames until the pod is back.</p>
+  <h3>Linux host mode</h3>
+  <p>With <code>--mode=host</code> the agent runs as one systemd service on a VM or bare-metal host, with no Kubernetes API. The host reports the same frames as a cluster, so the core and the protocol are unchanged: a host is a cluster of one with one synthetic namespace. There is no controller Deployment, no DaemonSet, no sensor stream and no listener unless <code>--ui-listen</code> or <code>--api-listen</code> is set (<a href="#s11">section 11</a>); the sensor roles run in the agent's own process and the collectors read them directly.</p>
+  <div class="tablewrap"><table>
+    <tr><th>In a cluster</th><th>On a host</th></tr>
+    <tr><td class="k">Cluster</td><td>The OS host name; <code>--cluster-name</code> overrides it. A host installed with a one-time key uses the name the core minted</td></tr>
+    <tr><td class="k">Namespace</td><td>One synthetic namespace, <code>--host-namespace</code>, default <code>host</code>. Hosts running the same services share one value, so their services merge in the core graph</td></tr>
+    <tr><td class="k">Tenant</td><td><code>--target-tenant</code>, required; tenant mode only</td></tr>
+    <tr><td class="k">Virtual app</td><td>A systemd unit selected by <code>--host-units</code> globs, default every enabled service except system units; Ready when <code>ActiveState=active</code> and <code>SubState=running</code>, through the same flap damping</td></tr>
+    <tr><td class="k">USE</td><td>The unit's cgroup under <code>system.slice</code>, with the same readers, PSI included; limits from the unit's own <code>cpu.max</code> and <code>memory.max</code></td></tr>
+    <tr><td class="k">LOG</td><td>journald by <code>_SYSTEMD_UNIT</code>, through <code>journalctl --follow</code>; priority 0 to 3 is an error, 4 a warning, then the same regexes and redaction</td></tr>
+    <tr><td class="k">RED</td><td>OBI with Kubernetes off, one discovery entry per unit selecting every PID in its cgroup; series are stamped with the unit and the host namespace from <code>/proc/&lt;pid&gt;/cgroup</code>. A new PID in a unit restarts the instrumenter, a short RED gap</td></tr>
+    <tr><td class="k">Topology</td><td>A callee is named only by <code>server.address</code>, so every edge goes to an external host, even another unit; L4 flows carry addresses only</td></tr>
+    <tr><td class="k">Identity</td><td>The same join certificate, by one-time key or admin approval (<a href="#s6">section 06</a>); <code>--join-ca-fingerprint</code> is required. Key and certificate kept in <code>--join-state-dir</code></td></tr>
+    <tr><td class="k">HA</td><td>None: one agent per host, and a second one would duplicate every frame</td></tr>
+  </table></div>
+  <p>Install is a binary or a deb or rpm package with <code>triage-agent.service</code>, which reads its flags from <code>/etc/triage-agent/env</code> and runs as root with the same six capabilities as the DaemonSet. <code>install.sh</code>, published with each release, installs the package from the command the core returns for a host key: it writes the env file, puts the key in <code>enroll.key</code> in the join state directory (mode 0600) and starts the service. The <code>hello</code> carries the capability <code>host</code>. The acceptance steps have not yet been run on a real host.</p>
+</section>
+
+<!-- 02 -->
+<section id="s2">
+  <div class="sechead"><span class="ord">02</span><h2>Scope and tenants</h2></div>
+  <p>Each item the agent sees, whether a workload, an event or a metric series, is resolved to a tenant through its namespace before it is queued. An annotated namespace always goes to its annotation's tenant. Tenant mode adds a primary tenant for namespaces listed in <code>--target-namespaces</code>; cluster mode works from annotations alone.</p>
+  <figure class="figscroll">
+    <svg viewBox="0 0 880 300" role="img" aria-label="Tenant resolution in the two modes. Tenant mode: namespaces from the list and annotations; annotated ones go to their annotation's tenant, listed-only ones to the primary tenant. Cluster mode: annotated namespaces only, each to its annotation's tenant. A Linux host takes its tenant from --target-tenant.">
+      <defs><marker id="tm" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#736F65"/></marker></defs>
+      <text class="ma" x="24" y="24">TENANT MODE · NAMESPACES AND PLAIN LINUX</text>
+      <text class="mb" x="472" y="24">CLUSTER MODE · ANNOTATED NAMESPACES</text>
+      <line class="bound" x1="440" y1="12" x2="440" y2="292"/>
+
+      <rect class="box" x="24" y="44" width="216" height="52" rx="8"/><text class="t c" x="132" y="66">Namespaces in scope</text><text class="ts c" x="132" y="84">list + annotated</text>
+      <rect class="box" x="256" y="44" width="168" height="52" rx="8"/><text class="t" x="272" y="66">Linux host</text><text class="ts" x="272" y="84">whole host</text>
+      <path class="e d" d="M340 96V140" marker-end="url(#tm)"/>
+      <path class="e" d="M132 96V116M120 116H328"/>
+      <path class="e" d="M120 116V140" marker-end="url(#tm)"/><path class="e" d="M328 116V140" marker-end="url(#tm)"/>
+      <text class="ts" x="128" y="132">annotated</text><text class="ts r" x="320" y="132">listed only</text>
+      <rect class="box" x="24" y="144" width="192" height="52" rx="8"/><text class="t c" x="120" y="166">Annotation's tenant</text><text class="ts c" x="120" y="184">triageagent.dev/tenant</text>
+      <rect class="box" x="232" y="144" width="192" height="52" rx="8"/><text class="t c" x="328" y="166">Primary tenant</text><text class="ts c" x="328" y="184">--target-tenant</text>
+      <path class="e" d="M120 196V220H328V196M224 220V240" marker-end="url(#tm)"/>
+      <rect class="box hot" x="96" y="244" width="256" height="44" rx="8"/><text class="t c" x="224" y="271">Per-tenant queues</text>
+
+      <rect class="box" x="544" y="44" width="256" height="52" rx="8"/><text class="t c" x="672" y="66">Namespaces in scope</text><text class="ts c" x="672" y="84">annotated namespaces</text>
+      <path class="e" d="M672 96V140" marker-end="url(#tm)"/>
+      <rect class="box" x="576" y="144" width="192" height="52" rx="8"/><text class="t c" x="672" y="166">Annotation's tenant</text><text class="ts c" x="672" y="184">triageagent.dev/tenant</text>
+      <path class="e" d="M672 196V240" marker-end="url(#tm)"/>
+      <rect class="box hot" x="544" y="244" width="256" height="44" rx="8"/><text class="t c" x="672" y="271">Per-tenant queues</text>
+    </svg>
+    <figcaption>Figure 2. Tenant resolution. An annotated namespace always goes to its annotation's tenant. Items opted out with <code>triageagent.dev/triage: "false"</code> are never sent. A Linux host has no namespaces, so <code>--target-tenant</code> sets its tenant. In cluster mode a namespace listed in <code>--target-namespaces</code> without the annotation has no tenant; its items are skipped and counted.</figcaption>
+  </figure>
+  <div class="tablewrap"><table>
+    <tr><th></th><th>Tenant mode</th><th>Cluster mode</th></tr>
+    <tr><td class="k">Selected by</td><td><code>--target-tenant</code> set</td><td><code>--target-tenant</code> empty; <code>--cluster-name</code> is the identity</td></tr>
+    <tr><td class="k">Authentication</td><td>Per cluster, by join certificate; the hello names the primary tenant</td><td>Per cluster, by join certificate; the hello names no tenant</td></tr>
+    <tr><td class="k">Frame stamp</td><td>Primary tenant unstamped; other annotated tenants stamped</td><td>Every frame stamped</td></tr>
+    <tr><td class="k">Scope</td><td><code>--target-namespaces</code> plus annotated namespaces</td><td>Annotated namespaces</td></tr>
+    <tr><td class="k">Listed, not annotated</td><td>Primary tenant</td><td>Skipped and counted</td></tr>
+    <tr><td class="k">Covers</td><td>Namespaces from the list and annotations; plain Linux hosts (<code>--mode=host</code>)</td><td>Annotated namespaces only</td></tr>
+  </table></div>
+  <p>An agent installed with a one-time key (<a href="#s6">section 06</a>) runs in cluster mode. The key fixes the tenants it may serve, the chart sets no <code>target.*</code> value, and the core drops anything outside the key's bindings. An agent that watches no Kubernetes objects (<code>kubernetes.watch: false</code>) has no annotation to read, so every frame files under one tenant, <code>--target-tenant</code>. The chart takes it from <code>core.tenants</code> when that holds exactly one entry and <code>target.tenant</code> is empty; with several entries, set <code>target.tenant</code>.</p>
+  <h3>Annotations</h3>
+  <div class="tablewrap"><table>
+    <tr><th>Key</th><th>On</th><th>Effect</th></tr>
+    <tr><td class="k">triageagent.dev/tenant</td><td>Namespace</td><td>Puts the namespace in scope and names its tenant</td></tr>
+    <tr><td class="k">triageagent.dev/triage: "false"</td><td>Workload, pod template, namespace</td><td>No virtual app, events, metrics or topology for it</td></tr>
+    <tr><td class="k">triageagent.dev/instrument</td><td>Pod</td><td>Excludes the pod from eBPF instrumentation</td></tr>
+    <tr><td class="k">triageagent.dev/virtual-app, -group, -identity</td><td>Workload, namespace</td><td>Names and groups the virtual app; namespace values are inherited</td></tr>
+    <tr><td class="k">triageagent.dev/tier, weight, domain, description</td><td>Workload, namespace</td><td>Describes it; <code>weight</code> is 0.1 to 10</td></tr>
+  </table></div>
+</section>
+
+<!-- 03 -->
+<section id="s3">
+  <div class="sechead"><span class="ord">03</span><h2>Objects and signals</h2></div>
+  <h3>Objects</h3>
+  <p>Objects the chart installs in the agent namespace.</p>
+  <div class="tablewrap"><table>
+    <tr><th>Object</th><th>Kind</th><th>Purpose</th></tr>
+    <tr><td class="k">triage-agent</td><td>Deployment</td><td>Controller; one or more replicas, the leader pushes to the core</td></tr>
+    <tr><td class="k">&lt;fullname&gt;-ebpf</td><td>DaemonSet</td><td>Sensor roles; <code>hostPID</code>; <code>hostNetwork</code> only with network flows</td></tr>
+    <tr><td class="k">&lt;fullname&gt;-peers</td><td>Service, headless</td><td>Port 9471, gossip between controller replicas, mutual TLS</td></tr>
+    <tr><td class="k">PodDisruptionBudget</td><td>PodDisruptionBudget</td><td>Keeps a controller replica up during voluntary disruptions, when replicas are above 1</td></tr>
+    <tr><td class="k">&lt;fullname&gt;-sensors</td><td>Service, ClusterIP</td><td>Port 9470</td></tr>
+    <tr><td class="k">&lt;fullname&gt;-otlp</td><td>Deployment and Service, ClusterIP</td><td>The OTLP sensor role, when <code>otlp.sensor.enabled</code>: two replicas by default, OTLP on 4317. With <code>otlp.insecure</code> the chart adds a NetworkPolicy that admits only the namespaces in <code>allowFrom</code></td></tr>
+    <tr><td class="k">OBI config</td><td>ConfigMap</td><td>Mounted as a file; not read through the API</td></tr>
+    <tr><td class="k">&lt;fullname&gt;-sensor-ca</td><td>ConfigMap, created empty</td><td>Controller writes <code>ca.crt</code>; sensors pin it</td></tr>
+    <tr><td class="k">&lt;fullname&gt;-sensor-tls</td><td>Secret, created empty</td><td>Controller certificate and key</td></tr>
+    <tr><td class="k">&lt;fullname&gt;-join</td><td>Secret</td><td>Ed25519 key, issued certificate, core CA, and the one-time agent key until the core has issued the certificate</td></tr>
+  </table></div>
+  <h3>Watched API types</h3>
+  <p>The controller follows these Kubernetes API types through informers. All access is get, list and watch.</p>
+  <div class="tablewrap"><table>
+    <tr><th>API type</th><th>Default</th><th>Used for</th><th>Ready when</th></tr>
+    <tr><td class="k">apps/v1 deployments, statefulsets</td><td>Yes</td><td>Virtual-app discovery</td><td><code>readyReplicas</code> ≥ <code>spec.replicas</code></td></tr>
+    <tr><td class="k">apps/v1 daemonsets</td><td>Yes</td><td>Virtual-app discovery</td><td><code>numberReady</code> ≥ <code>desiredNumberScheduled</code></td></tr>
+    <tr><td class="k">argoproj.io/v1alpha1 rollouts</td><td>Yes</td><td>Virtual-app discovery</td><td><code>readyReplicas</code> ≥ <code>spec.replicas</code></td></tr>
+    <tr><td class="k">kagent Agent (AI agents)</td><td>As its Deployment</td><td>The kagent controller runs each Agent as a Deployment; the Agent resource itself is not watched</td><td>As a Deployment</td></tr>
+    <tr><td class="k">Any namespaced workload kind</td><td>Opt-in</td><td>Virtual-app discovery for custom types and vendor CRDs</td><td>A <code>Ready</code> or <code>Available</code> condition</td></tr>
+    <tr><td class="k">apps/v1 replicasets, batch/v1 jobs, cronjobs</td><td>Yes</td><td>Owner walk from a pod to the workload that names it</td><td></td></tr>
+    <tr><td class="k">v1 pods</td><td>Yes</td><td>Pod to workload identity for resource metrics</td><td></td></tr>
+    <tr><td class="k">v1 namespaces</td><td>Yes</td><td>Scope and tenant annotations</td><td></td></tr>
+    <tr><td class="k">v1 services, networking.k8s.io/v1 ingresses</td><td>Yes</td><td>Service index and entry points</td><td></td></tr>
+    <tr><td class="k">v1 events</td><td>Yes</td><td>Warning events, filtered server-side to <code>type=Warning</code></td><td></td></tr>
+  </table></div>
+  <p>Custom types are added with <code>workloadResources</code> (flag <code>--workload-resources</code>), one <code>&lt;group&gt;/&lt;version&gt;/&lt;resource&gt;</code> per entry, and a matching read rule in <code>rbac.extraWorkloadRules</code>. A non-empty list replaces the defaults, so keep the ones still needed. A type the API server does not serve is skipped at startup with one log line.</p>
+<pre><code class="language-yaml">workloadResources:
+  - apps/v1/deployments
+  - apps/v1/statefulsets
+  - apps/v1/daemonsets
+  - argoproj.io/v1alpha1/rollouts
+  - helm.toolkit.fluxcd.io/v2/helmreleases   # Flux HelmRelease
+rbac:
+  extraWorkloadRules:
+    - apiGroups: ["helm.toolkit.fluxcd.io"]
+      resources: ["helmreleases"]
+      verbs: ["get", "list", "watch"]</code></pre>
+  <h3>Signals</h3>
+  <p>Five sources feed the agent. RED and topology come from OBI (OpenTelemetry eBPF Instrumentation, vendored at <code>third_party/obi</code>), which chooses its own hooks; the agent loads no eBPF program of its own.</p>
+  <div class="tablewrap"><table>
+    <tr><th>Source</th><th>Read by</th><th>Method</th><th>Yields</th></tr>
+    <tr><td>Kernel hooks</td><td class="k">ebpf</td><td>OBI uprobes and kprobes for HTTP and gRPC; socket filter for L4 when <code>ebpf.networkFlows.enabled</code></td><td>RED per service; L7 and L4 edges</td></tr>
+    <tr><td>cgroup v2, PSI</td><td class="k">node-exporter</td><td>Host files, read only</td><td>USE per container</td></tr>
+    <tr><td>Container log files</td><td class="k">logs-based metrics</td><td>Tails from file end, polls every 250 ms; partial lines over 1 MiB dropped and counted</td><td><code>log.errors</code>, <code>log.warns</code>, <code>log.lines</code></td></tr>
+    <tr><td>Kubernetes API</td><td class="k">controller</td><td>Informers on namespaces and workloads; events filtered server-side to <code>type=Warning</code></td><td>Virtual apps, Warning events</td></tr>
+    <tr><td>OpenTelemetry SDKs and Collectors</td><td class="k">controller</td><td>OTLP/gRPC push to port 4317, when <code>otlp.enabled</code>; routed by metric name</td><td>RED, SIG and L7 topology from semantic-convention histograms or span metrics; USE, with PSI, from kubelet cAdvisor or <code>use.*</code>; LOG from <code>log.*</code></td></tr>
+  </table></div>
+  <h3>OTLP receiver</h3>
+  <p>A cluster that already runs OpenTelemetry, or cannot run the DaemonSet, pushes OTLP metrics to the controller. The receiver keeps each resource's newest cumulative point per series and hands it to sensorstream, so the same collectors, baseline gates and replica gossip apply. Metric names route it: the HTTP, gRPC and database histograms and <code>obi.network.flow.bytes</code> go to RED and topology, <code>use.*</code> to USE, <code>log.errors</code>, <code>log.warns</code> and <code>log.lines</code> to LOG. Where a sensor and an OTLP sender report the same service or pod, the sensor's numbers are used and the OTLP ones dropped, so nothing is counted twice.</p>
+  <p>A Collector that has only traces, kubelet access and logs covers all three frameworks without the DaemonSet. The receiver translates two inputs it would otherwise ignore:</p>
+  <div class="tablewrap"><table>
+    <tr><th>Collector input</th><th>Translated to</th><th>Notes</th></tr>
+    <tr><td>Traces through the <code>spanmetrics</code> connector</td><td>HTTP and gRPC server histograms (RED, SIG), client histograms (L7 edges)</td><td>Read from <code>traces.span.metrics.duration</code> by <code>span.kind</code> and <code>rpc.system</code>; milliseconds become seconds; a span without a status code counts as 200 or OK, an error span as 500 or UNKNOWN; internal spans and the calls counter are dropped. Needs <code>add_resource_attributes: true</code> so the service, not the Collector, owns the series</td></tr>
+    <tr><td>Kubelet <code>/metrics/cadvisor</code> through the <code>prometheus</code> receiver</td><td><code>use.*</code> per pod, node cores and memory</td><td>Pod-level cgroup series only. PSI is the rate of <code>container_pressure_*_waiting_seconds</code> as a percentage, the same meaning as the DaemonSet's <code>some avg</code>; it needs Kubernetes 1.34 or later and a ClusterRole with <code>get</code> on <code>nodes/metrics</code></td></tr>
+    <tr><td>Logs through the <code>count</code> connector</td><td>LOG</td><td>Count by severity into <code>log.errors</code>, <code>log.warns</code> and <code>log.lines</code></td></tr>
+  </table></div>
+  <p>Points need <code>service.name</code> and <code>k8s.namespace.name</code> and cumulative temporality. Older conventions are converted: <code>http.server.duration</code> in milliseconds, <code>http.status_code</code>, a numeric <code>rpc.grpc.status_code</code>. The workload comes from <code>k8s.owner.name</code> or the <code>k8s.deployment.name</code> family that the <code>k8sattributes</code> processor adds. Delta sums and histograms are added into a running total per series; exponential histograms are refused and reported in the response. Limits (<code>otlp.limits</code>): 2000 resources in all, 5000 series each, 500 resources per sender, 4 MiB per request; a resource silent for 10 minutes is dropped.</p>
+  <p>The receiver serves the controller's certificate, which senders pin from <code>-sensor-ca</code>. A sender authenticates with a client certificate that chains to <code>otlp.clientCASecret</code>, which is the OTel exporter's own <code>tls.cert_file</code> and <code>key_file</code>, or with a projected ServiceAccount token, audience <code>triage-agent-otlp</code>, of an account in <code>otlp.allowedServiceAccounts</code>, checked by TokenReview.</p>
+<pre><code class="language-yaml">exporters:
+  otlp/triage:
+    endpoint: &lt;fullname&gt;-sensors.&lt;namespace&gt;.svc:4317
+    tls:
+      ca_file: /etc/otel/triage/ca.crt       # from -sensor-ca
+      cert_file: /etc/otel/certs/client.crt  # chains to otlp.clientCASecret
+      key_file: /etc/otel/certs/client.key</code></pre>
+  <h3>OTLP sensor role</h3>
+  <p>With <code>otlp.sensor.enabled</code> the receiver runs in its own Deployment, <code>--mode=otlp</code> of the same image, and the controller keeps no OTLP listener. A Collector then sends <strong>raw</strong> telemetry: no <code>spanmetrics</code>, <code>count</code>, <code>deltatocumulative</code> or <code>filter</code> component is needed, only <code>k8sattributes</code>, which has to run on the sender because it reads the API server, and an OTLP exporter. The pods transform what they receive:</p>
+  <div class="tablewrap"><table>
+    <tr><th>Raw input</th><th>Made into</th><th>Notes</th></tr>
+    <tr><td>Server and consumer spans</td><td>HTTP and gRPC server duration histograms (RED, SIG)</td><td>gRPC is recognised from <code>rpc.system</code>, <code>rpc.system.name</code> or <code>rpc.grpc.status_code</code>. Internal spans are ignored</td></tr>
+    <tr><td>Client and producer spans</td><td>Client duration histograms (L7 edges)</td><td>Same attributes as the spanmetrics path</td></tr>
+    <tr><td>Log records</td><td><code>log.errors</code>, <code>log.warns</code>, <code>log.lines</code> per namespace and service</td><td>From <code>severity_number</code>; counts only, no error sample</td></tr>
+    <tr><td>Delta sums and histograms</td><td>Cumulative series</td><td>Added into the resource's running total; a reset or an out-of-order point never lowers a counter</td></tr>
+    <tr><td>Metrics no collector reads</td><td>Dropped at intake</td><td>Before they take a slot against the limits, so an unfiltered Collector does not exhaust them. Counted as <code>unread</code> in the pod log and the ledger</td></tr>
+  </table></div>
+  <p>A service that reports its own request duration metric and also sends spans would be counted twice. The RED collector reads sources in the order sensors, native OTLP, then OTLP derived from spans, and skips a derived series whose service and metric a native source already reported. A pod's derived resources carry <code>triage.otlp.replica</code>, so the shares of one service that different pods saw stay separate sources that the collectors sum.</p>
+  <p>Each pod keeps its sources in memory and sends the changed ones to the controller over the sensor stream every <code>otlp.sensor.tick</code>. It authenticates to the controller with the controller's serving certificate as its client certificate, so an OTLP-only install needs no ClusterRole. The controller applies the joined tenants and the workspace scope again to every source. A sender sees <code>UNAVAILABLE</code> only when no pod is ready, and retries from its own queue; a lost pod resets its counters and the next snapshot restores the series.</p>
+  <p><strong>Collectors inside the cluster.</strong> A Collector with neither a client certificate nor a token for the agent can use <code>otlp.insecure</code>: plain gRPC, no sender check, every point filed under the agent's one tenant. The chart refuses it without <code>allowFrom</code>, a list of namespaces, and renders a default-deny NetworkPolicy that admits only those. A point that names a namespace outside the tenant's scope is refused, and the limits apply per remote address. It excludes <code>ownCA</code>, <code>clientCASecret</code>, <code>allowedServiceAccounts</code> and <code>forwarders</code>, and the cluster's network plugin must enforce NetworkPolicy.</p>
+  <p><strong>Namespace and workload.</strong> A resource needs <code>k8s.namespace.name</code>. The core refuses a whole frame over one entry with no namespace or name, so the push path holds such an entry back by name instead; it is listed under <em>Held back from the core</em> in the local TUI and counted in <code>triage_agent_frames_malformed_dropped_total</code>. A common cause is <code>k8sattributes</code> associating pods by <code>container.id</code> first: some SDKs report a container id that is not the pod's, and the processor uses the first rule whose attribute is present, with no fallback. Associate by connection IP or pod UID instead.</p>
+  <p><strong>Topology without a Service index.</strong> An agent with <code>kubernetes.watch=false</code> cannot resolve a callee's Service address. A client span whose server address names a service the agent has read (<code>name</code>, <code>name:port</code>, <code>name.namespace</code> or <code>name.namespace.svc</code>) becomes an edge to that service; any other address stays external.</p>
+<pre><code class="language-yaml">exporters:
+  otlp_grpc/triage:
+    endpoint: &lt;fullname&gt;-otlp.&lt;namespace&gt;.svc:4317
+    tls:
+      insecure: true    # otlp.insecure, in-cluster only</code></pre>
+  <p>Virtual apps come from workloads only, synthesized by workload name or by label when a namespace opts in. The workload kinds and their readiness rules are under Watched API types above.</p>
+  <p><strong>Sandboxed runtimes.</strong> eBPF works on the host kernel, so sandboxes limit it. The agent cannot run under gVisor, Kata or user-namespaced pods, which have no host kernel or host PID namespace to probe. Workloads that run under them are mostly invisible to the traffic role: their traffic passes through the sandbox's own kernel, so RED, SIG and L7 topology are missing and at most L4 flows at the sandbox's interface are seen.</p>
+</section>
+
+<!-- 04 -->
+<section id="s4">
+  <div class="sechead"><span class="ord">04</span><h2>Data flow and frames</h2></div>
+  <p>Gated frames carry only services that crossed their baseline in the window. Summary frames carry every service, ungated, so the core can see quiet services too.</p>
+  <figure class="figscroll">
+    <svg viewBox="0 0 880 250" role="img" aria-label="Pipeline from sensor roles through sensorstream and the collectors to push and the core, with timings, and a snapshot request from the core on graph load.">
+      <defs>
+        <marker id="pa" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#9C4A26"/></marker>
+        <marker id="pb" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#3F6478"/></marker>
+      </defs>
+      <rect class="box" x="16" y="40" width="148" height="60" rx="8"/><text class="t c" x="90" y="66">Sensor roles</text><text class="ts c" x="90" y="84">OTLP snapshot</text>
+      <rect class="box" x="196" y="40" width="148" height="60" rx="8"/><text class="t c" x="270" y="66">sensorstream</text><text class="ts c" x="270" y="84">latest per node</text>
+      <rect class="box" x="376" y="40" width="148" height="60" rx="8"/><text class="t c" x="450" y="66">Collectors</text><text class="ts c" x="450" y="84">delta, gate, cap</text>
+      <rect class="box hot" x="556" y="40" width="148" height="60" rx="8"/><text class="t c" x="630" y="66">Per-tenant queues</text><text class="ts c" x="630" y="84">push over WSS</text>
+      <rect class="box" x="736" y="40" width="128" height="60" rx="8"/><text class="t c" x="800" y="66">Core</text><text class="ts c" x="800" y="84">ingest</text>
+      <path class="e a" d="M164 70H192" marker-end="url(#pa)"/>
+      <path class="e a" d="M344 70H372" marker-end="url(#pa)"/>
+      <path class="e a" d="M524 70H552" marker-end="url(#pa)"/>
+      <path class="e a" d="M704 70H732" marker-end="url(#pa)"/>
+      <path class="e b" d="M800 100V150H630V104" marker-end="url(#pb)"/>
+      <text class="mb c" x="715" y="167">snapshot request on graph load</text>
+
+      <rect class="well" x="16" y="180" width="148" height="56" rx="6"/><text class="mi" x="28" y="202">every 15 s</text><text class="ts" x="28" y="222">--sensor-tick</text>
+      <rect class="well" x="196" y="180" width="148" height="56" rx="6"/><text class="mi" x="208" y="202">stale after 2 m</text><text class="ts" x="208" y="222">node dropped from reads</text>
+      <rect class="well" x="376" y="180" width="148" height="56" rx="6"/><text class="mi" x="388" y="202">Δ ≥ 10, ≥ 3× median</text><text class="ts" x="388" y="222">of 5+ windows (logs)</text>
+      <rect class="well" x="556" y="180" width="148" height="56" rx="6"/><text class="mi" x="568" y="202">round-robin</text><text class="ts" x="568" y="222">one WSS</text>
+      <rect class="well" x="736" y="180" width="128" height="56" rx="6"/><text class="mi" x="748" y="202">≤ 512 KiB in</text><text class="ts" x="748" y="222">per inbound message</text>
+      <text class="m" x="16" y="24">PIPELINE</text>
+      <text class="m" x="16" y="172">CADENCE AND LIMITS</text>
+    </svg>
+    <figcaption>Figure 3. Pipeline with its cadences. Reconnect backoff is 1 s to 30 s on both links.</figcaption>
+  </figure>
+  <div class="tablewrap"><table>
+    <tr><th>Frame</th><th>Content</th><th>Enabled by</th></tr>
+    <tr><td class="k">snapshot, app_delta</td><td>Virtual-app status</td><td>Core configured</td></tr>
+    <tr><td class="k">k8s_event</td><td>Kubernetes Warning events</td><td>Core configured</td></tr>
+    <tr><td class="k">red_metrics / red_summary</td><td>RED from OBI, gated / every service</td><td><code>redMetrics.enabled</code></td></tr>
+    <tr><td class="k">use_metrics / use_summary</td><td>USE from cgroup v2 and PSI, gated / every service</td><td><code>useMetrics.enabled</code></td></tr>
+    <tr><td class="k">log_metrics</td><td>Error and warn deltas per service, one sample line</td><td><code>--log-metrics-enabled</code></td></tr>
+    <tr><td class="k">topology_snapshot</td><td>Observed L7 calls and optional L4 flows</td><td><code>--topology-enabled</code></td></tr>
+    <tr><td class="k">sensor_state</td><td>Sensor health every 60 s, unstamped, not tenant data. Lists each OTLP source with its last push and per-framework counts: RED and LOG data points, USE pods</td><td>Any collector</td></tr>
+    <tr><td class="k">limits (inbound)</td><td>The core's daily event cap for each tenant the agent serves (core policy <code>budgets.agentEventsDaily</code>). The agent holds its Kubernetes events to it with one token bucket per tenant, refilled evenly over 24 hours and holding one hour's share, so a storm is cut within minutes. App deltas and metric batches carry state and are never held back; the core caps the events it derives from them. Drops are counted per tenant and logged on the first and every thousandth. The frame also carries <code>namespaces</code>, the namespaces each tenant takes from this agent (absent or empty means every namespace): the OTLP receiver refuses, and the push path drops and counts as <code>outOfScopeDropped</code>, anything outside it. An older core sends no limits and nothing changes</td><td>Always</td></tr>
+    <tr><td class="k">resync (inbound)</td><td>Snapshot request on graph load. Core asks the agent to resend one tenant's virtual-app snapshot after that tenant's service graph reloads. The agent answers with <code>snapshot</code> frames and an end marker; no metrics or topology are resent</td><td>Always</td></tr>
+  </table></div>
+  <h3>Wire formats</h3>
+  <p>Inside the cluster the agent speaks native OpenTelemetry. OBI emits OTel metrics under the semantic conventions, and the sensor roles forward them unchanged as OTLP <code>ResourceMetrics</code> with cumulative temporality. No custom metric model sits between OBI and the collectors.</p>
+  <div class="tablewrap"><table>
+    <tr><th>OTel metric</th><th>Type</th><th>Used for</th></tr>
+    <tr><td class="k">http.server.request.duration</td><td>Histogram</td><td>RED and SIG for HTTP; status from <code>http.response.status_code</code></td></tr>
+    <tr><td class="k">rpc.server.call.duration</td><td>Histogram</td><td>RED and SIG for gRPC; status from <code>rpc.response.status_code</code></td></tr>
+    <tr><td class="k">http.client.request.duration, rpc.client.call.duration, db.client.operation.duration</td><td>Histogram</td><td>L7 topology edges</td></tr>
+    <tr><td class="k">obi.network.flow.bytes</td><td>Counter</td><td>L4 topology edges</td></tr>
+    <tr><td class="k">k8s.namespace.name, service.name</td><td>Resource attributes</td><td>Identity of every series</td></tr>
+  </table></div>
+  <p>The sensor stream wraps those metrics in a small protobuf envelope. Each tick a sensor sends one <code>Snapshot</code> per role and one <code>SensorState</code>; the controller acknowledges each message by sequence number.</p>
+<pre><code class="language-protobuf">service SensorService { rpc Stream(stream StreamRequest) returns (stream StreamResponse); }
+
+message StreamRequest { uint64 seq; Timestamp time; oneof { Hello | Snapshot | SensorState } }
+message Snapshot {
+  string role = 1;
+  repeated opentelemetry.proto.metrics.v1.ResourceMetrics resource_metrics = 2;
+}
+message StreamResponse { Ack { uint64 seq } }</code></pre>
+  <p>The collectors turn the cumulative histograms into per-window request count, error count and p99 per service, then gate them. A latency breach names the slowest operation of the window in its sample, and a window whose p99 bucket holds a single request is neither judged nor learned, so one long-lived stream closing does not read as the service's latency. What leaves the cluster is one JSON frame per WebSocket text message: a shared envelope with exactly one payload field named after the kind. The <code>red_metrics</code> example below uses illustrative values.</p>
+<pre><code class="language-json">{ "v": 1, "kind": "red_metrics", "cluster": "&lt;cluster&gt;", "tenant": "&lt;tenant&gt;",
+  "redMetrics": {
+    "windowStart": 1759834800, "windowSec": 60,
+    "services": [{
+      "namespace": "shop", "service": "checkout",
+      "requestCount": 1840, "errorCount": 41,
+      "sample": "GET /api/orders -> 502 x41",
+      "p99Ms": 812, "baselineP99Ms": 140, "latencyBreach": true,
+      "breach": "op-latency", "operation": "POST /api/orders",
+      "observed": 812, "baseline": 140, "evidenceSec": 180
+    }]
+  } }</code></pre>
+  <p>The payload fields are <code>hello</code>, <code>snapshot</code>, <code>appDelta</code>, <code>k8sEvent</code>, <code>logMetrics</code>, <code>redMetrics</code>, <code>redSummary</code>, <code>useMetrics</code>, <code>useSummary</code>, <code>topologySnapshot</code> and <code>sensorState</code>. Field names are a pinned contract with the core and must stay byte-identical on both sides; fields added later are optional.</p>
+
+  <h3>Wire caps</h3>
+  <div class="tablewrap"><table>
+    <tr><th>Cap</th><th>Value</th></tr>
+    <tr><td>Services per metrics frame</td><td>100, larger frames chunked</td></tr>
+    <tr><td>Sample text</td><td>256 bytes</td></tr>
+    <tr><td>Operation name</td><td>128 bytes</td></tr>
+    <tr><td>Topology</td><td>200 nodes, 500 edges</td></tr>
+    <tr><td>External address</td><td>128 bytes</td></tr>
+  </table></div>
+</section>
+
+<!-- 05 -->
+<section id="s5">
+  <div class="sechead"><span class="ord">05</span><h2>Log samples</h2></div>
+  <p>A <code>log_metrics</code> frame carries one sample line per service so the core can see what the errors say. The fingerprint that groups errors is masked; the sample that leaves the cluster is the line with secrets and email addresses replaced by <code>***</code>, then cut to length.</p>
+  <figure class="figscroll">
+    <svg viewBox="0 0 880 240" role="img" aria-label="An error line is extracted and stripped, then splits: a masked fingerprint used for identity only, and a raw exemplar that is cut to 256 bytes and sent to the core without redaction.">
+      <defs>
+        <marker id="sm" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#736F65"/></marker>
+        <marker id="sa" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#9C4A26"/></marker>
+      </defs>
+      <text class="m" x="16" y="24">FROM ERROR LINE TO log.sample</text>
+      <rect class="box" x="16" y="70" width="140" height="60" rx="8"/><text class="t c" x="86" y="96">Error line</text><text class="ts c" x="86" y="114">regex: level, panic:</text>
+      <rect class="box" x="186" y="70" width="140" height="60" rx="8"/><text class="t c" x="256" y="96">Extract</text><text class="ts c" x="256" y="114">message, msg, error, err</text>
+      <rect class="box" x="356" y="70" width="140" height="60" rx="8"/><text class="t c" x="426" y="96">Strip noise</text><text class="ts c" x="426" y="114">timestamp, level tokens</text>
+      <rect class="box cool" x="540" y="36" width="160" height="56" rx="8"/><text class="t c" x="620" y="60">Fingerprint</text><text class="ts c" x="620" y="78">UUIDs, hex, digits → #</text>
+      <rect class="box" x="540" y="132" width="160" height="56" rx="8"/><text class="t c" x="620" y="156">Exemplar</text><text class="ts c" x="620" y="174">redacted, 160 B per slot</text>
+      <rect class="box" x="736" y="132" width="128" height="56" rx="8"/><text class="t c" x="800" y="156">On the wire</text><text class="ts c" x="800" y="174">cut to 256 B</text>
+      <rect class="well" x="736" y="36" width="128" height="56" rx="6"/><text class="tl c" x="800" y="60">series identity</text><text class="ts c" x="800" y="78">and dedup only</text>
+      <path class="e" d="M156 100H182" marker-end="url(#sm)"/>
+      <path class="e" d="M326 100H352" marker-end="url(#sm)"/>
+      <path class="e" d="M496 100H516V64H536" marker-end="url(#sm)"/>
+      <path class="e a" d="M516 100V160H536" marker-end="url(#sa)"/>
+      <path class="e" d="M700 64H732" marker-end="url(#sm)"/>
+      <path class="e a" d="M700 160H732" marker-end="url(#sa)"/>
+      <text class="ma" x="540" y="218">Secrets and PII redacted before truncation</text>
+    </svg>
+    <figcaption>Figure 4. Masking applies to the fingerprint; redaction applies to the exemplar. The collector picks the sample of the error series with the largest positive delta in the window. Defaults: 160 bytes and 8 fingerprints per service.</figcaption>
+  </figure>
+  <div class="tablewrap"><table>
+    <tr><th>Control</th><th>Status</th></tr>
+    <tr><td>Length cap, 160 B exporter / 256 B wire</td><td><span class="pill ok">present</span></td></tr>
+    <tr><td>Slot cap, 8 fingerprints per service; overflow counted with no sample</td><td><span class="pill ok">present</span></td></tr>
+    <tr><td>Fingerprint masking</td><td><span class="pill lo">identity only</span></td></tr>
+    <tr><td>Namespace scope and opt-out</td><td><span class="pill ok">present</span></td></tr>
+    <tr><td>Secret and PII redaction of the sample: URI credentials, JWTs, Bearer and Basic credentials, secret-named keys, AWS key IDs, email addresses</td><td><span class="pill ok">present</span></td></tr>
+    <tr><td>URI credential scrub (<code>user:***@host</code>)</td><td><span class="pill ok">present</span></td></tr>
+    <tr><td>Prompt guardrails before a model call</td><td><span class="pill ok">core-side</span></td></tr>
+  </table></div>
+</section>
+
+<!-- 06 -->
+<section id="s6">
+  <div class="sechead"><span class="ord">06</span><h2>Connections and trust</h2></div>
+  <p>Both links are encrypted and authenticated in both directions, and node roles open no port; the controller's own optional TUI and monitoring listeners are in <a href="#s11">section 11</a>. Between the controller and the core, each side proves itself with a certificate inside the WebSocket: the core first, by signing a challenge nonce with its agent CA, then the agent, with its Ed25519 join certificate and a signature over the same nonce. The join certificate is the agent's only credential for the core. This is mutual certificate authentication over TLS 1.3, carried in the WebSocket rather than as TLS client certificates.</p>
+  <p>The core's challenge is bound to the connection. On every join-mode dial the agent sends a fresh 32-byte random nonce in the <code>X-Triage-Agent-Nonce</code> upgrade header (base64), and a core that supports binding echoes it in the challenge and signs it together with its own nonce, so a challenge recorded on one connection fails on any other. A challenge without the echo is replayable and is always refused. A core that also binds the TLS channel sets <code>channelBound</code> and signs 32 bytes of TLS exporter keying material (label <code>EXPORTER-triage-agent-join</code>, no context) as a third line of the message, so a relay that terminates TLS itself cannot forward the challenge; the agent derives the same material from its side of the connection and refuses a mismatch. Without <code>channelBound</code> the agent accepts the nonce-bound signature over verified <code>wss://</code> or plaintext <code>ws://</code>, and refuses it when <code>--core-insecure-skip-verify</code> is set. A certificate returned on join is checked before it is saved: it must chain to the trusted CA, be currently valid, and name exactly the requested cluster and tenants; a rotation cross certificate must also be a CA certificate with the certificate-signing key usage.</p>
+  <h3>Joining the core</h3>
+  <p>There is no shared token, no signed hello and no per-cluster secret. The agent makes an Ed25519 key on first start and gets a certificate for it from the core. <code>--join-ca-fingerprint</code> (chart <code>core.caFingerprint</code>, from <code>triagectl agent list</code> on the core) pins the core's agent CA. It is required whenever <code>--triage-endpoint</code> is set, in a pod and in host mode, and the agent refuses to start without it. The key, certificate and saved core CA are kept in the Secret named by <code>--join-secret</code>, or in <code>--join-state-dir</code>, so a new pod or a restart needs no new approval.</p>
+  <div class="tablewrap"><table>
+    <tr><th>Way to join</th><th>Flow</th></tr>
+    <tr><td class="k">One-time agent key (core ADR-090)</td><td>The core admin or cabinet mints a key for one agent, <code>tak_&lt;id&gt;_&lt;secret&gt;</code>, of kind cluster, host or otlp, with its bindings (a tenant and namespaces). The core also mints the cluster name. The chart writes the key into the join Secret (<code>core.agentKey</code>, needs <code>core.storage: secret</code>); on a host <code>install.sh</code> writes it to <code>enroll.key</code> in the join state directory. On its first connect the agent spends the key, the core issues the certificate at once, and the agent removes the key from the store. A key the core refuses stays in the store. A key works once, for that cluster name and those tenants only</td></tr>
+    <tr><td class="k">Admin approval</td><td>With no key the agent logs <code>join pending</code> with its key fingerprint. An admin runs <code>triagectl agent approve &lt;cluster&gt; --fingerprint &lt;fingerprint&gt;</code> on the core</td></tr>
+    <tr><td class="k">Tenants</td><td>The join names the cluster and its tenants (<code>--join-tenant</code>, chart <code>core.tenants</code>; default <code>--target-tenant</code>). The certificate must name exactly those. They are also the only tenants an OTLP client certificate may name</td></tr>
+    <tr><td class="k">Storage</td><td>Chart <code>core.storage</code>: <code>secret</code> (default, a Secret the chart creates empty), <code>emptyDir</code> (a new key and a new join for each pod) or <code>pvc</code> (<code>core.existingClaim</code>)</td></tr>
+  </table></div>
+  <p>Between a sensor and the controller, one-way TLS plus a token gives mutual authentication with nothing extra to run. The controller holds a self-signed ECDSA P-256 certificate that each sensor pins from the <code>-sensor-ca</code> ConfigMap, so the sensor knows it reaches the real controller. The sensor presents no client certificate. It sends its projected ServiceAccount token, audience <code>triage-agent-sensors</code>, and the controller checks it with a <strong>TokenReview</strong>, a call to the Kubernetes API server that verifies the token's signature, expiry, audience and bound pod and returns the ServiceAccount and node it was issued for. The controller needs only <code>create</code> on <code>tokenreviews</code> for this. The token must belong to the <code>-ebpf</code> ServiceAccount, and the node named in the token must match the node in the sensor's hello. The kubelet issues the token per pod, valid for one hour and rotated automatically, so there is no client CA, no per-node certificate and no shared client key. A compromised node cannot send data as another node.</p>
+  <figure class="figscroll">
+    <svg viewBox="0 0 880 260" role="img" aria-label="Trust on each link: sensors pin the controller certificate and present a ServiceAccount token; the core and the controller prove themselves to each other with certificates over a challenge nonce.">
+      <defs><marker id="la" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#9C4A26"/></marker>
+      <marker id="lb" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#3F6478"/></marker></defs>
+      <rect class="box" x="16" y="60" width="180" height="80" rx="8"/><text class="t" x="32" y="86">Sensor pod</text><text class="ts" x="32" y="106">ebpf, node-exporter,</text><text class="ts" x="32" y="122">logs-based metrics</text>
+      <rect class="box" x="350" y="60" width="180" height="80" rx="8"/><text class="t" x="366" y="86">Controller</text><text class="ts" x="366" y="106">sensorstream :9470</text><text class="ts" x="366" y="122">WSS client</text>
+      <rect class="box" x="684" y="60" width="180" height="80" rx="8"/><text class="t" x="700" y="86">Core</text><text class="ts" x="700" y="106">WSS server</text><text class="ts" x="700" y="122">agent CA</text>
+      <path class="e a" d="M196 100H346" marker-end="url(#la)"/>
+      <path class="e a" d="M530 92H680" marker-end="url(#la)"/>
+      <path class="e b" d="M684 112H534" marker-end="url(#lb)"/>
+      <text class="ma c" x="271" y="90">gRPC · TLS 1.3 only</text>
+      <text class="ma c" x="605" y="82">wss</text>
+      <text class="mb c" x="605" y="130">snapshot request only</text>
+
+      <text class="m" x="16" y="172">SENSOR → SENSORSTREAM</text>
+      <text class="tl" x="16" y="194">Server: self-signed ECDSA P-256, pinned via -sensor-ca</text>
+      <text class="tl" x="16" y="212">Client: projected SA token, audience triage-agent-sensors</text>
+      <text class="tl" x="16" y="230">Checked by TokenReview; node name must match the hello</text>
+      <text class="m" x="460" y="172">CONTROLLER → CORE</text>
+      <text class="tl" x="460" y="194">Core signs a nonce with its agent CA; agent pins the CA</text>
+      <text class="tl" x="460" y="212">Agent answers with its join cert and signature</text>
+      <text class="tl" x="460" y="230">Mutual auth inside WSS, not TLS client certificates</text>
+      <text class="m" x="16" y="24">TRUST PER LINK</text>
+    </svg>
+    <figcaption>Figure 5. Authentication on each link.</figcaption>
+  </figure>
+  <ul>
+    <li><strong>Listeners.</strong> Only the controller listens: 9470 for the sensor stream when <code>--sensor-listen</code> is set, and 4317 for OTLP when <code>--otlp-listen</code> is set. Metrics on 8080 are off by default (<code>--metrics-addr=0</code>). No pprof in the repository.</li>
+    <li><strong>Keepalive.</strong> 30 s with a 10 s timeout on both ends of the gRPC stream.</li>
+    <li><strong>Certificate life.</strong> The sensor certificate is valid for 10 years and regenerated 30 days before expiry. The join certificate renews with less than a third of its life left.</li>
+  </ul>
+</section>
+
+<!-- 07 -->
+<section id="s7">
+  <div class="sechead"><span class="ord">07</span><h2>RBAC</h2></div>
+  <p>RBAC is read-only on workloads. The agent has no cluster-wide Secret or ConfigMap access and updates three named objects in its own namespace, each by <code>resourceNames</code>.</p>
+  <div class="tablewrap"><table>
+    <tr><th>Role</th><th>Grants</th></tr>
+    <tr><td class="k">ClusterRole, controller</td><td>get, list, watch on namespaces, events, pods, services, ingresses, deployments, statefulsets, daemonsets, replicasets, jobs, cronjobs, rollouts; get on endpoints. No Secrets, ConfigMaps or wildcards</td></tr>
+    <tr><td class="k">ClusterRole, ebpf</td><td>get, list, watch on pods, services, nodes, namespaces and workload kinds; pod informer limited to its node</td></tr>
+    <tr><td class="k">Role -sensor-stream</td><td>get, update on <code>-sensor-tls</code> and <code>-sensor-ca</code></td></tr>
+    <tr><td class="k">Role -join</td><td>get, update on <code>-join</code></td></tr>
+    <tr><td class="k">Role leader-election</td><td>Leases; create and patch events</td></tr>
+    <tr><td class="k">ClusterRole -sensor-tokenreview</td><td>create tokenreviews</td></tr>
+    <tr><td class="k">ClusterRole -api-review (with <code>api.serviceAccountAuth</code>)</td><td>create tokenreviews and subjectaccessreviews, for the monitoring API's ServiceAccount authentication</td></tr>
+    <tr><td class="k">ClusterRole -api-reader (with <code>api.serviceAccountAuth</code>)</td><td>get on <code>agent-api</code> in <code>triageagent.dev</code>: the permission an API caller needs. Bound by the operator, not by the chart, cluster-wide or per tenant namespace</td></tr>
+  </table></div>
+  <h3>Process privilege</h3>
+  <p>Both workloads run the same image, whose default user is <code>nonroot</code> (UID 65532, Chainguard <code>static</code> base). The controller keeps that user and needs no host access. The DaemonSet overrides it with <code>runAsUser: 0</code> in its pod spec, in both modes below. It runs all sensor roles in one container, <code>agent</code>, so the traffic, resource and logs-based metrics roles share one security context. The chart offers two privilege modes for it, selected by <code>ebpf.privileged</code>.</p>
+  <div class="tablewrap"><table>
+    <tr><th></th><th>Unprivileged (default)</th><th>Privileged fallback</th></tr>
+    <tr><td class="k">ebpf.privileged</td><td><code>false</code></td><td><code>true</code></td></tr>
+    <tr><td class="k">privileged</td><td>false</td><td>true</td></tr>
+    <tr><td class="k">Capabilities</td><td>Drop <code>ALL</code>; add <code>BPF</code>, <code>PERFMON</code>, <code>NET_RAW</code>, <code>SYS_PTRACE</code>, <code>DAC_READ_SEARCH</code>, <code>CHECKPOINT_RESTORE</code>, plus <code>ebpf.extraCapabilities</code></td><td>All</td></tr>
+    <tr><td class="k">Privilege escalation</td><td>Blocked</td><td>Not restricted</td></tr>
+    <tr><td class="k">Seccomp</td><td><code>RuntimeDefault</code></td><td>Not set</td></tr>
+    <tr><td class="k">Root filesystem</td><td>Read-only</td><td>Read-only</td></tr>
+    <tr><td class="k">User</td><td>0 (root), overrides the image's <code>nonroot</code></td><td>0 (root), overrides the image's <code>nonroot</code></td></tr>
+    <tr><td class="k">Use when</td><td>Kernels 5.11 and later, which load eBPF under this capability set</td><td>Older or unusual kernels that cannot load eBPF under the capability set</td></tr>
+  </table></div>
+  <p><strong>Root scope.</strong> UID 0 is what makes the six capabilities effective: Kubernetes has no field for ambient capabilities, and file capabilities on the binary are blocked by <code>no_new_privs</code>. Root here is not full privilege; it is UID 0 with every other capability dropped, <code>privileged: false</code>, <code>no_new_privs</code>, seccomp and a read-only root filesystem. <code>hostPID</code> already requires the <code>privileged</code> Pod Security level, with or without root. Comparable eBPF agents such as Beyla, Cilium, Falco and Tetragon also run as root, most with wider capabilities or full privilege.</p>
+  <h3>Extra capabilities</h3>
+  <div class="tablewrap"><table>
+    <tr><th>Capability</th><th>Needed for</th></tr>
+    <tr><td class="k">SYS_RESOURCE</td><td>Kernels before 5.11, to lift BPF verifier instruction and memory limits</td></tr>
+    <tr><td class="k">SYS_ADMIN</td><td>Go services on GKE COS 6.12: without it every Go uprobe fails with permission denied and Go services report no RED; the sensor status points to this capability only when the failing executable is Go. Some kernels also need it for Go trace-context propagation</td></tr>
+  </table></div>
+  <p>Both widen the container beyond the audited default; the chart advises trying without them first.</p>
+  <h3>Host access</h3>
+  <div class="tablewrap"><table>
+    <tr><th>Item</th><th>When</th><th>Why</th></tr>
+    <tr><td class="k">hostPID</td><td>Traffic metrics on</td><td>OBI hooks other containers' processes; a namespace share has no capability substitute</td></tr>
+    <tr><td class="k">hostNetwork</td><td><code>ebpf.networkFlows.enabled</code></td><td>The socket filter captures L4 flows in the host network namespace</td></tr>
+    <tr><td class="k">/sys/fs/bpf</td><td>Always</td><td>BPF filesystem for OBI's maps and programs</td></tr>
+    <tr><td class="k">/sys/fs/cgroup, read-only</td><td>Resource metrics on</td><td>cgroup v2 and PSI files</td></tr>
+    <tr><td class="k">/var/log, read-only</td><td>Logs-based metrics on</td><td>Container log files</td></tr>
+  </table></div>
+</section>
+
+<!-- 08 -->
+<section id="s8">
+  <div class="sechead"><span class="ord">08</span><h2>Topology and drift</h2></div>
+  <p>With <code>--topology-enabled</code>, the RED collector builds a <code>topology_snapshot</code> from OBI's client-side metrics and, when enabled, L4 flows. Counts accumulate across RED ticks and flush every 600 s as one full snapshot, so a lost frame heals on the next flush. The snapshot keeps the top 500 edges by calls and the first 200 nodes, and is skipped when every scrape in the tick failed.</p>
+    <figure class="figscroll">
+    <svg viewBox="0 18 880 352" role="img" aria-label="Sample topology snapshot drawn as a graph: eleven workloads, three external hosts, and one observed edge from checkout to cache that is not in the declared graph.">
+      <line class="ge" x1="160" y1="180" x2="350" y2="125"/>
+      <line class="ge" x1="160" y1="180" x2="330" y2="265"/>
+      <line class="ge" x1="160" y1="180" x2="215" y2="70"/>
+      <line class="ge" x1="160" y1="180" x2="140" y2="300"/>
+      <line class="ge" x1="160" y1="180" x2="60" y2="110"/>
+      <line class="ge" x1="140" y1="300" x2="215" y2="70"/>
+      <line class="ge" x1="350" y1="125" x2="520" y2="70"/>
+      <line class="ge" x1="350" y1="125" x2="480" y2="198"/>
+      <line class="ge" x1="350" y1="125" x2="660" y2="135"/>
+      <line class="ge" x1="350" y1="125" x2="690" y2="212"/>
+      <line class="ge" x1="350" y1="125" x2="330" y2="265"/>
+      <line class="ge" x1="330" y1="265" x2="520" y2="265"/>
+      <line class="gx" x1="520" y1="70" x2="700" y2="45"/>
+      <line class="gx" x1="690" y1="212" x2="800" y2="280"/>
+      <line class="ge" x1="480" y1="198" x2="660" y2="135"/>
+      <line class="gx" x1="480" y1="198" x2="420" y2="335"/>
+      <line class="gd" x1="350" y1="125" x2="520" y2="265"/>
+      <circle class="gn" cx="160" cy="180" r="15"/><text class="gl" x="160" y="158">frontend</text>
+      <circle class="gn" cx="350" cy="125" r="14"/><text class="gl" x="350" y="104">checkout</text>
+      <circle class="gn" cx="330" cy="265" r="12"/><text class="gl" x="330" y="246">cart</text>
+      <circle class="gn" cx="520" cy="70" r="12"/><text class="gl" x="520" y="51">payment</text>
+      <circle class="gn" cx="520" cy="265" r="11"/><text class="gl" x="520" y="294">cache</text>
+      <circle class="gn" cx="215" cy="70" r="11"/><text class="gl" x="215" y="52">catalog</text>
+      <circle class="gn" cx="140" cy="300" r="10"/><text class="gl" x="140" y="283">recommendation</text>
+      <circle class="gn" cx="480" cy="198" r="11"/><text class="gl" x="480" y="180">shipping</text>
+      <circle class="gn" cx="660" cy="135" r="10"/><text class="gl" x="660" y="118">currency</text>
+      <circle class="gn" cx="690" cy="212" r="10"/><text class="gl" x="690" y="195">email</text>
+      <circle class="gn" cx="60" cy="110" r="9"/><text class="gl" x="60" y="94">ad</text>
+      <circle class="gxn" cx="700" cy="45" r="7"/><text class="gl gm" x="700" y="31">pay.example.com:443</text>
+      <circle class="gxn" cx="800" cy="280" r="7"/><text class="gl gm" x="800" y="266">smtp.example.com:587</text>
+      <circle class="gxn" cx="420" cy="335" r="7"/><text class="gl gm" x="420" y="321">10.4.0.12:5432</text>
+      <text class="ma" x="420" y="215" text-anchor="end">not declared</text>
+      <circle class="gn" cx="690" cy="330" r="7"/><text class="tl" x="704" y="334">workload</text>
+      <circle class="gxn" cx="690" cy="352" r="5"/><text class="tl" x="704" y="356">external host</text>
+      <line class="gd" x1="770" y1="330" x2="796" y2="330"/><text class="tl" x="804" y="334">drift</text>
+    </svg>
+    <figcaption>Figure 6. A sample <code>topology_snapshot</code> drawn as a graph. Nodes are workloads, never pods, sized by traffic. Each edge is one caller, callee and protocol, carrying the call count for the window, or bytes for an L4 flow. A destination outside scope is sent as an external host. The core flags an observed edge that the declared graph lacks, here checkout to cache, as drift.</figcaption>
+  </figure>
+  <p>The agent has no drift comparator. The core compares the snapshot with the declared service graph. A snapshot request does not resend topology; the next flush carries it.</p>
+</section>
+
+<!-- 09 -->
+<section id="s9">
+  <div class="sechead"><span class="ord">09</span><h2>Connectors</h2></div>
+  <p>Each connector is its own Go module, deployed apart from the agent, that turns a provider's signals into events for the core events API.</p>
+  <div class="tablewrap"><table>
+    <tr><th>Connector</th><th>Runs as</th><th>Input</th><th>Auth to core</th><th>Delivery</th></tr>
+    <tr><td class="k">gcpevents</td><td>Cloud Run function</td><td>Billing cost anomalies and Monitoring alerts via Pub/Sub push; Service Health polled every 15 min</td><td>Bearer from Secret Manager, <code>X-Tenant</code></td><td>3 attempts, 4xx dropped</td></tr>
+    <tr><td class="k">promevents</td><td>Deployment, port 8080</td><td>Alertmanager webhook <code>POST /alertmanager</code></td><td>Projected SA token (audience <code>triage-core</code>, 1 h) or static token, <code>X-Tenant</code> per alert</td><td>15 s timeout, 3 attempts, 4xx except 408 and 429 dropped, duplicates suppressed 2 min</td></tr>
+  </table></div>
+  <p><code>promevents</code> runs non-root with a read-only root filesystem and all capabilities dropped; its Role in the core namespace grants verb <code>ingest</code> on named tenants only.</p>
+</section>
+
+<!-- 10 -->
+<section id="s10">
+  <div class="sechead"><span class="ord">10</span><h2>Configuration</h2></div>
+  <h3>Requirements</h3>
+  <div class="tablewrap"><table>
+    <tr><th>Item</th><th>Requirement</th></tr>
+    <tr><td class="k">Kernel</td><td>5.8 or later, 4.18 on RHEL-based distros; OBI refuses to start below that. The unprivileged default is documented for 5.11 and later; 5.8 to 5.10 need <code>SYS_RESOURCE</code></td></tr>
+    <tr><td class="k">BTF</td><td>Kernel built with <code>CONFIG_DEBUG_INFO_BTF</code>; OBI refuses to start without it</td></tr>
+    <tr><td class="k">cgroup</td><td>cgroup v2, for resource metrics</td></tr>
+    <tr><td class="k">Linux host</td><td>systemd 240 or later (D-Bus for unit discovery, <code>journalctl</code> for logs), cgroup v2, and the kernel and BTF above. Root, with the six capabilities the unit file grants</td></tr>
+    <tr><td class="k">Controller resources</td><td>Requests 50m CPU, 64Mi memory; limits 200m CPU, 512Mi memory</td></tr>
+    <tr><td class="k">DaemonSet resources</td><td>Requests 50m CPU, 128Mi memory; limits 300m CPU, 700Mi memory. Memory grows with the number of instrumented pods; CPU peaks near 130m during the attach burst after a restart</td></tr>
+  </table></div>
+  <h3>Flags and values</h3>
+  <div class="tablewrap"><table>
+    <tr><th>Flag or value</th><th>Default</th><th>Meaning</th></tr>
+    <tr><td class="k">--triage-endpoint / core.host, core.endpoint</td><td>empty</td><td>Core WebSocket URL. The chart builds <code>wss://&lt;core-host&gt;/events/ws</code> from <code>core.host</code>; <code>core.endpoint</code> is a full-URL override. Empty runs without a core</td></tr>
+    <tr><td class="k">--cluster-name / core.clusterName</td><td>empty; host mode the host name</td><td>Cluster identifier; required with an endpoint. For a key install, the name the core minted</td></tr>
+    <tr><td class="k">--join-ca-fingerprint / core.caFingerprint</td><td>empty</td><td>Core agent CA fingerprint; required with an endpoint</td></tr>
+    <tr><td class="k">--join-tenant / core.tenants</td><td>--target-tenant</td><td>Tenants the join asks for, repeatable; for an OTLP-only agent with one entry, also its tenant</td></tr>
+    <tr><td class="k">core.agentKey</td><td>empty</td><td>One-time agent key, written to the join Secret; on a host, <code>enroll.key</code> in the join state directory</td></tr>
+    <tr><td class="k">--join-secret, --join-state-dir / core.storage, core.existingClaim</td><td>Secret (chart); <code>/data/join</code></td><td>Where the key, certificate and core CA are kept</td></tr>
+    <tr><td class="k">--core-heartbeat / core.heartbeatSeconds</td><td>20</td><td>Heartbeat interval in seconds</td></tr>
+    <tr><td class="k">--core-insecure-skip-verify / core.insecureSkipVerify</td><td>false</td><td>Skip TLS verification of a <code>wss://</code> endpoint; dev only</td></tr>
+    <tr><td class="k">--kubernetes / kubernetes.watch</td><td>true</td><td><code>false</code> runs on OTLP and sensor data alone, with no informers and no cluster-wide rights; needs one tenant (see section 02)</td></tr>
+    <tr><td class="k">--target-tenant</td><td>empty</td><td>Primary tenant; empty selects cluster mode. Required in host mode</td></tr>
+    <tr><td class="k">--target-namespaces</td><td>empty</td><td>Static scope list beside annotated namespaces</td></tr>
+    <tr><td class="k">--workload-resources</td><td>Deploy, STS, DS, Rollout</td><td>Workload kinds watched</td></tr>
+    <tr><td class="k">--virtual-apps</td><td>on</td><td>Synthesize virtual apps</td></tr>
+    <tr><td class="k">--sensor-listen</td><td>empty</td><td>Sensor stream address; empty disables it and its collectors</td></tr>
+    <tr><td class="k">otlp.enabled</td><td>false</td><td>OTLP/gRPC receiver on 4317; turns on the sensor stream without the DaemonSet</td></tr>
+    <tr><td class="k">otlp.clientCASecret</td><td>empty</td><td>Secret with <code>ca.crt</code> for mutual TLS</td></tr>
+    <tr><td class="k">otlp.sensor.enabled</td><td>false</td><td>Runs the OTLP receiver and its transformers as <code>--mode=otlp</code> pods; senders dial <code>&lt;fullname&gt;-otlp</code>. Enabling it reissues the serving certificate once</td></tr>
+    <tr><td class="k">otlp.sensor.replicas / tick</td><td>2 / 10s</td><td>Pods of the role, and how often each sends its changed sources to the controller</td></tr>
+    <tr><td class="k">otlp.insecure.enabled / allowFrom</td><td>false / empty</td><td>Plain gRPC for in-cluster Collectors; <code>allowFrom</code> lists the namespaces the NetworkPolicy admits and is required</td></tr>
+    <tr><td class="k">otlp.limits.*</td><td>2000 / 5000 / 500 / 4 MiB</td><td><code>maxResources</code>, <code>maxPointsPerResource</code>, <code>maxResourcesPerSender</code>, <code>maxRequestBytes</code></td></tr>
+    <tr><td class="k">otlp.allowedServiceAccounts</td><td>empty</td><td><code>namespace/name</code> or <code>namespace/*</code> allowed to send with a token</td></tr>
+    <tr><td class="k">--sensor-tick</td><td>15s</td><td>Sensor send interval</td></tr>
+    <tr><td class="k">--log-metrics-enabled</td><td>false</td><td>Log collector; needs push</td></tr>
+    <tr><td class="k">--log-metrics-interval-seconds</td><td>60</td><td>Window</td></tr>
+    <tr><td class="k">--log-metrics-error-threshold</td><td>10</td><td>Error or warn delta that qualifies a window</td></tr>
+    <tr><td class="k">--log-baseline</td><td>true</td><td>Median gate: ×3, ≥ 5 windows</td></tr>
+    <tr><td class="k">--log-exporter-sample-max-len</td><td>160</td><td>Bytes kept for fingerprint and sample</td></tr>
+    <tr><td class="k">--log-exporter-max-samples-per-service</td><td>8</td><td>Distinct fingerprints per service</td></tr>
+    <tr><td class="k">--topology-enabled</td><td>false</td><td>Topology snapshots</td></tr>
+    <tr><td class="k">--topology-interval-seconds</td><td>600</td><td>Snapshot flush</td></tr>
+    <tr><td class="k">--core-allow-plaintext / core.allowPlaintext</td><td>false</td><td>Allow <code>ws://</code> beyond localhost and .svc</td></tr>
+    <tr><td class="k">--metrics-addr</td><td>0</td><td>Self-metrics listener; 0 disables</td></tr>
+    <tr><td class="k">--ui-listen / ui.listen</td><td>empty</td><td>Local TUI on a loopback address; works without a core (standalone)</td></tr>
+    <tr><td class="k">--ui-max-events / ui.maxEvents</td><td>100</td><td>Newest events per tenant the TUI and API keep, 10 to 5000; older ones are dropped, the counters keep counting</td></tr>
+    <tr><td class="k">--ui-admin-key-file / ui.adminKey.existingSecret</td><td>empty</td><td>Admin key for the TUI login, read from a mounted Secret; empty means no login</td></tr>
+    <tr><td class="k">--ui-admin-key, TRIAGE_AGENT_UI_ADMIN_KEY</td><td>empty</td><td>Host mode only: the key as a flag or environment variable</td></tr>
+    <tr><td class="k">--api-listen / api.listen</td><td>empty</td><td>Monitoring API address; needs <code>--api-tokens-file</code> or <code>--api-sa-auth</code>; works without a core (standalone)</td></tr>
+    <tr><td class="k">--api-tokens-file / api.tokens.existingSecret</td><td>empty</td><td>API tokens, one <code>name tenant token</code> per line; optional with <code>--api-sa-auth</code></td></tr>
+    <tr><td class="k">--api-sa-auth / api.serviceAccountAuth</td><td>false</td><td>Cluster mode: also accept ServiceAccount tokens (audience <code>triage-agent-api</code>) decided by RBAC</td></tr>
+    <tr><td class="k">--api-mcp / api.mcp</td><td>false</td><td>Serve the MCP endpoint <code>POST /mcp</code> (read-only tools)</td></tr>
+    <tr><td class="k">--api-docs / api.docs</td><td>false</td><td>Serve the OpenAPI spec and the Swagger page</td></tr>
+    <tr><td class="k">--api-tls-cert-file, --api-tls-key-file / api.tls.existingSecret</td><td>empty</td><td>Serve the API over TLS; empty serves plain HTTP</td></tr>
+    <tr><td class="k">ebpf.privileged</td><td>false</td><td>Fully privileged fallback for older kernels</td></tr>
+    <tr><td class="k">ebpf.networkFlows.enabled</td><td>false</td><td>L4 flows; DaemonSet on <code>hostNetwork</code></td></tr>
+    <tr><td class="k">replicaCount</td><td>1; production runs 3</td><td>Controller replicas; above 1 turns on leader election, replica gossip and a PodDisruptionBudget</td></tr>
+  </table></div>
+</section>
+
+<!-- 11 -->
+<section id="s11">
+  <div class="sechead"><span class="ord">11</span><h2>Local TUI and API</h2></div>
+  <p>Two optional listeners let people and tools read what the agent sees. Both are off by default and read the same state, with a core or standalone: a <code>push.Observer</code> receives a read-only copy of every frame the pusher queues, per resolved tenant, so what they show is what the core is sent (ADR-0019, ADR-0020).</p>
+  <h3>TUI</h3>
+  <p><code>--ui-listen</code> serves the core's TUI, embedded in the binary, with two panels: <b>app</b> (virtual apps with traffic, the dependency graph and a treemap) and <b>sensors</b> (sources on the left, the events they raise on the right, and above them what the collectors did with the selected source's data, see <i>Signal path</i> below). <code>T</code> or <code>N</code> picks the tenant (one is always selected), <code>?</code> shows the flags in effect and the agent's statistics, <code>s</code> cycles app state, <code>/</code> filters. The address must be loopback and requests must carry a loopback <code>Host</code>; the way in is <code>kubectl port-forward</code> or an SSH tunnel. Only GET is served, apart from login and logout.</p>
+  <div class="tablewrap"><table>
+    <tr><th>Item</th><th>Behaviour</th></tr>
+    <tr><td class="k">Login</td><td>With an admin key (at least 16 bytes) every <code>/api/</code> call needs a session; the static files stay public so the login page loads. In a cluster the key is a file mounted from a Secret and read on each use, so editing the Secret rotates it. In host mode it may also come from <code>--ui-admin-key</code> or <code>TRIAGE_AGENT_UI_ADMIN_KEY</code>. Without a key there is no login and the loopback bind is the only guard</td></tr>
+    <tr><td class="k">Session</td><td>Cookie, <code>HttpOnly</code>, <code>SameSite=Strict</code>, 12 h, signed with a key derived from the admin key: every replica accepts it and rotating the key ends all sessions. Login and logout refuse a foreign <code>Origin</code>; failed logins back off from 1 s to a minute, even for the right key</td></tr>
+    <tr><td class="k">Replicas</td><td>Only the leader's pusher and collectors run. The leader publishes its state (the store snapshot, newest 300 events, apps, link state) to its peers every 5 s as a <code>ui</code> mesh frame, and followers serve it, so every replica shows the same view, up to 5 s behind. Event ids continue from the leader's across a failover</td></tr>
+    <tr><td class="k">Events</td><td>The newest <code>--ui-max-events</code> events are kept <b>per tenant</b>, so a tenant that raises many (one latency window a minute) cannot push a quiet tenant's out. The snapshot gossiped to followers is bounded over all tenants</td></tr>
+    <tr><td class="k">Tenants</td><td>Every service, edge, workload and event carries the tenant its frame was routed to; <code>?tenant=</code> on any endpoint filters. A callee in another tenant shows as <code>other tenant</code> without its name. Node-wide sensors appear in every tenant's view. The picker is a view filter, not isolation</td></tr>
+  </table></div>
+  <h3>Monitoring API</h3>
+  <p><code>--api-listen</code> serves Prometheus <code>/metrics</code>, a discovery document <code>/.well-known/triage-agent</code> and the read-only JSON API (<code>/api/v1/status, tenants, apps, services, graph, sources, events, stream</code>) for Prometheus, Grafana and other tools. It binds any address, serves TLS when a certificate is given and plain HTTP otherwise, and <b>never runs unauthenticated</b>: it refuses to start without a credential source, <code>--api-tokens-file</code> or, in cluster mode, <code>--api-sa-auth</code>. Two further parts are <b>off by default</b>: an MCP endpoint (<code>--api-mcp</code>) and an OpenAPI description with a Swagger page (<code>--api-docs</code>).</p>
+  <div class="tablewrap"><table>
+    <tr><th>Item</th><th>Behaviour</th></tr>
+    <tr><td class="k">Tokens</td><td>A Secret file of <code>name tenant token</code> lines, tokens at least 24 bytes, sent as <code>Authorization: Bearer</code>. Compared by hash against every entry in constant time; reloaded when the file changes, and a broken reload keeps the loaded tokens. Tenant <code>*</code> is unrestricted</td></tr>
+    <tr><td class="k">ServiceAccount auth</td><td>In cluster mode <code>--api-sa-auth</code> (chart <code>api.serviceAccountAuth</code>) also accepts a ServiceAccount token of audience <code>triage-agent-api</code> (<code>kubectl create token &lt;sa&gt; --audience triage-agent-api</code>). The agent runs a TokenReview, then a SubjectAccessReview for <code>get</code> on <code>agent-api.triageagent.dev</code>. A ClusterRoleBinding of the chart's <code>-api-reader</code> role is unrestricted; a RoleBinding in a namespace binds the caller to that namespace's <code>triageagent.dev/tenant</code>, and a namespace without the annotation is refused. A token that is not a JWT of a plausible size is refused without a review; reviews run one per token at a time and eight at once; accepted outcomes are cached up to 60 s (never past the token's expiry), refused ones 30 s, in a separate cache. The token file stays for callers outside the cluster and for host mode, where the flag is refused. Serve <code>api.tls</code> with it</td></tr>
+    <tr><td class="k">MCP</td><td><code>POST /mcp</code> speaks the Model Context Protocol over streamable HTTP (JSON-RPC 2.0, protocol 2025-06-18, one JSON answer per call, no sessions, no batches). Seven read-only tools mirror the JSON API: <code>agent_status</code>, <code>list_tenants</code>, <code>list_apps</code>, <code>list_services</code>, <code>get_graph</code>, <code>list_sources</code>, <code>get_events</code>. Same bearer tokens and tenant scope; a tenant-bound caller's <code>tenant</code> argument is overridden by its own. A request whose <code>Origin</code> host differs from <code>Host</code> is refused; the body is limited to 64 KiB and one answer to 2 MiB. The only POST the API accepts</td></tr>
+    <tr><td class="k">OpenAPI and Swagger</td><td><code>/api/v1/openapi.json</code> describes the paths (the MCP path only when it is on), <code>/api/v1/docs</code> serves a Swagger UI page and <code>/api/v1/docs.js</code> its init script. They are static and need no token, so a browser can load them; the calls the page makes need one (Authorize). Served with a CSP, <code>X-Frame-Options: DENY</code>, and the two swagger-ui files from cdnjs pinned by SRI hash, so the browser needs internet access</td></tr>
+    <tr><td class="k">Tenant scope</td><td>A token tied to a tenant can read that tenant only, enforced by the agent: the <code>tenant</code> query is forced to it, a request for another tenant is 403, the tenant list shows only it, and the token sees neither the node-wide sensors nor the core address and cluster-wide frame counts</td></tr>
+    <tr><td class="k">Metrics</td><td>Per service <code>triage_agent_service_{requests_per_second, error_ratio, latency_p99_seconds, cpu_pressure_ratio, memory_pressure_ratio, io_pressure_ratio, oom_kills_window, log_error_lines_window, log_warn_lines_window}</code>; <code>triage_agent_app_ready</code>; <code>triage_agent_edge_{calls,bytes}_per_second</code>; <code>triage_agent_source_up</code>; <code>triage_agent_events_total</code>; for an unrestricted token the link (<code>core_link_connected</code>, <code>frames_sent_total</code>, dropped) and sensor nodes. Labels stop at tenant, namespace and service. Values are the last window's, not samples. <code>triage_agent_signal_path_total{role,source,outcome}</code> (unrestricted tokens only) counts what each collector did with each source's data</td></tr>
+    <tr><td class="k">Signal path</td><td>Every collector (RED, USE, logs) and the OTLP receiver counts, per sensor node or OTLP source: <code>ticks</code> (reads), <code>no_snapshot</code>, <code>points</code>, <code>services</code>, <code>filtered</code> (outside the namespace scope) and <code>unattributed</code> (no workload). Per role (source <code>*</code>): services read, <code>gated</code> (read but below every gate), <code>capped</code> (cut by a frame's size cap) and <code>sent</code> (handed to the push sender). They appear in the sources API as <code>ledger</code> and <code>roleLedger</code> and under the selected source in the TUI, so an empty event list can be told from data that was read and held back. The units follow each collector (a service in the logs and RED roles, a pod in USE), the counters restart from zero on a leader change, and a restricted token sees none of them</td></tr>
+    <tr><td class="k">Leader only</td><td>Only the leader exports signal series; a follower answers <code>/metrics</code> with <code>triage_agent_info</code> alone, so Prometheus sees each series once however many replicas it scrapes. The JSON API is served by every replica from the gossiped view. A leader change leaves a gap of seconds and restarts the <code>events_total</code> counters</td></tr>
+    <tr><td class="k">Chart</td><td>Service <code>&lt;fullname&gt;-api</code>; <code>api.tls.existingSecret</code> for TLS; <code>api.mcp</code> and <code>api.docs</code> (both false) and <code>api.serviceAccountAuth</code>; an optional ServiceMonitor that reads the scrape token from its own Secret. The chart refuses <code>api.listen</code> without tokens or <code>api.serviceAccountAuth</code></td></tr>
+  </table></div>
+</section>
+
+<!-- 12 -->
+<section id="s12">
+  <div class="sechead"><span class="ord">12</span><h2>OBI note</h2></div>
+  <p><code>third_party/obi</code> is an owned fork of OBI v0.12.2 with 11 local commits, including eBPF C changes, and is not tracked upstream; Apache-2.0 attribution stays in <code>NOTICE</code>. Its Go offsets table, used for binaries without debug info, covers Go up to 1.26.4 and grpc-go up to 1.81.1. Refresh it with OBI's tracker when new Go or grpc-go releases land, and keep scanning its <code>go.mod</code> for CVEs.</p>
+</section>
+
+<!-- 13 -->
+<section id="s13">
+  <div class="sechead"><span class="ord">13</span><h2>FAQ</h2></div>
+
+  <details class="faq"><summary>What is the difference between the eBPF and OTLP modes?</summary>
+  <p>Both feed the same collectors, gates and frames; they differ in where the numbers come from. In eBPF mode the DaemonSet reads them on each node: OBI hooks see every HTTP and gRPC call without code changes, cgroup files give USE and PSI, container log files give LOG, and a socket filter adds L4 flows. In OTLP mode the triage DaemonSet does not run; an OpenTelemetry Collector pushes metrics to the controller on port 4317. RED and L7 edges come from semantic-convention histograms or span metrics, LOG from the count connector, and USE with PSI from each node's kubelet, which reads the cgroup pressure files itself and serves them on <code>/metrics/cadvisor</code>. The Collector still has to reach every node: as a DaemonSet each pod scrapes its own node's kubelet, or one Deployment discovers the nodes through the Kubernetes API and scrapes them all. The two can run side by side; where both report the same service or pod, the sensor's numbers are used. With the OTLP sensor role the Collector sends raw traces, logs and metrics and the agent makes the histograms and counts itself (section 03).</p>
+  <div class="tablewrap"><table>
+    <tr><th></th><th>eBPF</th><th>OTLP</th></tr>
+    <tr><td class="k">On each node</td><td>Triage DaemonSet with <code>hostPID</code>, root, six capabilities, reading <code>/sys/fs/cgroup</code></td><td>The kubelet's own <code>/metrics/cadvisor</code>, scraped by the Collector (a DaemonSet, or one Deployment for all nodes) with <code>get</code> on <code>nodes/metrics</code></td></tr>
+    <tr><td class="k">Coverage</td><td>Every process on the node, any language</td><td>Only what is traced or scraped</td></tr>
+    <tr><td class="k">Service graph</td><td>L7 calls and L4 flows</td><td>L7 edges from client spans that name the server; no L4</td></tr>
+    <tr><td class="k">Needs</td><td>Kernel 5.8+, BTF, cgroup v2</td><td>A Collector with <code>k8sattributes</code> and an OTLP exporter, plus a kubelet cAdvisor scrape for USE; with the controller's own listener it also needs spanmetrics and the count connector. Kubernetes 1.34+ for PSI</td></tr>
+    <tr><td class="k">Sandboxed runtimes</td><td>Mostly invisible</td><td>Seen if instrumented</td></tr>
+  </table></div>
+  <p>Measured side by side on one cluster, OTLP alone matched eBPF for USE and for RED on traced services, and kept about a tenth of the graph's edges once L4 flows were gone.</p>
+  </details>
+
+  <details class="faq"><summary>Can the agent run outside a cluster in OTLP-only mode?</summary>
+  <p>Yes, as long as it can reach a Kubernetes API. The controller loads a kubeconfig when it is not in a pod, so it runs on a laptop or a VM against any cluster it can reach. Set <code>POD_NAMESPACE</code> to the namespace that holds its Secrets, turn leader election off for a single copy, and give the kubeconfig identity the agent's RBAC, including <code>create</code> on TokenReviews when senders use tokens. Senders must reach that machine on 4317 and verify it by name, so add that name to the serving certificate with <code>--sensor-extra-names</code>; a Collector next to it is the simple setup, and every point still needs <code>k8s.namespace.name</code> to land in a tenant. A host with no Kubernetes API at all runs the Linux host mode (see the last question).</p>
+  </details>
+
+  <details class="faq"><summary>What sensitive information leaves the cluster?</summary>
+  <p>Only the frames in section 04, over the one outbound WebSocket connection to the core. They carry:</p>
+  <ul>
+    <li>names: cluster, namespace, workload, service, and pod names in USE and events;</li>
+    <li>aggregates per window: request, error and log counts, p99 latency, CPU, memory and PSI percentages;</li>
+    <li>operation names: HTTP route templates, RPC methods and the status codes seen;</li>
+    <li>topology edges between workloads, and the host name of a destination outside scope;</li>
+    <li>the message of Kubernetes Warning events;</li>
+    <li>one log line per service, redacted for secrets and email addresses and cut to 160 bytes (section 05);</li>
+    <li>sensor health and the OTLP source list; a tenant sees only its own OTLP sources, and role error text only reaches the all-tenant view.</li>
+  </ul>
+  <p>Request and response bodies, headers, raw logs, traces, environment variables and Secrets never leave. Namespaces without a tenant and objects opted out with <code>triageagent.dev/triage: "false"</code> are not sent at all.</p>
+  </details>
+
+  <details class="faq"><summary>Why are connectors needed?</summary>
+  <p>The agent sees what runs in the cluster. Some failures start outside it: a cost anomaly or a Service Health incident in the cloud provider, an alert from an existing Prometheus rule, a security finding. Connectors bring those into the same tenants and issues as events, so a cloud outage and the errors it causes in a service are correlated in one place. Each connector is a small separate deployment that posts to the core events API with its own credentials (section 09), so the agent itself needs no cloud permissions.</p>
+  </details>
+
+  <details class="faq"><summary>How can a Linux host be instrumented?</summary>
+  <p>With <code>--mode=host</code>, the agent runs as one systemd service on a VM or bare-metal host, with no Kubernetes API. The host is a cluster of one: <code>--cluster-name</code> (default the host name) names it, <code>--target-tenant</code> sets the tenant since a host has no namespaces (figure 2), and every selected systemd unit is a virtual app in one synthetic namespace (<code>--host-namespace</code>, default <code>host</code>). USE comes from each unit's cgroup, LOG from journald and log files, and RED from OBI in a build with the <code>obi</code> tag, which the release binaries are. The agent joins like a cluster, by its join certificate only: with a one-time key from the core, <code>install.sh</code> does it in one command and the core issues the certificate at once; without a key, the agent prints a fingerprint and an admin runs <code>triagectl agent approve</code>. The key and certificate stay in <code>/var/lib/triage-agent/join</code>. The release carries the binaries, the unit file with the same six capabilities as the DaemonSet and a deb and rpm package; the README has the steps. Host containers (Docker, Podman) are not covered yet. Alerts from a host's existing Prometheus still arrive through <code>promevents</code>.</p>
+  </details>
+</section>
+
+</main>
+</div>
+<script>
+(function () {
+  var links = document.querySelectorAll('.sidebar a');
+  var map = {};
+  links.forEach(function (a) { map[a.getAttribute('href').slice(1)] = a; });
+  var io = new IntersectionObserver(function (entries) {
+    entries.forEach(function (e) {
+      if (e.isIntersecting) {
+        links.forEach(function (a) { a.classList.remove('on'); });
+        var a = map[e.target.id]; if (a) a.classList.add('on');
+      }
+    });
+  }, { rootMargin: '-20% 0px -70% 0px' });
+  document.querySelectorAll('main section[id]').forEach(function (s) { io.observe(s); });
+})();
+</script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-json.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-protobuf.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-yaml.min.js"></script>
+<script>try { Prism.highlightAll(); } catch (e) {}</script>
+</body>
+</html>

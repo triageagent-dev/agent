@@ -1,0 +1,48 @@
+{
+  "anomalyName": "billingAccounts/0X0X0X-0X0X0X-0X0X0X/anomalies/9c2ea1f4-2c4e-4c1a-9c8d-2f0a1b3c4d5e",
+  "billingAccountName": "billingAccounts/0X0X0X-0X0X0X-0X0X0X",
+  "resourceName": "projects/example-data-prod",
+  "resourceDisplayName": "Example Data Prod",
+  "detectionDate": "2026-07-24",
+  "scope": "SCOPE_PROJECT",
+  "expectedSpendAmount": {
+    "currencyCode": "USD",
+    "units": "310",
+    "nanos": 0
+  },
+  "actualSpendAmount": {
+    "currencyCode": "USD",
+    "units": "1240",
+    "nanos": 500000000
+  },
+  "deviationAmount": {
+    "currencyCode": "USD",
+    "units": "930",
+    "nanos": 500000000
+  },
+  "deviationPercentage": 300.16,
+  "rootCauses": [
+    {
+      "resource": "services/24E6-581D-38E5",
+      "displayName": "BigQuery",
+      "causeType": "CAUSE_TYPE_SERVICE",
+      "deviationAmount": {
+        "currencyCode": "USD",
+        "units": "930",
+        "nanos": 500000000
+      },
+      "subCauses": [
+        {
+          "resource": "skus/2E27-4F75-95CD",
+          "displayName": "Analysis",
+          "causeType": "CAUSE_TYPE_SKU",
+          "deviationAmount": {
+            "currencyCode": "USD",
+            "units": "902",
+            "nanos": 0
+          }
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,384 @@
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package otelcfg
+
+import (
+	"context"
+	"os"
+	"sync"
+	"testing"
+
+	"github.com/caarlos0/env/v11"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"go.opentelemetry.io/collector/consumer"
+	"go.opentelemetry.io/collector/pdata/ptrace"
+
+	"go.opentelemetry.io/obi/pkg/export/instrumentations"
+)
+
+func TestHTTPTracesEndpoint(t *testing.T) {
+	defer RestoreEnvAfterExecution()()
+	tcfg := TracesConfig{
+		CommonEndpoint:   "https://localhost:3131",
+		TracesEndpoint:   "https://localhost:3232/v1/traces",
+		Instrumentations: []instrumentations.Instrumentation{instrumentations.InstrumentationALL},
+	}
+
+	t.Run("testing with two endpoints", func(t *testing.T) {
+		testHTTPTracesOptions(t, OTLPOptions{Scheme: "https", Endpoint: "localhost:3232", URLPath: "/v1/traces", Headers: map[string]string{}}, &tcfg)
+	})
+
+	tcfg = TracesConfig{
+		CommonEndpoint:   "https://localhost:3131/otlp",
+		Instrumentations: []instrumentations.Instrumentation{instrumentations.InstrumentationALL},
+	}
+
+	t.Run("testing with only common endpoint", func(t *testing.T) {
+		testHTTPTracesOptions(t, OTLPOptions{Scheme: "https", Endpoint: "localhost:3131", BaseURLPath: "/otlp", URLPath: "/otlp/v1/traces", Headers: map[string]string{}}, &tcfg)
+	})
+
+	tcfg = TracesConfig{
+		CommonEndpoint:   "https://localhost:3131",
+		TracesEndpoint:   "http://localhost:3232",
+		Instrumentations: []instrumentations.Instrumentation{instrumentations.InstrumentationALL},
+	}
+	t.Run("testing with insecure endpoint", func(t *testing.T) {
+		testHTTPTracesOptions(t, OTLPOptions{Scheme: "http", Endpoint: "localhost:3232", Insecure: true, Headers: map[string]string{}}, &tcfg)
+	})
+
+	tcfg = TracesConfig{
+		CommonEndpoint:     "https://localhost:3232",
+		InsecureSkipVerify: true,
+		Instrumentations:   []instrumentations.Instrumentation{instrumentations.InstrumentationALL},
+	}
+
+	t.Run("testing with skip TLS verification", func(t *testing.T) {
+		testHTTPTracesOptions(t, OTLPOptions{Scheme: "https", Endpoint: "localhost:3232", URLPath: "/v1/traces", SkipTLSVerify: true, Headers: map[string]string{}}, &tcfg)
+	})
+}
+
+func testHTTPTracesOptions(t *testing.T, expected OTLPOptions, tcfg *TracesConfig) {
+	defer RestoreEnvAfterExecution()()
+	opts, err := HTTPTracesEndpointOptions(tcfg)
+	require.NoError(t, err)
+	assert.Equal(t, expected, opts)
+}
+
+func TestMissingSchemeInHTTPTracesEndpoint(t *testing.T) {
+	defer RestoreEnvAfterExecution()()
+	opts, err := HTTPTracesEndpointOptions(&TracesConfig{CommonEndpoint: "http://foo:3030", Instrumentations: []instrumentations.Instrumentation{instrumentations.InstrumentationALL}})
+	require.NoError(t, err)
+	require.NotEmpty(t, opts)
+
+	_, err = HTTPTracesEndpointOptions(&TracesConfig{CommonEndpoint: "foo:3030", Instrumentations: []instrumentations.Instrumentation{instrumentations.InstrumentationALL}})
+	require.Error(t, err)
+
+	_, err = HTTPTracesEndpointOptions(&TracesConfig{CommonEndpoint: "foo", Instrumentations: []instrumentations.Instrumentation{instrumentations.InstrumentationALL}})
+	require.Error(t, err)
+}
+
+func TestHTTPTracesEndpointHeaders(t *testing.T) {
+	type testCase struct {
+		Description     string
+		Env             map[string]string
+		ExpectedHeaders map[string]string
+	}
+	for _, tc := range []testCase{
+		{
+			Description:     "No headers",
+			ExpectedHeaders: map[string]string{},
+		},
+		{
+			Description:     "defining common OTLP_HEADERS",
+			Env:             map[string]string{"OTEL_EXPORTER_OTLP_HEADERS": "Foo=Bar ==,Authorization=Base 2222=="},
+			ExpectedHeaders: map[string]string{"Foo": "Bar ==", "Authorization": "Base 2222=="},
+		},
+		{
+			Description:     "defining common OTLP_TRACES_HEADERS",
+			Env:             map[string]string{"OTEL_EXPORTER_OTLP_TRACES_HEADERS": "Foo=Bar ==,Authorization=Base 1234=="},
+			ExpectedHeaders: map[string]string{"Foo": "Bar ==", "Authorization": "Base 1234=="},
+		},
+		{
+			Description: "OTLP_TRACES_HEADERS takes precedence over OTLP_HEADERS",
+			Env: map[string]string{
+				"OTEL_EXPORTER_OTLP_HEADERS":        "Foo=Bar ==,Authorization=Base 3210==",
+				"OTEL_EXPORTER_OTLP_TRACES_HEADERS": "Authorization=Base 1111==",
+			},
+			ExpectedHeaders: map[string]string{"Foo": "Bar ==", "Authorization": "Base 1111=="},
+		},
+	} {
+		// mutex to avoid running testcases in parallel so we don't mess up with env vars
+		mt := sync.Mutex{}
+		t.Run(tc.Description, func(t *testing.T) {
+			mt.Lock()
+			restore := RestoreEnvAfterExecution()
+			defer func() {
+				restore()
+				mt.Unlock()
+			}()
+			for k, v := range tc.Env {
+				t.Setenv(k, v)
+			}
+
+			opts, err := HTTPTracesEndpointOptions(&TracesConfig{
+				TracesEndpoint:   "https://localhost:1234/v1/traces",
+				Instrumentations: []instrumentations.Instrumentation{instrumentations.InstrumentationALL},
+			})
+			require.NoError(t, err)
+			assert.Equal(t, tc.ExpectedHeaders, opts.Headers)
+		})
+	}
+}
+
+func TestGRPCTracesEndpointOptions(t *testing.T) {
+	defer RestoreEnvAfterExecution()()
+	t.Run("do not accept URLs without a scheme", func(t *testing.T) {
+		_, err := GRPCTracesEndpointOptions(&TracesConfig{CommonEndpoint: "foo:3939", Instrumentations: []instrumentations.Instrumentation{instrumentations.InstrumentationALL}})
+		require.Error(t, err)
+	})
+	tcfg := TracesConfig{
+		CommonEndpoint:   "https://localhost:3131",
+		TracesEndpoint:   "https://localhost:3232",
+		Instrumentations: []instrumentations.Instrumentation{instrumentations.InstrumentationALL},
+	}
+
+	t.Run("testing with two endpoints", func(t *testing.T) {
+		testTracesGRPCOptions(t, OTLPOptions{Endpoint: "localhost:3232", Headers: map[string]string{}}, &tcfg)
+	})
+
+	tcfg = TracesConfig{
+		CommonEndpoint:   "https://localhost:3131",
+		Instrumentations: []instrumentations.Instrumentation{instrumentations.InstrumentationALL},
+	}
+
+	t.Run("testing with only common endpoint", func(t *testing.T) {
+		testTracesGRPCOptions(t, OTLPOptions{Endpoint: "localhost:3131", Headers: map[string]string{}}, &tcfg)
+	})
+
+	tcfg = TracesConfig{
+		CommonEndpoint:   "https://localhost:3131",
+		TracesEndpoint:   "http://localhost:3232",
+		Instrumentations: []instrumentations.Instrumentation{instrumentations.InstrumentationALL},
+	}
+	t.Run("testing with insecure endpoint", func(t *testing.T) {
+		testTracesGRPCOptions(t, OTLPOptions{Endpoint: "localhost:3232", Insecure: true, Headers: map[string]string{}}, &tcfg)
+	})
+
+	tcfg = TracesConfig{
+		CommonEndpoint:     "https://localhost:3232",
+		InsecureSkipVerify: true,
+		Instrumentations:   []instrumentations.Instrumentation{instrumentations.InstrumentationALL},
+	}
+
+	t.Run("testing with skip TLS verification", func(t *testing.T) {
+		testTracesGRPCOptions(t, OTLPOptions{Endpoint: "localhost:3232", SkipTLSVerify: true, Headers: map[string]string{}}, &tcfg)
+	})
+}
+
+func TestGRPCTracesEndpointHeaders(t *testing.T) {
+	type testCase struct {
+		Description     string
+		Env             map[string]string
+		ExpectedHeaders map[string]string
+	}
+	for _, tc := range []testCase{
+		{
+			Description:     "No headers",
+			ExpectedHeaders: map[string]string{},
+		},
+		{
+			Description:     "defining common OTLP_HEADERS",
+			Env:             map[string]string{"OTEL_EXPORTER_OTLP_HEADERS": "Foo=Bar ==,Authorization=Base 2222=="},
+			ExpectedHeaders: map[string]string{"Foo": "Bar ==", "Authorization": "Base 2222=="},
+		},
+		{
+			Description:     "defining common OTLP_TRACES_HEADERS",
+			Env:             map[string]string{"OTEL_EXPORTER_OTLP_TRACES_HEADERS": "Foo=Bar ==,Authorization=Base 1234=="},
+			ExpectedHeaders: map[string]string{"Foo": "Bar ==", "Authorization": "Base 1234=="},
+		},
+		{
+			Description: "OTLP_TRACES_HEADERS takes precedence over OTLP_HEADERS",
+			Env: map[string]string{
+				"OTEL_EXPORTER_OTLP_HEADERS":        "Foo=Bar ==,Authorization=Base 3210==",
+				"OTEL_EXPORTER_OTLP_TRACES_HEADERS": "Authorization=Base 1111==",
+			},
+			ExpectedHeaders: map[string]string{"Foo": "Bar ==", "Authorization": "Base 1111=="},
+		},
+	} {
+		// mutex to avoid running testcases in parallel so we don't mess up with env vars
+		mt := sync.Mutex{}
+		t.Run(tc.Description, func(t *testing.T) {
+			mt.Lock()
+			restore := RestoreEnvAfterExecution()
+			defer func() {
+				restore()
+				mt.Unlock()
+			}()
+			for k, v := range tc.Env {
+				t.Setenv(k, v)
+			}
+
+			opts, err := GRPCTracesEndpointOptions(&TracesConfig{
+				TracesEndpoint:   "https://localhost:1234/v1/traces",
+				Instrumentations: []instrumentations.Instrumentation{instrumentations.InstrumentationALL},
+			})
+			require.NoError(t, err)
+			assert.Equal(t, tc.ExpectedHeaders, opts.Headers)
+		})
+	}
+}
+
+func testTracesGRPCOptions(t *testing.T, expected OTLPOptions, tcfg *TracesConfig) {
+	defer RestoreEnvAfterExecution()()
+	opts, err := GRPCTracesEndpointOptions(tcfg)
+	require.NoError(t, err)
+	assert.Equal(t, expected, opts)
+}
+
+func TestTracesSetupHTTP_Protocol(t *testing.T) {
+	testCases := []struct {
+		Endpoint              string
+		ProtoVal              Protocol
+		TraceProtoVal         Protocol
+		ExpectedProtoEnv      string
+		ExpectedTraceProtoEnv string
+	}{
+		{ProtoVal: "", TraceProtoVal: "", ExpectedProtoEnv: "", ExpectedTraceProtoEnv: "http/protobuf"},
+		{ProtoVal: "", TraceProtoVal: "foo", ExpectedProtoEnv: "", ExpectedTraceProtoEnv: "foo"},
+		{ProtoVal: "bar", TraceProtoVal: "", ExpectedProtoEnv: "bar", ExpectedTraceProtoEnv: ""},
+		{ProtoVal: "bar", TraceProtoVal: "foo", ExpectedProtoEnv: "", ExpectedTraceProtoEnv: "foo"},
+		{Endpoint: "http://foo:4317", ProtoVal: "", TraceProtoVal: "", ExpectedProtoEnv: "", ExpectedTraceProtoEnv: "grpc"},
+		{Endpoint: "http://foo:4317", ProtoVal: "", TraceProtoVal: "foo", ExpectedProtoEnv: "", ExpectedTraceProtoEnv: "foo"},
+		{Endpoint: "http://foo:4317", ProtoVal: "bar", TraceProtoVal: "", ExpectedProtoEnv: "bar", ExpectedTraceProtoEnv: ""},
+		{Endpoint: "http://foo:4317", ProtoVal: "bar", TraceProtoVal: "foo", ExpectedProtoEnv: "", ExpectedTraceProtoEnv: "foo"},
+		{Endpoint: "http://foo:14317", ProtoVal: "", TraceProtoVal: "", ExpectedProtoEnv: "", ExpectedTraceProtoEnv: "grpc"},
+		{Endpoint: "http://foo:14317", ProtoVal: "", TraceProtoVal: "foo", ExpectedProtoEnv: "", ExpectedTraceProtoEnv: "foo"},
+		{Endpoint: "http://foo:14317", ProtoVal: "bar", TraceProtoVal: "", ExpectedProtoEnv: "bar", ExpectedTraceProtoEnv: ""},
+		{Endpoint: "http://foo:14317", ProtoVal: "bar", TraceProtoVal: "foo", ExpectedProtoEnv: "", ExpectedTraceProtoEnv: "foo"},
+		{Endpoint: "http://foo:4318", ProtoVal: "", TraceProtoVal: "", ExpectedProtoEnv: "", ExpectedTraceProtoEnv: "http/protobuf"},
+		{Endpoint: "http://foo:4318", ProtoVal: "", TraceProtoVal: "foo", ExpectedProtoEnv: "", ExpectedTraceProtoEnv: "foo"},
+		{Endpoint: "http://foo:4318", ProtoVal: "bar", TraceProtoVal: "", ExpectedProtoEnv: "bar", ExpectedTraceProtoEnv: ""},
+		{Endpoint: "http://foo:4318", ProtoVal: "bar", TraceProtoVal: "foo", ExpectedProtoEnv: "", ExpectedTraceProtoEnv: "foo"},
+		{Endpoint: "http://foo:24318", ProtoVal: "", TraceProtoVal: "", ExpectedProtoEnv: "", ExpectedTraceProtoEnv: "http/protobuf"},
+		{Endpoint: "http://foo:24318", ProtoVal: "", TraceProtoVal: "foo", ExpectedProtoEnv: "", ExpectedTraceProtoEnv: "foo"},
+		{Endpoint: "http://foo:24318", ProtoVal: "bar", TraceProtoVal: "", ExpectedProtoEnv: "bar", ExpectedTraceProtoEnv: ""},
+		{Endpoint: "http://foo:24318", ProtoVal: "bar", TraceProtoVal: "foo", ExpectedProtoEnv: "", ExpectedTraceProtoEnv: "foo"},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.Endpoint+"/"+string(tc.ProtoVal)+"/"+string(tc.TraceProtoVal), func(t *testing.T) {
+			defer RestoreEnvAfterExecution()()
+			_, err := HTTPTracesEndpointOptions(&TracesConfig{
+				CommonEndpoint:   "http://host:3333",
+				TracesEndpoint:   tc.Endpoint,
+				Protocol:         tc.ProtoVal,
+				TracesProtocol:   tc.TraceProtoVal,
+				Instrumentations: []instrumentations.Instrumentation{instrumentations.InstrumentationALL},
+			})
+			require.NoError(t, err)
+			assert.Equal(t, tc.ExpectedProtoEnv, os.Getenv(envProtocol))
+			assert.Equal(t, tc.ExpectedTraceProtoEnv, os.Getenv(envTracesProtocol))
+		})
+	}
+}
+
+func TestTracesSetupHTTP_DoNotOverrideEnv(t *testing.T) {
+	defer RestoreEnvAfterExecution()()
+	t.Run("setting both variables", func(t *testing.T) {
+		defer RestoreEnvAfterExecution()()
+		t.Setenv(envProtocol, "foo-proto")
+		t.Setenv(envTracesProtocol, "bar-proto")
+		_, err := HTTPTracesEndpointOptions(&TracesConfig{
+			CommonEndpoint:   "http://host:3333",
+			Protocol:         "foo",
+			TracesProtocol:   "bar",
+			Instrumentations: []instrumentations.Instrumentation{instrumentations.InstrumentationALL},
+		})
+		require.NoError(t, err)
+		assert.Equal(t, "foo-proto", os.Getenv(envProtocol))
+		assert.Equal(t, "bar-proto", os.Getenv(envTracesProtocol))
+	})
+	t.Run("setting only proto env var", func(t *testing.T) {
+		defer RestoreEnvAfterExecution()()
+		t.Setenv(envProtocol, "foo-proto")
+		_, err := HTTPTracesEndpointOptions(&TracesConfig{
+			CommonEndpoint:   "http://host:3333",
+			Protocol:         "foo",
+			Instrumentations: []instrumentations.Instrumentation{instrumentations.InstrumentationALL},
+		})
+		require.NoError(t, err)
+		_, ok := os.LookupEnv(envTracesProtocol)
+		assert.False(t, ok)
+		assert.Equal(t, "foo-proto", os.Getenv(envProtocol))
+	})
+}
+
+func TestTracesConfig_Enabled(t *testing.T) {
+	tracesConsumer, err := consumer.NewTraces(func(context.Context, ptrace.Traces) error { return nil })
+	require.NoError(t, err)
+
+	providerCalls := 0
+	assert.True(t, (&TracesConfig{CommonEndpoint: "foo"}).Enabled())
+	assert.True(t, (&TracesConfig{TracesEndpoint: "foo"}).Enabled())
+	assert.True(t, (&TracesConfig{
+		OTLPEndpointProvider: func() (string, bool) {
+			providerCalls++
+			return "https://collector:4318", false
+		},
+	}).Enabled())
+	assert.Equal(t, 1, providerCalls)
+	assert.True(t, (&TracesConfig{TracesConsumer: tracesConsumer}).Enabled())
+	assert.True(t, (&TracesConfig{Protocol: ProtocolDebug}).Enabled())
+}
+
+func TestTracesConfig_Disabled(t *testing.T) {
+	assert.False(t, (&TracesConfig{}).Enabled())
+	assert.False(t, (&TracesConfig{
+		OTLPEndpointProvider: func() (string, bool) { return "", false },
+	}).Enabled())
+}
+
+func TestNormalizeQueueConfig(t *testing.T) {
+	t.Run("BatchMaxSize set, QueueSize defaults to 4x", func(t *testing.T) {
+		cfg := &TracesConfig{BatchMaxSize: 50}
+		require.NoError(t, cfg.NormalizeQueueConfig())
+		assert.Equal(t, 50, cfg.BatchMaxSize)
+		assert.Equal(t, 200, cfg.QueueSize)
+	})
+
+	t.Run("explicit QueueSize is respected", func(t *testing.T) {
+		cfg := &TracesConfig{BatchMaxSize: 10, QueueSize: 500}
+		require.NoError(t, cfg.NormalizeQueueConfig())
+		assert.Equal(t, 500, cfg.QueueSize)
+	})
+
+	t.Run("error when QueueSize < 2*BatchMaxSize", func(t *testing.T) {
+		cfg := &TracesConfig{BatchMaxSize: 100, QueueSize: 10}
+		err := cfg.NormalizeQueueConfig()
+		require.Error(t, err)
+	})
+
+	t.Run("zero values produce no error and no defaults", func(t *testing.T) {
+		cfg := &TracesConfig{}
+		require.NoError(t, cfg.NormalizeQueueConfig())
+		assert.Equal(t, 0, cfg.BatchMaxSize)
+		assert.Equal(t, 0, cfg.QueueSize)
+	})
+}
+
+func TestNormalizeQueueConfig_EnvVar(t *testing.T) {
+	defer RestoreEnvAfterExecution()()
+	t.Setenv("OTEL_EBPF_OTLP_TRACES_BATCH_MAX_SIZE", "75")
+	t.Setenv("OTEL_EBPF_OTLP_TRACES_QUEUE_SIZE", "600")
+
+	var cfg TracesConfig
+	require.NoError(t, env.Parse(&cfg))
+	assert.Equal(t, 75, cfg.BatchMaxSize)
+	assert.Equal(t, 600, cfg.QueueSize)
+
+	require.NoError(t, cfg.NormalizeQueueConfig())
+	assert.Equal(t, 75, cfg.BatchMaxSize)
+	assert.Equal(t, 600, cfg.QueueSize)
+}

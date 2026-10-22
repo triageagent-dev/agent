@@ -1,0 +1,33 @@
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
+
+#pragma once
+
+// These need to line up with some Go identifiers:
+// EventTypeHTTP, EventTypeGRPC, EventTypeHTTPClient, EventTypeGRPCClient, EventTypeSQLClient, EventTypeKHTTPRequest
+#define EVENT_HTTP_REQUEST 1
+#define EVENT_GRPC_REQUEST 2
+#define EVENT_HTTP_CLIENT 3
+#define EVENT_GRPC_CLIENT 4
+#define EVENT_SQL_CLIENT 5
+#define EVENT_K_HTTP_REQUEST 6
+#define EVENT_K_HTTP2_REQUEST 7
+#define EVENT_TCP_REQUEST 8
+#define EVENT_GO_KAFKA 9
+#define EVENT_GO_REDIS 10
+#define EVENT_GO_KAFKA_SEG 11 // the segment-io version (kafka-go) has different format
+#define EVENT_TCP_LARGE_BUFFER 12
+#define EVENT_GO_SPAN 13
+#define EVENT_GO_MONGO 14
+#define EVENT_FAILED_CONNECT 15
+#define EVENT_DNS_REQUEST 16
+#define EVENT_GO_RUNTIME_METRICS 17
+#define EVENT_GO_CHANNEL_LINK 18
+#define EVENT_JVM_MEM_POOL_GC 19
+#define EVENT_GO_AUTO_SPAN 20
+#define EVENT_GO_RUNTIME_HISTOGRAM 21
+#define EVENT_GO_AUTO_ACTIVATED 22
+#define EVENT_NODEJS_EVENTLOOP 23
+#define EVENT_NODE_SPAN 24
+#define EVENT_K_HTTP2_REQUEST_HEADERS 25
+#define EVENT_K_HTTP2_RESPONSE_HEADERS 26

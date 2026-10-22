@@ -1,0 +1,125 @@
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
+
+#pragma once
+
+#include <bpfcore/vmlinux.h>
+#include <bpfcore/bpf_core_read.h>
+#include <bpfcore/bpf_helpers.h>
+
+#include <shared/obi_ctx.h>
+
+enum {
+    // include/linux/tty_driver.h
+    k_tty_driver_type_pty = 0x0004,
+    k_tty_driver_subtype_pty_master = 0x0001,
+
+    // include/uapi/asm-generic/termbits.h
+    k_echo = 0x00008,
+
+    // log handling
+    k_log_event_max_size = 1 << 15,    // 32K
+    k_log_event_max_log_len = 1 << 13, // 8K
+
+    // iovec
+    k_iov_max_segs = 8,
+    k_iov_seg_max_len = 1 << 13, // 8K
+
+    // terminal file
+    k_pts_file_path_len_max = 64,
+    k_pts_file_path_len_max_mask = k_pts_file_path_len_max - 1,
+};
+
+static const char k_newline = '\n';
+
+typedef struct log_event {
+    u64 ino;
+    u32 tgid;
+    u32 len;
+    u32 fd;
+    u32 dev; // kernel dev_t of the pipe's superblock, disambiguates ino across filesystems
+    obi_ctx_info_t ctx;
+    u8 file_path[k_pts_file_path_len_max];
+    u8 log[];
+} log_event_t;
+
+const log_event_t *log_event__unused __attribute__((unused));
+
+// bare inode numbers collide across filesystems (pipefs vs on-disk FIFOs,
+// and get_next_ino() wraps at 32 bits), so pipes are keyed by (ino, dev).
+// dev holds a 32-bit kernel dev_t; u64 keeps the key free of implicit padding
+typedef struct log_pipe_key {
+    u64 ino;
+    u64 dev;
+} log_pipe_key_t;
+
+const log_pipe_key_t *log_pipe_key__unused __attribute__((unused));
+
+enum tty_driver_type___new {
+    TTY_DRIVER_TYPE_SYSTEM,
+    TTY_DRIVER_TYPE_CONSOLE,
+    TTY_DRIVER_TYPE_SERIAL,
+    TTY_DRIVER_TYPE_PTY,
+    TTY_DRIVER_TYPE_SCC,
+    TTY_DRIVER_TYPE_SYSCONS,
+};
+
+enum tty_driver_subtype___new {
+    SYSTEM_TYPE_TTY = 1,
+    SYSTEM_TYPE_CONSOLE,
+    SYSTEM_TYPE_SYSCONS,
+    SYSTEM_TYPE_SYSPTMX,
+
+    PTY_TYPE_MASTER = 1,
+    PTY_TYPE_SLAVE,
+
+    SERIAL_TYPE_NORMAL = 1,
+};
+
+struct tty_termios {
+    u32 c_lflag;
+    // ...unused fields
+};
+
+struct tty_dev {
+    u16 minor;
+    u16 major;
+    struct tty_termios termios;
+};
+
+static __always_inline void tty_dev_fill(struct tty_dev *dev, struct tty_struct *tty) {
+    BPF_CORE_READ_INTO(&dev->major, tty, driver, major);
+    BPF_CORE_READ_INTO(&dev->minor, tty, driver, minor_start);
+    dev->minor += BPF_CORE_READ(tty, index);
+    dev->termios.c_lflag = BPF_CORE_READ(tty, termios.c_lflag);
+}
+
+static __always_inline bool tty_driver_is_pty(struct tty_struct *tty) {
+    int typ;
+    if (bpf_core_enum_value_exists(enum tty_driver_type___new, TTY_DRIVER_TYPE_PTY)) {
+        typ = bpf_core_enum_value(enum tty_driver_type___new, TTY_DRIVER_TYPE_PTY);
+    } else {
+        typ = k_tty_driver_type_pty;
+    }
+
+    if (bpf_core_field_exists(((struct tty_driver *)0)->type)) {
+        return BPF_CORE_READ(tty, driver, type) == typ;
+    }
+
+    return false;
+}
+
+static __always_inline bool tty_driver_is_master(struct tty_struct *tty) {
+    int typ;
+    if (bpf_core_enum_value_exists(enum tty_driver_subtype___new, PTY_TYPE_MASTER)) {
+        typ = bpf_core_enum_value(enum tty_driver_subtype___new, PTY_TYPE_MASTER);
+    } else {
+        typ = k_tty_driver_subtype_pty_master;
+    }
+
+    if (bpf_core_field_exists(((struct tty_driver *)0)->subtype)) {
+        return BPF_CORE_READ(tty, driver, subtype) == typ;
+    }
+
+    return false;
+}

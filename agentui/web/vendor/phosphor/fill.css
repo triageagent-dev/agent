@@ -1,0 +1,441 @@
+@font-face {
+  font-family: "Phosphor-Fill";
+  src: url("./Phosphor-Fill.woff2") format("woff2");
+  font-weight: normal;
+  font-style: normal;
+  font-display: block;
+}
+
+.ph-fill {
+  /* use !important to prevent issues with browser extensions that change fonts */
+  font-family: "Phosphor-Fill" !important;
+  speak: never;
+  font-style: normal;
+  font-weight: normal;
+  font-variant: normal;
+  text-transform: none;
+  line-height: 1;
+
+  /* Enable Ligatures ================ */
+  letter-spacing: 0;
+  -webkit-font-feature-settings: "liga";
+  -moz-font-feature-settings: "liga=1";
+  -moz-font-feature-settings: "liga";
+  -ms-font-feature-settings: "liga" 1;
+  font-feature-settings: "liga";
+  -webkit-font-variant-ligatures: discretionary-ligatures;
+  font-variant-ligatures: discretionary-ligatures;
+
+  /* Better Font Rendering =========== */
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+.ph-fill.ph-alarm:before {
+  content: "\e006";
+}
+.ph-fill.ph-anchor:before {
+  content: "\e514";
+}
+.ph-fill.ph-angle:before {
+  content: "\e7bc";
+}
+.ph-fill.ph-arrow-clockwise:before {
+  content: "\e036";
+}
+.ph-fill.ph-arrow-left:before {
+  content: "\e058";
+}
+.ph-fill.ph-arrows-clockwise:before {
+  content: "\e094";
+}
+.ph-fill.ph-at:before {
+  content: "\e0ac";
+}
+.ph-fill.ph-bell-ringing:before {
+  content: "\e5e8";
+}
+.ph-fill.ph-boot:before {
+  content: "\ecca";
+}
+.ph-fill.ph-brackets-curly:before {
+  content: "\e860";
+}
+.ph-fill.ph-browser:before {
+  content: "\e0f4";
+}
+.ph-fill.ph-browsers:before {
+  content: "\e0f6";
+}
+.ph-fill.ph-buildings:before {
+  content: "\e102";
+}
+.ph-fill.ph-calendar:before {
+  content: "\e108";
+}
+.ph-fill.ph-cards:before {
+  content: "\e0f8";
+}
+.ph-fill.ph-caret-right:before {
+  content: "\e13a";
+}
+.ph-fill.ph-certificate:before {
+  content: "\e766";
+}
+.ph-fill.ph-chart-bar:before {
+  content: "\e150";
+}
+.ph-fill.ph-chart-line-up:before {
+  content: "\e156";
+}
+.ph-fill.ph-check:before {
+  content: "\e182";
+}
+.ph-fill.ph-check-circle:before {
+  content: "\e184";
+}
+.ph-fill.ph-checks:before {
+  content: "\e53a";
+}
+.ph-fill.ph-circle:before {
+  content: "\e18a";
+}
+.ph-fill.ph-clipboard:before {
+  content: "\e196";
+}
+.ph-fill.ph-clock:before {
+  content: "\e19a";
+}
+.ph-fill.ph-clock-counter-clockwise:before {
+  content: "\e1a0";
+}
+.ph-fill.ph-cloud:before {
+  content: "\e1aa";
+}
+.ph-fill.ph-code:before {
+  content: "\e1bc";
+}
+.ph-fill.ph-columns:before {
+  content: "\e546";
+}
+.ph-fill.ph-compass:before {
+  content: "\e1c8";
+}
+.ph-fill.ph-control:before {
+  content: "\eca6";
+}
+.ph-fill.ph-cookie:before {
+  content: "\e6ca";
+}
+.ph-fill.ph-copy:before {
+  content: "\e1ca";
+}
+.ph-fill.ph-cpu:before {
+  content: "\e610";
+}
+.ph-fill.ph-crown-simple:before {
+  content: "\e616";
+}
+.ph-fill.ph-currency-dollar:before {
+  content: "\e550";
+}
+.ph-fill.ph-cursor:before {
+  content: "\e1dc";
+}
+.ph-fill.ph-desktop:before {
+  content: "\e560";
+}
+.ph-fill.ph-disc:before {
+  content: "\e564";
+}
+.ph-fill.ph-dot:before {
+  content: "\ecde";
+}
+.ph-fill.ph-dress:before {
+  content: "\ea7e";
+}
+.ph-fill.ph-drop:before {
+  content: "\e210";
+}
+.ph-fill.ph-ear:before {
+  content: "\e70c";
+}
+.ph-fill.ph-empty:before {
+  content: "\edbc";
+}
+.ph-fill.ph-export:before {
+  content: "\eaf0";
+}
+.ph-fill.ph-eye:before {
+  content: "\e220";
+}
+.ph-fill.ph-fan:before {
+  content: "\e9f2";
+}
+.ph-fill.ph-file:before {
+  content: "\e230";
+}
+.ph-fill.ph-file-text:before {
+  content: "\e23a";
+}
+.ph-fill.ph-fingerprint:before {
+  content: "\e23e";
+}
+.ph-fill.ph-flag:before {
+  content: "\e244";
+}
+.ph-fill.ph-function:before {
+  content: "\ebe4";
+}
+.ph-fill.ph-gauge:before {
+  content: "\e628";
+}
+.ph-fill.ph-github-logo:before {
+  content: "\e576";
+}
+.ph-fill.ph-gradient:before {
+  content: "\eb42";
+}
+.ph-fill.ph-graph:before {
+  content: "\eb58";
+}
+.ph-fill.ph-hammer:before {
+  content: "\e80e";
+}
+.ph-fill.ph-hand:before {
+  content: "\e298";
+}
+.ph-fill.ph-hash:before {
+  content: "\e2a2";
+}
+.ph-fill.ph-heartbeat:before {
+  content: "\e2ac";
+}
+.ph-fill.ph-image:before {
+  content: "\e2ca";
+}
+.ph-fill.ph-info:before {
+  content: "\e2ce";
+}
+.ph-fill.ph-key:before {
+  content: "\e2d6";
+}
+.ph-fill.ph-keyboard:before {
+  content: "\e2d8";
+}
+.ph-fill.ph-layout:before {
+  content: "\e6d6";
+}
+.ph-fill.ph-leaf:before {
+  content: "\e2da";
+}
+.ph-fill.ph-lightbulb:before {
+  content: "\e2dc";
+}
+.ph-fill.ph-link:before {
+  content: "\e2e2";
+}
+.ph-fill.ph-list:before {
+  content: "\e2f0";
+}
+.ph-fill.ph-lock:before {
+  content: "\e2fa";
+}
+.ph-fill.ph-log:before {
+  content: "\ed82";
+}
+.ph-fill.ph-magic-wand:before {
+  content: "\e6b6";
+}
+.ph-fill.ph-magnifying-glass:before {
+  content: "\e30c";
+}
+.ph-fill.ph-memory:before {
+  content: "\e9c4";
+}
+.ph-fill.ph-microphone:before {
+  content: "\e326";
+}
+.ph-fill.ph-minus:before {
+  content: "\e32a";
+}
+.ph-fill.ph-network:before {
+  content: "\edde";
+}
+.ph-fill.ph-note:before {
+  content: "\e348";
+}
+.ph-fill.ph-notification:before {
+  content: "\e6fa";
+}
+.ph-fill.ph-orange:before {
+  content: "\ee40";
+}
+.ph-fill.ph-palette:before {
+  content: "\e6c8";
+}
+.ph-fill.ph-park:before {
+  content: "\ecb2";
+}
+.ph-fill.ph-path:before {
+  content: "\e39c";
+}
+.ph-fill.ph-pen:before {
+  content: "\e3aa";
+}
+.ph-fill.ph-percent:before {
+  content: "\e3b6";
+}
+.ph-fill.ph-phone:before {
+  content: "\e3b8";
+}
+.ph-fill.ph-pi:before {
+  content: "\ec80";
+}
+.ph-fill.ph-pill:before {
+  content: "\e700";
+}
+.ph-fill.ph-pipe:before {
+  content: "\ed86";
+}
+.ph-fill.ph-placeholder:before {
+  content: "\e650";
+}
+.ph-fill.ph-play:before {
+  content: "\e3d0";
+}
+.ph-fill.ph-plus:before {
+  content: "\e3d4";
+}
+.ph-fill.ph-pulse:before {
+  content: "\e000";
+}
+.ph-fill.ph-activity:before {
+  content: "\e000";
+}
+.ph-fill.ph-question:before {
+  content: "\e3e8";
+}
+.ph-fill.ph-queue:before {
+  content: "\e6ac";
+}
+.ph-fill.ph-radio:before {
+  content: "\e77e";
+}
+.ph-fill.ph-ranking:before {
+  content: "\ed62";
+}
+.ph-fill.ph-record:before {
+  content: "\e3ee";
+}
+.ph-fill.ph-repeat:before {
+  content: "\e3f6";
+}
+.ph-fill.ph-resize:before {
+  content: "\ed6e";
+}
+.ph-fill.ph-rocket-launch:before {
+  content: "\e3fe";
+}
+.ph-fill.ph-rows:before {
+  content: "\e5a2";
+}
+.ph-fill.ph-scroll:before {
+  content: "\eb7a";
+}
+.ph-fill.ph-selection:before {
+  content: "\e69a";
+}
+.ph-fill.ph-shapes:before {
+  content: "\ec5e";
+}
+.ph-fill.ph-share:before {
+  content: "\e406";
+}
+.ph-fill.ph-shield-check:before {
+  content: "\e40c";
+}
+.ph-fill.ph-sign-in:before {
+  content: "\e428";
+}
+.ph-fill.ph-sign-out:before {
+  content: "\e42a";
+}
+.ph-fill.ph-sock:before {
+  content: "\ecce";
+}
+.ph-fill.ph-squares-four:before {
+  content: "\e464";
+}
+.ph-fill.ph-stack:before {
+  content: "\e466";
+}
+.ph-fill.ph-star:before {
+  content: "\e46a";
+}
+.ph-fill.ph-steps:before {
+  content: "\ecbe";
+}
+.ph-fill.ph-stop:before {
+  content: "\e46c";
+}
+.ph-fill.ph-swap:before {
+  content: "\e83c";
+}
+.ph-fill.ph-table:before {
+  content: "\e476";
+}
+.ph-fill.ph-tabs:before {
+  content: "\e778";
+}
+.ph-fill.ph-tag:before {
+  content: "\e478";
+}
+.ph-fill.ph-target:before {
+  content: "\e47c";
+}
+.ph-fill.ph-terminal:before {
+  content: "\e47e";
+}
+.ph-fill.ph-terminal-window:before {
+  content: "\eae8";
+}
+.ph-fill.ph-text-indent:before {
+  content: "\ea1e";
+}
+.ph-fill.ph-timer:before {
+  content: "\e492";
+}
+.ph-fill.ph-translate:before {
+  content: "\e4a2";
+}
+.ph-fill.ph-tree:before {
+  content: "\e6da";
+}
+.ph-fill.ph-union:before {
+  content: "\edbe";
+}
+.ph-fill.ph-user:before {
+  content: "\e4c2";
+}
+.ph-fill.ph-users:before {
+  content: "\e4d6";
+}
+.ph-fill.ph-video:before {
+  content: "\e740";
+}
+.ph-fill.ph-warning:before {
+  content: "\e4e0";
+}
+.ph-fill.ph-warning-circle:before {
+  content: "\e4e2";
+}
+.ph-fill.ph-watch:before {
+  content: "\e4e6";
+}
+.ph-fill.ph-waveform:before {
+  content: "\e802";
+}
+.ph-fill.ph-x:before {
+  content: "\e4f6";
+}

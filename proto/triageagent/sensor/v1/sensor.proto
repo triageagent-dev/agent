@@ -1,0 +1,98 @@
+// Copyright 2026 Denys Vasyliev.
+// SPDX-License-Identifier: Apache-2.0
+
+// Sensor stream (docs/adr/0015-sensor-stream-grpc.md): each sensor pod of the
+// eBPF DaemonSet holds one stream to the controller for its lifetime.
+syntax = "proto3";
+
+package triageagent.sensor.v1;
+
+import "google/protobuf/timestamp.proto";
+import "opentelemetry/proto/metrics/v1/metrics.proto";
+
+option go_package = "github.com/triageagent-dev/agent/sensorstream/sensorpb;sensorpb";
+
+service SensorService {
+  // The sensor sends Hello first, then Snapshot and SensorState messages
+  // every tick. The controller acks each SensorState.
+  rpc Stream(stream StreamRequest) returns (stream StreamResponse);
+}
+
+message StreamRequest {
+  // Increases by one per message on a stream; a gap is a lost message.
+  uint64 seq = 1;
+  google.protobuf.Timestamp time = 2;
+  oneof body {
+    Hello hello = 10;
+    Snapshot snapshot = 11;
+    SensorState state = 12;
+  }
+}
+
+message Hello {
+  string node = 1;
+  string pod = 2;
+  string version = 3;
+  repeated string roles = 4;
+  // What this sensor process is configured to do: its flags, secrets left
+  // out. The controller shows them next to its own so an operator sees what
+  // each part runs. An older sensor sends none.
+  repeated Setting settings = 5;
+}
+
+// One flag of the sensor process.
+message Setting {
+  string name = 1;
+  string value = 2;
+  string default = 3;
+  // True when value differs from default.
+  bool changed = 4;
+}
+
+// One role's metrics at this tick, in OTLP with cumulative temporality.
+message Snapshot {
+  string role = 1;
+  repeated opentelemetry.proto.metrics.v1.ResourceMetrics resource_metrics = 2;
+  // Set by the otlp role (ADR-0022): the key of the OTLP source whose metrics
+  // these are, so the controller files them as that source (Hub.Ingest)
+  // rather than as this sensor's own role metrics. Empty for every other role.
+  string source = 3;
+}
+
+// The sensor's own health, sent every tick.
+message SensorState {
+  repeated RoleState roles = 1;
+  uint32 goroutines = 2;
+  uint64 heap_bytes = 3;
+  uint64 sys_bytes = 4;
+  double cpu_seconds = 5;
+  uint64 reconnects = 6;
+  uint64 send_errors = 7;
+  // Time to send the previous tick's messages.
+  int64 send_micros = 8;
+  // Round trip of the previous SensorState to its Ack.
+  int64 ack_rtt_micros = 9;
+  // Encoded size of the previous tick's messages.
+  uint64 tick_bytes = 10;
+  // Time from the stream opening until the first Ack on this stream.
+  int64 connect_micros = 11;
+}
+
+message RoleState {
+  string role = 1;
+  int64 gather_micros = 2;
+  uint32 metrics = 3;
+  uint32 data_points = 4;
+  uint64 gather_errors = 5;
+  string last_error = 6;
+}
+
+message StreamResponse {
+  oneof body {
+    Ack ack = 1;
+  }
+}
+
+message Ack {
+  uint64 seq = 1;
+}

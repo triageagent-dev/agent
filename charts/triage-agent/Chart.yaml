@@ -1,0 +1,46 @@
+apiVersion: v2
+name: triage-agent
+description: |
+  The Triage Agent cluster agent. Observes workloads in a cluster, groups them
+  into applications from workload labels and triageagent.dev/* annotations,
+  and streams their state plus Kubernetes Warning events, log metrics and eBPF
+  RED/USE metrics to the triage core over an outbound WebSocket, for clusters
+  with no inbound API access.
+  REQUIRES an agent build carrying the corrected flag defaults (--red-metrics-
+  service-name=triage-ebpf, --log-metrics-service-name=triage-log,
+  --log-metrics-port=9466).
+  The eBPF DaemonSet's agent container runs the SAME agent binary and the
+  SAME image as the Deployment (image.repository:image.tag), with --mode
+  repeated per role (ebpf, node-exporter, log-exporter). The image is always
+  built with -tags obi, so --mode ebpf works without any separate image to
+  name.
+  ebpf.networkFlows.enabled turns on a SECOND topology-edge source (L4
+  network flows, obi_network_flow_bytes_total) alongside the existing L7 RED
+  scrape. Requires ebpf.enabled=true (the chart fails the render otherwise)
+  and an agent build carrying docs/todo/service-graph-from-obi.md.
+  Off by default; enabling it sets hostNetwork: true + dnsPolicy:
+  ClusterFirstWithHostNet on the eBPF DaemonSet pod (socket_filter captures
+  from the host network namespace). See values.yaml's ebpf.networkFlows
+  comment for what that implies for every other container/port on that same
+  pod.
+  ebpf.excludeOtelInstrumentedServices (default false) covers a process that
+  already ships its own OTel SDK too, instead of leaving it with no RED
+  metrics and only a target_info entry (OBI's own default,
+  discovery.exclude_otel_instrumented_services=true). This chart's metrics
+  endpoint is scraped only by the agent itself, so covering that process here
+  does not duplicate anything in the customer's own telemetry backend.
+type: application
+version: 3.2.96
+appVersion: "3.2.96-fd2a2d0"
+keywords:
+  - triage
+  - agent
+  - controller
+  - push
+  - ebpf
+home: https://github.com/triageagent-dev/agent
+sources:
+  - https://github.com/triageagent-dev/agent
+  - https://github.com/triageagent-dev/agent
+maintainers:
+  - name: Denys Vasyliev

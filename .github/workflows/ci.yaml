@@ -1,0 +1,402 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+    tags: ["v*"]
+  pull_request:
+    branches: ["main"]
+
+# Least privilege by default; each job below grants only what it needs.
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - run: make obi-verify
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # third_party/obi is a vendored, checked-in copy of OBI's source; its
+      # bpf2go-generated Go bindings (*_bpfel.{go,o}, gitignored per
+      # third_party/obi/.gitignore) are not committed, so this checkout
+      # starts without them. `go vet ./...` below reaches them even without
+      # `-tags obi`: cmd/triage-agent's untagged ebpf_config_test.go and
+      # ebpf_metrics_test.go import go.opentelemetry.io/obi/pkg/obi and
+      # .../pkg/export/connector, which transitively need pkg/ebpf/common —
+      # without generation this fails with "undefined: BpfTcpLargeBufferT"
+      # etc. `git rev-parse HEAD:third_party/obi` hashes exactly the
+      # committed (patched) vendor tree — go.mod/go.sum/*.c/*.h included, the
+      # gitignored generated output excluded by construction — so the cache
+      # key changes only when there is actually something new to generate.
+      - name: Hash the vendored OBI tree
+        id: obi-tree
+        run: echo "hash=$(git rev-parse HEAD:third_party/obi)" >> "$GITHUB_OUTPUT"
+
+      # Restores prior codegen output keyed on that hash. On a hit, `make
+      # obi-generate` below is skipped entirely (no Docker pull needed). On a
+      # miss (OBI version bump, or the very first run), `make obi-generate`
+      # both generates AND populates the cache for every run after this one —
+      # third_party/obi's own Makefile also tracks these via *_bpfel.go.d, so
+      # even a same-key rerun without cache would no-op on the second call.
+      - name: Cache OBI eBPF codegen
+        id: obi-cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            third_party/obi/pkg/**/*_bpfel.go
+            third_party/obi/pkg/**/*_bpfel.o
+            third_party/obi/pkg/**/*_bpfel.go.d
+            third_party/obi/pkg/**/*_bpfeb.go
+            third_party/obi/pkg/**/*_bpfeb.o
+            third_party/obi/pkg/**/*_bpfeb.go.d
+          key: obi-codegen-${{ steps.obi-tree.outputs.hash }}
+
+      # Docker-only, and only actually runs on a cache miss — see `make
+      # obi-generate` (Makefile) and hack/build-obi.sh for the same
+      # step run locally. ubuntu-latest ships Docker Engine preinstalled and
+      # running; the generator image (ghcr.io/open-telemetry/obi-generator,
+      # pinned in third_party/obi/Makefile's GEN_IMG) is public — no login,
+      # no secret, needed to pull it.
+      - name: Generate OBI eBPF bindings
+        if: steps.obi-cache.outputs.cache-hit != 'true'
+        run: make obi-generate
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Build
+        run: go build ./...
+
+      # The tests gate a merge: they build a fake Kubernetes client, so they
+      # need no cluster and no downloaded test binaries.
+      - name: Test
+        run: go test -race ./...
+
+      # third_party/obi is its own module (the root's `./...` does not reach
+      # it), and this repo patches its HTTP/2 and gRPC decoding, so that
+      # package's tests run here too. They need the generated bindings above.
+      - name: Test the vendored OBI HTTP/2 decoding
+        working-directory: third_party/obi
+        run: go test -race ./pkg/ebpf/common/ ./pkg/internal/ebpf/bhpack/
+
+  # gcpevents is its own Go module (so `gcloud functions deploy --source ./gcpevents`
+  # builds only the function), which means the root module's `./...` above does not
+  # reach it — it needs its own job or it is never compiled or tested here at all.
+  gcpevents:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: gcpevents
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: gcpevents/go.mod
+          cache: true
+          cache-dependency-path: gcpevents/go.sum
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Build
+        run: go build ./...
+
+      - name: Test
+        run: go test ./...
+
+  # promevents is its own Go module too, with no dependencies (no go.sum, so
+  # nothing for setup-go to cache).
+  promevents:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: promevents
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: promevents/go.mod
+          cache: false
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Build
+        run: go build ./...
+
+      - name: Test
+        run: go test -race ./...
+
+  image:
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request'
+    permissions:
+      contents: read
+      packages: write
+      # keyless cosign signing and build-provenance attestation (OIDC)
+      id-token: write
+      attestations: write
+    steps:
+      # Full history and tags: the image version below counts commits since the
+      # last tag, as the Makefile does.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # .ko.yaml builds with -tags obi, so this job needs the same generated
+      # eBPF bindings as the test job above (same comments apply). The cache
+      # key matches that job's, so this restores what it already generated
+      # instead of pulling the generator image again.
+      - name: Hash the vendored OBI tree
+        id: obi-tree
+        run: echo "hash=$(git rev-parse HEAD:third_party/obi)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache OBI eBPF codegen
+        id: obi-cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            third_party/obi/pkg/**/*_bpfel.go
+            third_party/obi/pkg/**/*_bpfel.o
+            third_party/obi/pkg/**/*_bpfel.go.d
+            third_party/obi/pkg/**/*_bpfeb.go
+            third_party/obi/pkg/**/*_bpfeb.o
+            third_party/obi/pkg/**/*_bpfeb.go.d
+          key: obi-codegen-${{ steps.obi-tree.outputs.hash }}
+
+      - name: Generate OBI eBPF bindings
+        if: steps.obi-cache.outputs.cache-hit != 'true'
+        run: make obi-generate
+
+      - uses: ko-build/setup-ko@d006021bd0c28d1ce33a07e7943d48b079944c8d # v0.9
+
+      - name: Login to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Build and push
+        id: ko
+        env:
+          KO_DOCKER_REPO: ghcr.io/${{ github.repository }}
+        run: |
+          SHA=$(git rev-parse --short HEAD)
+          # Every image carries v<major>.<minor>.<commits since the last tag>-<sha>,
+          # the version `make ko-push` gives it (Makefile VER), next to the bare sha.
+          LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || true)
+          BASE="${LAST_TAG#v}"
+          BASE="${BASE:-2.3.0}"
+          COMMITS=$(git rev-list ${LAST_TAG:+$LAST_TAG..}HEAD --count)
+          VER="v${BASE%.*}.${COMMITS}-${SHA}"
+          TAGS="$SHA,$VER"
+          # .ko.yaml stamps these into the binary via -ldflags, and ko fails the
+          # build outright if any is unset ("template: map has no entry for key
+          # VERSION") — they are required, not optional. An untagged build stamps
+          # its version so the image still identifies itself.
+          export GIT_COMMIT="$SHA"
+          export BUILD_DATE="$(date -u '+%Y-%m-%d')"
+          export VERSION="$VER"
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            export VERSION="${GITHUB_REF_NAME#v}"
+            MAJOR_MINOR="${VERSION%.*}"
+            MAJOR="${MAJOR_MINOR%.*}"
+            TAGS="$TAGS,v$VERSION,$VERSION,$MAJOR_MINOR,$MAJOR"
+          fi
+          if [[ "${{ github.ref_name }}" == "${{ github.event.repository.default_branch }}" ]]; then
+            TAGS="$TAGS,latest"
+          fi
+          ko build \
+            --tags="$TAGS" \
+            --bare \
+            --platform=linux/amd64,linux/arm64 \
+            --image-label org.opencontainers.image.revision=$(git rev-parse HEAD) \
+            --image-label org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }} \
+            ./cmd/triage-agent > "$RUNNER_TEMP/ko-ref.txt"
+          # ko prints the pushed reference, <repo>@sha256:<digest>, on stdout.
+          REF="$(tail -n1 "$RUNNER_TEMP/ko-ref.txt")"
+          echo "digest=${REF##*@}" >> "$GITHUB_OUTPUT"
+          # The image without OBI (hack/ko-otlp/.ko.yaml) for the controller and
+          # the OTLP role: <repo>-otlp, same tags, no eBPF bindings needed.
+          KO_CONFIG_PATH=hack/ko-otlp KO_DOCKER_REPO="${KO_DOCKER_REPO}-otlp" ko build \
+            --tags="$TAGS" \
+            --bare \
+            --platform=linux/amd64,linux/arm64 \
+            --image-label org.opencontainers.image.revision=$(git rev-parse HEAD) \
+            --image-label org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }} \
+            ./cmd/triage-agent > "$RUNNER_TEMP/ko-ref-otlp.txt"
+          REF="$(tail -n1 "$RUNNER_TEMP/ko-ref-otlp.txt")"
+          echo "digest_otlp=${REF##*@}" >> "$GITHUB_OUTPUT"
+
+      # Sign and attest by digest, never by tag: a tag can move.
+      - name: Sign the image
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}
+          DIGEST: ${{ steps.ko.outputs.digest }}
+        run: cosign sign --yes "${IMAGE}@${DIGEST}"
+
+      - name: Sign the image without OBI
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}-otlp
+          DIGEST: ${{ steps.ko.outputs.digest_otlp }}
+        run: cosign sign --yes "${IMAGE}@${DIGEST}"
+
+      - name: Attest image build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ghcr.io/${{ github.repository }}
+          subject-digest: ${{ steps.ko.outputs.digest }}
+          push-to-registry: true
+
+      - name: Attest build provenance of the image without OBI
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ghcr.io/${{ github.repository }}-otlp
+          subject-digest: ${{ steps.ko.outputs.digest_otlp }}
+          push-to-registry: true
+
+      # The Helm chart next to the image, on release tags only: the core's
+      # install command pulls oci://ghcr.io/<owner>/charts/triage-agent by
+      # default. The packaged chart defaults to the image this job just
+      # pushed; the chart in the repo keeps its placeholder.
+      - name: Publish the Helm chart
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}
+          OWNER: ${{ github.repository_owner }}
+          ACTOR: ${{ github.actor }}
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          CHART="$RUNNER_TEMP/chart"
+          cp -R charts/triage-agent "$CHART"
+          sed -i "s#^  repository: .*#  repository: ${IMAGE}#; s#^  tag: \"\".*#  tag: \"${VERSION}\"#" "$CHART/values.yaml"
+          grep -q "^  repository: ${IMAGE}$" "$CHART/values.yaml"
+          grep -q "^  tag: \"${VERSION}\"$" "$CHART/values.yaml"
+          helm package "$CHART" --version "$VERSION" --app-version "$VERSION" -d "$RUNNER_TEMP"
+          echo "$TOKEN" | helm registry login ghcr.io -u "$ACTOR" --password-stdin
+          helm push "$RUNNER_TEMP"/triage-agent-*.tgz "oci://ghcr.io/${OWNER,,}/charts"
+
+  release:
+    needs: [test, image]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+      # keyless cosign signing and build-provenance attestation (OIDC)
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # Every build of ./cmd/triage-agent needs the generated eBPF bindings:
+      # the untagged files (ebpf_config.go, ebpf_metrics.go) import OBI
+      # packages that reference them, not only the -tags obi host build.
+      # Same cache and key as the test and image jobs above.
+      - name: Hash the vendored OBI tree
+        id: obi-tree
+        run: echo "hash=$(git rev-parse HEAD:third_party/obi)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache OBI eBPF codegen
+        id: obi-cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            third_party/obi/pkg/**/*_bpfel.go
+            third_party/obi/pkg/**/*_bpfel.o
+            third_party/obi/pkg/**/*_bpfel.go.d
+            third_party/obi/pkg/**/*_bpfeb.go
+            third_party/obi/pkg/**/*_bpfeb.o
+            third_party/obi/pkg/**/*_bpfeb.go.d
+          key: obi-codegen-${{ steps.obi-tree.outputs.hash }}
+
+      - name: Generate OBI eBPF bindings
+        if: steps.obi-cache.outputs.cache-hit != 'true'
+        run: make obi-generate
+
+      - name: Build release binaries
+        run: |
+          mkdir -p dist
+          VERSION="${GITHUB_REF_NAME}"
+          LDFLAGS="-s -w -X main.version=${VERSION} -X main.gitCommit=$(git rev-parse --short HEAD) -X main.buildDate=$(date -u '+%Y-%m-%d')"
+          for platform in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
+            os="${platform%/*}"; arch="${platform#*/}"
+            out="dist/triage-agent-${os}-${arch}"
+            # Build the PACKAGE (`./cmd/triage-agent`), not `main.go` alone —
+            # naming just main.go compiles only that one file and fails with
+            # "undefined: runEBPF" etc. the moment `go build` reaches
+            # anything the package's other files (modeflag.go,
+            # ebpf_stub.go) define.
+            CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" \
+              go build -ldflags "$LDFLAGS" -o "$out" ./cmd/triage-agent
+          done
+          cd dist && sha256sum triage-agent-* > checksums.txt
+
+      # Writes dist/triage-agent_linux_{amd64,arm64} and
+      # dist/triage-agent_linux_sha256sums.txt. VER is the tag, as above.
+      - name: Build host binaries (-tags obi)
+        run: make host-binaries VER="${GITHUB_REF_NAME}"
+
+      # A failing nfpm or package build fails the release: a release that
+      # silently lacks its deb or rpm is a broken release.
+      - name: Install nfpm
+        run: go install github.com/goreleaser/nfpm/v2/cmd/nfpm@v2.41.3
+
+      - name: Build deb and rpm packages
+        run: |
+          export PATH="$(go env GOPATH)/bin:$PATH"
+          make packages VER="${GITHUB_REF_NAME}"
+          cd dist && sha256sum *.deb *.rpm >> triage-agent_linux_sha256sums.txt
+
+      # The host install script the core's install command points at
+      # (core ADR-090), stamped with this release's version.
+      - name: Stamp install.sh
+        run: sed "s/@VERSION@/${GITHUB_REF_NAME}/" packaging/install.sh > dist/install.sh
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      # Provenance for every release artifact (binaries, packages, sums).
+      - name: Attest release build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/*
+
+      # Keyless signing: one <file>.sigstore.json bundle per artifact, uploaded
+      # with the release. See "Verifying a release" in README.md.
+      - name: Sign release artifacts
+        run: |
+          for f in dist/*; do
+            cosign sign-blob --yes --bundle "${f}.sigstore.json" "$f"
+          done
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+        with:
+          generate_release_notes: true
+          files: dist/*

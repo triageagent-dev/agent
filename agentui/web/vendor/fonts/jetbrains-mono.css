@@ -1,0 +1,5 @@
+/* JetBrains Mono (OFL-1.1, see LICENSE-JetBrainsMono.txt), latin subset,
+   self-hosted from @fontsource/jetbrains-mono 5.1.1. */
+@font-face { font-family: "JetBrains Mono"; font-style: normal; font-weight: 400; font-display: swap; src: url("./jetbrains-mono-latin-400.woff2") format("woff2"); }
+@font-face { font-family: "JetBrains Mono"; font-style: normal; font-weight: 500; font-display: swap; src: url("./jetbrains-mono-latin-500.woff2") format("woff2"); }
+@font-face { font-family: "JetBrains Mono"; font-style: normal; font-weight: 700; font-display: swap; src: url("./jetbrains-mono-latin-700.woff2") format("woff2"); }

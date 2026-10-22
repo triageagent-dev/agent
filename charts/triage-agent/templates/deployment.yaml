@@ -1,0 +1,487 @@
+{{- /* Nil-safe: `helm upgrade --reuse-values` renders with the PREVIOUS release's
+       values only — logExporter is a brand-new top-level key entirely absent from
+       that stored object on such an upgrade, so a bare .Values.logExporter.enabled
+       nil-derefs the render in exactly that case. */}}
+{{- $logExporter := .Values.logExporter | default dict }}
+{{- $core := include "triage-agent.core" . | fromYaml }}
+{{- /* An OTLP-only agent files every frame under one tenant. With no
+       target.tenant it is the one tenant of core.tenants, the tenant a key
+       install names. */}}
+{{- $tenant := .Values.target.tenant }}
+{{- if and (not $tenant) (not (include "triage-agent.kubernetesWatch" .)) (eq (len ($core.tenants | default list)) 1) }}
+{{- $tenant = first $core.tenants }}
+{{- end }}
+{{- $sensorStream := include "triage-agent.sensorStream" . }}
+{{- $otlp := include "triage-agent.otlp" . }}
+{{- $otlpSensor := include "triage-agent.otlpSensor" . }}
+{{- $ui := .Values.ui | default dict }}
+{{- $uiKey := ($ui.adminKey | default dict) }}
+{{- $uiKeySecret := and $ui.listen $uiKey.existingSecret }}
+{{- $api := .Values.api | default dict }}
+{{- $apiTokens := and $api.listen (($api.tokens | default dict).existingSecret) }}
+{{- $apiSA := and $api.listen $api.serviceAccountAuth }}
+{{- $apiOn := or $apiTokens $apiSA }}
+{{- $apiTLS := and $api.listen (($api.tls | default dict).existingSecret) }}
+{{- if and $api.listen (not $apiOn) }}
+{{- fail "api.listen needs api.tokens.existingSecret or api.serviceAccountAuth: the monitoring API has no unauthenticated mode" }}
+{{- end }}
+{{- /* The controller reads the client CA file only when it serves OTLP itself;
+       the otlp sensor pods (ADR-0022) mount it instead. */}}
+{{- $otlpCA := and $otlp (not $otlpSensor) ((.Values.otlp | default dict).clientCASecret) }}
+{{- /* Nil-safe for the same --reuse-values reason as $logExporter above:
+       virtualApps is a bare scalar (not a sub-map), so a missing key renders
+       as an empty string rather than nil-dereffing. Empty is falsy in the
+       checks and the `with $virtualApps` arg render below, so an unset value
+       omits --virtual-apps from the container args entirely and the
+       binary's own flag default applies. */}}
+{{- $virtualApps := .Values.virtualApps }}
+{{- if not (include "triage-agent.kubernetesWatch" .) }}
+{{- if not $core.enabled }}
+{{- fail "kubernetes.watch=false needs core.host: an agent that watches nothing only forwards OTLP and sensor metrics to the core" }}
+{{- end }}
+{{- if not $tenant }}
+{{- fail "kubernetes.watch=false needs one tenant (core.tenants with one entry, or target.tenant): with no namespace annotation to read, every frame files under one tenant" }}
+{{- end }}
+{{- end }}
+{{- if $core.enabled }}
+{{- /* The agent authenticates to the core only by its join certificate. */}}
+{{- $_ := required "core.caFingerprint is required with core.host: the agent joins the core by certificate (the install command the core gives carries it)" $core.caFingerprint }}
+{{- end }}
+{{- if and $virtualApps (ne $virtualApps "off") (not $core.enabled) }}
+{{- fail "virtualApps must be \"off\" unless core.host is set: mode \"on\" pushes synthesized apps over the push WebSocket, and there is nowhere else to send them (docs/todo/virtual-apps.md)" }}
+{{- end }}
+{{- if and $virtualApps (ne $virtualApps "off") (ne $virtualApps "on") }}
+{{- fail (printf "virtualApps must be \"off\" or \"on\", got %q" $virtualApps) }}
+{{- end }}
+{{- $ebpf := .Values.ebpf | default dict }}
+{{- /* The collectors run in this controller and read whatever source the
+       agent has: the DaemonSet's sensor roles or the OTLP receiver. Each is
+       on by default and runs when the core connection and one of its
+       sources are there (triage-agent.collectors). */}}
+{{- $col := include "triage-agent.collectors" . | fromYaml }}
+{{- /* L4 network-flow edges (agent repo's docs/todo/service-graph-from-obi.md)
+       are an OBI/eBPF instrumentation feature (obi.network.flow.bytes):
+       there is no DaemonSet to enable it on without ebpf.enabled=true. */}}
+{{- $networkFlows := $ebpf.networkFlows | default dict }}
+{{- if and $networkFlows.enabled (not $ebpf.enabled) }}
+{{- fail "ebpf.networkFlows.enabled requires ebpf.enabled=true — network flows are an OBI/eBPF instrumentation feature (obi_network_flow_bytes_total); there is no DaemonSet to enable it on otherwise." }}
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  {{- /* -controller suffix (spike/obi-embed): role-named workloads — pods read
+         <fullname>-controller-* next to the DS's <fullname>-ebpf-*. Pod labels
+         are unchanged, so Services/selectors are unaffected; only the object
+         name (and thus pod names) changes. */}}
+  name: {{ include "triage-agent.fullname" . }}-controller
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "triage-agent.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "triage-agent.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "triage-agent.selectorLabels" . | nindent 8 }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "triage-agent.serviceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      terminationGracePeriodSeconds: 10
+      containers:
+        - name: triage-agent
+          image: {{ include "triage-agent.liteImage" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            {{- if .Values.metrics.enabled }}
+            - --metrics-addr={{ .Values.metrics.bindAddress | default "127.0.0.1:8080" }}
+            {{- end }}
+            {{- if .Values.namespace }}
+            - --namespace={{ .Values.namespace }}
+            {{- end }}
+            {{- with .Values.syncPeriod }}
+            - --sync-period={{ . }}
+            {{- end }}
+            {{- range .Values.workloadResources }}
+            - --workload-resources={{ . }}
+            {{- end }}
+            {{- if .Values.logLevel }}
+            - --zap-log-level={{ .Values.logLevel }}
+            {{- end }}
+            {{- if include "triage-agent.leaderElection" . }}
+            - --enable-leader-election
+            - --leader-election-id={{ include "triage-agent.fullname" . }}
+            {{- end }}
+            {{- if $core.enabled }}
+            - --triage-endpoint={{ include "triage-agent.triageEndpoint" . }}
+            - --cluster-name={{ required "core.clusterName is required with core.host" $core.clusterName }}
+            {{- if $tenant }}
+            - --target-tenant={{ $tenant }}
+            {{- end }}
+            {{- range .Values.target.namespaces }}
+            - --target-namespaces={{ . }}
+            {{- end }}
+            {{- with $core.heartbeatSeconds }}
+            - --core-heartbeat={{ . }}
+            {{- end }}
+            {{- if $core.insecureSkipVerify }}
+            - --core-insecure-skip-verify
+            {{- end }}
+            {{- if $core.allowPlaintext }}
+            - --core-allow-plaintext
+            {{- end }}
+            {{- with $core.caFingerprint }}
+            - --join-ca-fingerprint={{ . }}
+            {{- if eq $core.storage "secret" }}
+            - --join-secret={{ include "triage-agent.fullname" $ }}-join
+            {{- else }}
+            - --join-state-dir=/data/join
+            {{- end }}
+            {{- range $core.tenants }}
+            - --join-tenant={{ . }}
+            {{- end }}
+            {{- end }}
+            {{- with $virtualApps }}
+            - --virtual-apps={{ . }}
+            {{- end }}
+            {{- if not (include "triage-agent.kubernetesWatch" .) }}
+            - --kubernetes=false
+            {{- end }}
+            {{- else if or $ui.listen $api.listen }}
+            {{- /* No core: the agent runs standalone, the TUI and monitoring API show this cluster and nothing is sent. */}}
+            {{- with $core.clusterName }}
+            - --cluster-name={{ . }}
+            {{- end }}
+            {{- if $tenant }}
+            - --target-tenant={{ $tenant }}
+            {{- end }}
+            {{- range .Values.target.namespaces }}
+            - --target-namespaces={{ . }}
+            {{- end }}
+            {{- end }}
+            {{- with $ui.listen }}
+            - --ui-listen={{ . }}
+            {{- end }}
+            {{- with $ui.maxEvents }}
+            - --ui-max-events={{ . }}
+            {{- end }}
+            {{- if $uiKeySecret }}
+            - --ui-admin-key-file=/etc/triage-agent-ui/admin-key
+            {{- end }}
+            {{- if $apiOn }}
+            - --api-listen={{ $api.listen }}
+            {{- if $apiTokens }}
+            - --api-tokens-file=/etc/triage-agent-api/tokens
+            {{- end }}
+            {{- if $apiSA }}
+            - --api-sa-auth
+            {{- end }}
+            {{- if $api.mcp }}
+            - --api-mcp
+            {{- end }}
+            {{- if $api.docs }}
+            - --api-docs
+            {{- end }}
+            {{- end }}
+            {{- if $apiTLS }}
+            - --api-tls-cert-file=/etc/triage-agent-api-tls/tls.crt
+            - --api-tls-key-file=/etc/triage-agent-api-tls/tls.key
+            {{- end }}
+            {{- if $sensorStream }}
+            - --sensor-listen=:{{ include "triage-agent.sensorStreamPort" . }}
+            - --sensor-tls-secret={{ include "triage-agent.fullname" . }}-sensor-tls
+            - --sensor-ca-configmap={{ include "triage-agent.fullname" . }}-sensor-ca
+            - --sensor-service={{ include "triage-agent.fullname" . }}-sensors
+            - --sensor-service-account={{ include "triage-agent.fullname" . }}-ebpf
+            - --mesh-listen=:{{ include "triage-agent.meshPort" . }}
+            - --mesh-service={{ include "triage-agent.fullname" . }}-peers
+            {{- end }}
+            {{- if $otlp }}
+            {{- if not (or .Values.otlp.clientCASecret .Values.otlp.ownCA .Values.otlp.allowedServiceAccounts ((.Values.otlp.insecure | default dict).enabled)) }}
+            {{- fail "otlp.enabled needs otlp.ownCA, otlp.clientCASecret, otlp.allowedServiceAccounts or otlp.insecure.enabled" }}
+            {{- end }}
+            {{- if and ((.Values.otlp.insecure | default dict).enabled) (not $otlpSensor) }}
+            {{- fail "otlp.insecure.enabled needs otlp.sensor.enabled: the unauthenticated listener runs only in the role's pods, which the chart fences with a NetworkPolicy" }}
+            {{- end }}
+            {{- if not $otlpSensor }}
+            - --otlp-listen=:{{ include "triage-agent.otlpPort" . }}
+            {{- end }}
+            {{- if .Values.otlp.ownCA }}
+            - --otlp-client-ca-secret={{ include "triage-agent.fullname" . }}-otlp-client-ca
+            {{- end }}
+            {{- $extraNames := .Values.otlp.extraNames | default list }}
+            {{- if and $otlpSensor (not ((.Values.otlp.insecure | default dict).enabled)) }}
+            {{- $svc := printf "%s-otlp" (include "triage-agent.fullname" .) }}
+            {{- $extraNames = concat $extraNames (list $svc (printf "%s.%s" $svc .Release.Namespace) (printf "%s.%s.svc" $svc .Release.Namespace) (printf "%s.%s.svc.cluster.local" $svc .Release.Namespace)) }}
+            {{- end }}
+            {{- if $otlpSensor }}
+            - --sensor-otlp-role
+            {{- end }}
+            {{- if $extraNames }}
+            - --sensor-extra-names={{ join "," $extraNames }}
+            {{- end }}
+            {{- if not $otlpSensor }}
+            {{- with .Values.otlp.allowedServiceAccounts }}
+            - --otlp-allowed-service-accounts={{ join "," . }}
+            {{- end }}
+            {{- with .Values.otlp.forwarders }}
+            - --otlp-forwarders={{ join "," . }}
+            {{- end }}
+            {{- with .Values.otlp.limits }}
+            {{- with .maxResources }}
+            - --otlp-max-resources={{ . | int }}
+            {{- end }}
+            {{- with .maxPointsPerResource }}
+            - --otlp-max-points-per-resource={{ . | int }}
+            {{- end }}
+            {{- with .maxResourcesPerSender }}
+            - --otlp-max-resources-per-sender={{ . | int }}
+            {{- end }}
+            {{- with .maxRequestBytes }}
+            - --otlp-max-request-bytes={{ . | int }}
+            {{- end }}
+            {{- end }}
+            {{- if $otlpCA }}
+            - --otlp-client-ca-file=/etc/triage-otlp/ca.crt
+            {{- end }}
+            {{- end }}
+            {{- end }}
+            {{- if $col.log }}
+            - --log-metrics-enabled
+            {{- with .Values.logMetrics.intervalSeconds }}
+            - --log-metrics-interval-seconds={{ . }}
+            {{- end }}
+            {{- with .Values.logMetrics.errorThreshold }}
+            - --log-metrics-error-threshold={{ . }}
+            {{- end }}
+            {{- if not (kindIs "invalid" ((.Values.logMetrics).baseline).enabled) }}
+            - --log-baseline={{ ((.Values.logMetrics).baseline).enabled }}
+            {{- end }}
+            {{- if not (kindIs "invalid" ((.Values.logMetrics).baseline).multiplier) }}
+            - --log-baseline-multiplier={{ ((.Values.logMetrics).baseline).multiplier }}
+            {{- end }}
+            {{- if not (kindIs "invalid" ((.Values.logMetrics).baseline).coldFloorLines) }}
+            - --log-baseline-cold-floor-lines={{ ((.Values.logMetrics).baseline).coldFloorLines }}
+            {{- end }}
+            {{- end }}
+            {{- if $col.red }}
+            - --red-metrics-enabled
+            {{- with .Values.redMetrics.intervalSeconds }}
+            - --red-metrics-interval-seconds={{ . }}
+            {{- end }}
+            {{- with .Values.redMetrics.errorThreshold }}
+            - --red-metrics-error-threshold={{ . }}
+            {{- end }}
+            {{- /* Nil-tested: 0 is a real value here and Helm reads it as falsy. */}}
+            {{- if not (kindIs "invalid" .Values.redMetrics.minErrorRatePct) }}
+            - --red-metrics-min-error-rate-pct={{ .Values.redMetrics.minErrorRatePct }}
+            {{- end }}
+            {{- /* Nil-tested for the same reason: 0 disables the arm. */}}
+            {{- if not (kindIs "invalid" .Values.redMetrics.operationErrorRatePct) }}
+            - --red-operation-error-rate-pct={{ .Values.redMetrics.operationErrorRatePct }}
+            {{- end }}
+            {{- /* Nil-tested: 0 disables the latency arm. */}}
+            {{- if not (kindIs "invalid" .Values.redMetrics.latencyMultiplier) }}
+            - --red-latency-multiplier={{ .Values.redMetrics.latencyMultiplier }}
+            {{- end }}
+            {{- with .Values.redMetrics.latencyFloorMs }}
+            - --red-latency-floor-ms={{ . }}
+            {{- end }}
+            {{- with .Values.redMetrics.latencyMinRequests }}
+            - --red-latency-min-requests={{ . }}
+            {{- end }}
+            {{- with .Values.redMetrics.latencyMinBaselineWindows }}
+            - --red-latency-min-baseline-windows={{ . }}
+            {{- end }}
+            {{- if not (kindIs "invalid" ((.Values.redMetrics).baseline).enabled) }}
+            - --red-baseline={{ ((.Values.redMetrics).baseline).enabled }}
+            {{- end }}
+            {{- if not (kindIs "invalid" ((.Values.redMetrics).baseline).multiplier) }}
+            - --red-baseline-multiplier={{ ((.Values.redMetrics).baseline).multiplier }}
+            {{- end }}
+            {{- if not (kindIs "invalid" ((.Values.redMetrics).baseline).evidenceWindows) }}
+            - --red-baseline-evidence-windows={{ ((.Values.redMetrics).baseline).evidenceWindows }}
+            {{- end }}
+            {{- if not (kindIs "invalid" ((.Values.redMetrics).baseline).errFloorPct) }}
+            - --red-baseline-err-floor-pct={{ ((.Values.redMetrics).baseline).errFloorPct }}
+            {{- end }}
+            {{- if not (kindIs "invalid" ((.Values.redMetrics).baseline).latFloorMs) }}
+            - --red-baseline-lat-floor-ms={{ ((.Values.redMetrics).baseline).latFloorMs }}
+            {{- end }}
+            {{- if not (kindIs "invalid" ((.Values.redMetrics).baseline).minBaselineWindows) }}
+            - --red-baseline-min-baseline-windows={{ ((.Values.redMetrics).baseline).minBaselineWindows }}
+            {{- end }}
+            {{- if not (kindIs "invalid" ((.Values.redMetrics).baseline).errMinRequests) }}
+            - --red-baseline-err-min-requests={{ ((.Values.redMetrics).baseline).errMinRequests }}
+            {{- end }}
+            {{- if not (kindIs "invalid" ((.Values.redMetrics).baseline).errMinErrors) }}
+            - --red-baseline-err-min-errors={{ ((.Values.redMetrics).baseline).errMinErrors }}
+            {{- end }}
+            {{- if not (kindIs "invalid" ((.Values.redMetrics).baseline).latMinRequests) }}
+            - --red-baseline-lat-min-requests={{ ((.Values.redMetrics).baseline).latMinRequests }}
+            {{- end }}
+            {{- if not (kindIs "invalid" ((.Values.redMetrics).baseline).errColdFloorPct) }}
+            - --red-baseline-err-cold-floor-pct={{ ((.Values.redMetrics).baseline).errColdFloorPct }}
+            {{- end }}
+            {{- if not (kindIs "invalid" ((.Values.redMetrics).baseline).latColdFloorMs) }}
+            - --red-baseline-lat-cold-floor-ms={{ ((.Values.redMetrics).baseline).latColdFloorMs }}
+            {{- end }}
+            {{- if not (kindIs "invalid" ((.Values.redMetrics).baseline).errSparseMinErrors) }}
+            - --red-baseline-err-sparse-min-errors={{ ((.Values.redMetrics).baseline).errSparseMinErrors }}
+            {{- end }}
+            {{- if not (kindIs "invalid" ((.Values.redMetrics).baseline).errSparseRatePct) }}
+            - --red-baseline-err-sparse-rate-pct={{ ((.Values.redMetrics).baseline).errSparseRatePct }}
+            {{- end }}
+            {{- if not (kindIs "invalid" ((.Values.redMetrics).baseline).latChronicMinRequests) }}
+            - --red-baseline-lat-chronic-min-requests={{ ((.Values.redMetrics).baseline).latChronicMinRequests }}
+            {{- end }}
+            {{- if not (kindIs "invalid" ((.Values.redMetrics).baseline).maxOperations) }}
+            - --red-baseline-max-operations={{ ((.Values.redMetrics).baseline).maxOperations }}
+            {{- end }}
+            {{- end }}
+            {{- if $col.topology }}
+            - --topology-enabled
+            {{- with .Values.topology.intervalSeconds }}
+            - --topology-interval-seconds={{ . }}
+            {{- end }}
+            {{- end }}
+            {{- if $col.use }}
+            - --use-metrics-enabled
+            {{- with .Values.useMetrics.intervalSeconds }}
+            - --use-metrics-interval-seconds={{ . }}
+            {{- end }}
+            {{- /* Nil-tested: 0 means "always report this dimension". */}}
+            {{- if not (kindIs "invalid" .Values.useMetrics.memPsiThreshold) }}
+            - --use-metrics-mem-psi-threshold={{ .Values.useMetrics.memPsiThreshold }}
+            {{- end }}
+            {{- if not (kindIs "invalid" .Values.useMetrics.cpuPsiThreshold) }}
+            - --use-metrics-cpu-psi-threshold={{ .Values.useMetrics.cpuPsiThreshold }}
+            {{- end }}
+            {{- if not (kindIs "invalid" .Values.useMetrics.ioPsiThreshold) }}
+            - --use-metrics-io-psi-threshold={{ .Values.useMetrics.ioPsiThreshold }}
+            {{- end }}
+            {{- if not (kindIs "invalid" ((.Values.useMetrics).baseline).enabled) }}
+            - --use-baseline={{ ((.Values.useMetrics).baseline).enabled }}
+            {{- end }}
+            {{- if not (kindIs "invalid" ((.Values.useMetrics).baseline).multiplier) }}
+            - --use-baseline-multiplier={{ ((.Values.useMetrics).baseline).multiplier }}
+            {{- end }}
+            {{- if not (kindIs "invalid" ((.Values.useMetrics).baseline).cpuFloorCores) }}
+            - --use-baseline-cpu-floor-cores={{ ((.Values.useMetrics).baseline).cpuFloorCores }}
+            {{- end }}
+            {{- if not (kindIs "invalid" ((.Values.useMetrics).baseline).cpuColdFloorCores) }}
+            - --use-baseline-cpu-cold-floor-cores={{ ((.Values.useMetrics).baseline).cpuColdFloorCores }}
+            {{- end }}
+            {{- end }}
+          {{- if or $sensorStream $apiOn }}
+          ports:
+            {{- if $sensorStream }}
+            - name: sensor-stream
+              containerPort: {{ include "triage-agent.sensorStreamPort" . }}
+              protocol: TCP
+            - name: mesh
+              containerPort: {{ include "triage-agent.meshPort" . }}
+              protocol: TCP
+            {{- if and $otlp (not $otlpSensor) }}
+            - name: otlp-grpc
+              containerPort: {{ include "triage-agent.otlpPort" . }}
+              protocol: TCP
+            {{- end }}
+            {{- end }}
+            {{- if $apiOn }}
+            - name: api
+              containerPort: {{ include "triage-agent.apiPort" . }}
+              protocol: TCP
+            {{- end }}
+          {{- end }}
+          {{- $joinStateVolume := and $core.enabled $core.caFingerprint (ne $core.storage "secret") }}
+          {{- if or $otlpCA $joinStateVolume $uiKeySecret $apiTokens $apiTLS }}
+          volumeMounts:
+            {{- if $apiTokens }}
+            - name: api-tokens
+              mountPath: /etc/triage-agent-api
+              readOnly: true
+            {{- end }}
+            {{- if $apiTLS }}
+            - name: api-tls
+              mountPath: /etc/triage-agent-api-tls
+              readOnly: true
+            {{- end }}
+            {{- if $uiKeySecret }}
+            - name: ui-admin-key
+              mountPath: /etc/triage-agent-ui
+              readOnly: true
+            {{- end }}
+            {{- if $otlpCA }}
+            - name: otlp-client-ca
+              mountPath: /etc/triage-otlp
+              readOnly: true
+            {{- end }}
+            {{- if and $core.enabled $core.caFingerprint (ne $core.storage "secret") }}
+            - name: join-state
+              mountPath: /data/join
+            {{- end }}
+          {{- end }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      {{- if or $otlpCA $joinStateVolume $uiKeySecret $apiTokens $apiTLS }}
+      volumes:
+        {{- if $apiTokens }}
+        - name: api-tokens
+          secret:
+            secretName: {{ $apiTokens }}
+            items:
+              - key: {{ (($api.tokens).secretKey) | default "tokens" }}
+                path: tokens
+        {{- end }}
+        {{- if $apiTLS }}
+        - name: api-tls
+          secret:
+            secretName: {{ $apiTLS }}
+        {{- end }}        {{- if $uiKeySecret }}
+        - name: ui-admin-key
+          secret:
+            secretName: {{ $uiKeySecret }}
+            items:
+              - key: {{ $uiKey.secretKey | default "admin-key" }}
+                path: admin-key
+        {{- end }}
+        {{- if $otlpCA }}
+        - name: otlp-client-ca
+          secret:
+            secretName: {{ $otlpCA }}
+            items:
+              - key: ca.crt
+                path: ca.crt
+        {{- end }}
+        {{- if and $core.enabled $core.caFingerprint (ne $core.storage "secret") }}
+        - name: join-state
+          {{- if eq $core.storage "pvc" }}
+          persistentVolumeClaim:
+            claimName: {{ required "core.existingClaim is required with core.storage=pvc" $core.existingClaim }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        {{- end }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

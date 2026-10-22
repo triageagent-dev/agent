@@ -1,0 +1,38 @@
+version: "3.9"
+services:
+  grafana:
+    image: grafana/grafana:13.2.0@sha256:3fd54ae1214669f8355f065ec9f6445d5279a3d77095ab048ca045685272429b
+    volumes:
+      - "{{ .ConfigDir }}/grafana-datasources.yaml:/etc/grafana/provisioning/datasources/grafana-datasources.yaml"
+    ports:
+      - "{{ .GrafanaHTTPPort }}:3000"
+  prometheus:
+    image: prom/prometheus:v3.14.0@sha256:5ce7540c3c00ef4ab0c9d2c995c6a5b9c421f44b4a115d97a2c7af3b1c21cbb0
+    command:
+      - --web.enable-remote-write-receiver
+      - --enable-feature=exemplar-storage
+      - --enable-feature=native-histograms
+      - --config.file=/etc/prometheus/prometheus.yml
+    ports:
+      - "{{ .PrometheusHTTPPort }}:9090"
+  tempo:
+    image: grafana/tempo:3.0.0@sha256:78439f7f7cf3c97122846c13a832e060c6c7ef67dcc814dccf0a5f3f78393a93
+    volumes:
+      - "{{ .ConfigDir }}/tempo-config.yaml:/config.yaml"
+    command:
+      - --config.file=/config.yaml
+    ports:
+      - 4317:4317
+      - "{{ .TempoHTTPPort }}:3200"
+#  loki:
+#    image: grafana/loki:2.9.0
+#    ports:
+#      - "{{ .LokiHTTPPort }}:3100"
+  collector:
+    image: otel/opentelemetry-collector-contrib:0.159.0@sha256:1f2c54a30e713fac6b3ae77a1ec84010c2007e29ced8ec666214fc2f6739c1cc
+    volumes:
+      - "{{ .ConfigDir }}/otelcol-config.yaml:/config.yaml"
+    command:
+      - --config=file:/config.yaml
+    ports:
+      - 4318:4318

@@ -1,0 +1,22 @@
+#!/bin/bash
+
+# Format all staged C/C++ files
+files=$(git diff --cached --name-only --diff-filter=ACM | grep -E '\.(c|cpp|h)$' | grep -v '^NOTICES/')
+
+if [ -n "$files" ]; then
+	echo "Running clang-format on:"
+	echo "$files"
+
+	# Run clang-format on the staged files
+	for file in $files; do
+		clang-format -i "$file"
+		git add "$file" # Re-add formatted files to staging
+	done
+fi
+
+# check if make check-config-schema >/dev/null 2>&1 is successful
+if ! $(make check-config-schema >/dev/null 2>&1); then
+  echo "Found differences in config schema. Generating new config schema..."
+  make generate-config-schema
+  git add devdocs/config/config-schema.json
+fi

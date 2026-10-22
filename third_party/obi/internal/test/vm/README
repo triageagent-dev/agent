@@ -1,0 +1,130 @@
+VIRTUAL MACHINE TESTS
+=====================
+
+VM Tests boot a QEMU guest against a selected Linux kernel and run OBI's
+integration and BPF-verifier test suites inside it. This allows OBI to be
+exercised against a matrix of kernel versions and architectures.
+
+The host's OBI source tree is shared into the guest via 9p (mount tag 'obi'),
+overlaid with /overlay/upper, and mounted at /build. Test outputs flow back
+through a second 9p mount (mount tag 'testout') so artifacts are available on
+the host after the VM exits. LVH-sourced kernels also receive their loadable
+modules through a third 9p mount (tag 'modules').
+
+
+KERNEL MATRIX
+=============
+
+All kernels are described in 'kernels.yaml'. Each entry declares:
+
+  - id:              short slug used as KERNEL_ID and in artifact filenames
+  - lvh_tag:         exact tag on quay.io/lvh-images/kernel-images, pinned to
+                     a dated build (e.g. "6.12-20260504.013701")
+  - pr_integration:  true => included in the PR-default integration matrix
+  - pr_verifier:     true => included in the PR-default verifier matrix
+
+Everything runs on amd64. arm64 was dropped because GitHub-hosted arm64
+runners don't expose nested KVM and TCG is ~12x slower — infeasible at
+PR scale.
+
+Steady state:
+  - 5.10-lts, 5.15-lts, 6.1-lts, 6.6-lts, 6.12-lts, 6.18-lts   LTS
+  - bpf, bpf-next                                               Dev trees
+  - rhel8.9, rhel8.10, rhel9.6                                  RHEL
+
+PR runs cover only the fast-lane integration kernels (5.15-lts + 6.18-lts).
+To include a kernel in PR runs, set 'pr_integration: true' (or
+'pr_verifier: true') on its kernels.yaml entry.
+
+
+KERNEL ARTIFACTS
+================
+
+Kernels are not committed to the repository. They are pulled on demand from
+'quay.io/lvh-images/kernel-images:<lvh_tag>' and cached under:
+
+    internal/test/vm/lvh/out/vmlinuz-${id}-${arch}
+    internal/test/vm/lvh/out/vmlinuz-${id}-${arch}.config
+    internal/test/vm/lvh/out/vmlinuz-${id}-${arch}.buildinfo
+    internal/test/vm/lvh/out/modules-${id}-${arch}/<release>/
+
+Each OCI artifact ships vmlinuz + .config + /lib/modules/<release> with all
+.ko files. The build pipeline used to produce these images is maintained by
+the Cilium project at github.com/cilium/little-vm-helper-images.
+
+To bump a kernel:
+
+  1. Find the desired tag at
+     https://quay.io/repository/lvh-images/kernel-images?tab=tags
+     (always prefer dated tags over the rolling '<id>-main' alias).
+  2. Update 'lvh_tag' in 'kernels.yaml'.
+  3. Done. CI re-pulls on the next run.
+
+
+USAGE
+=====
+
+Run integration tests inside the VM against a specific kernel:
+
+    KERNEL_ID=6.18-lts make
+
+Run the BPF verifier suite instead of integration tests:
+
+    TARGET_TEST=run-bpf-verifier-vm KERNEL_ID=6.12-lts make
+
+Boot with an explicit kernel path (overrides KERNEL_ID):
+
+    KERNEL=/tmp/bzImage MODULES_DIR=/tmp/modules make
+
+Drop into an interactive shell instead of running tests:
+
+    TARGET_TEST= KERNEL_ID=6.18-lts make
+
+For interactive debugging, the qemu serial console (-nographic) attaches to
+your terminal; an agetty respawn auto-logs in as root on ttyS0.
+
+
+PULLING KERNELS LOCALLY
+=======================
+
+'lvh/pull-kernel.sh' fetches a single kernel from quay and extracts vmlinuz
+plus the modules tree:
+
+    bash internal/test/vm/lvh/pull-kernel.sh 6.12-lts amd64
+
+'prepare-kernel.sh' wraps the pull for the Makefile and CI; it returns
+'KERNEL=' and 'MODULES_DIR=' assignments for eval and pulls on cache miss:
+
+    eval "$(bash internal/test/vm/prepare-kernel.sh 6.12-lts amd64)"
+
+
+CI WORKFLOWS
+============
+
+  - workflow_integration_tests_vm.yml
+        Runs integration tests inside the VM for every kernel marked
+        'pr_integration: true' in kernels.yaml.
+
+  - pull_request.yml :: bpf-verifier
+        Runs BPF verifier tests inside the VM for every kernel marked
+        'pr_verifier: true'. Cheap (~5 minutes per kernel on amd64 KVM).
+
+
+TECHNICAL NOTES
+===============
+
+  - Rootfs definition lives in 'Dockerfile' in this directory. The Alpine
+    image ships docker, docker-cli-buildx, docker-cli-compose, iptables
+    (legacy + nft), openrc, plus a Go toolchain imported from the pinned
+    golang image. No sshd — debug via the serial console (-nographic).
+  - 'modules-load' openrc service mounts /lib/modules via 9p (if a 'modules'
+    mount tag is supplied) and modprobes overlay/br_netfilter/iptable_*/
+    nf_*/veth/vxlan/macvlan before localmount runs. This is required for
+    LVH kernels (modular) and is a harmless no-op for monolithic ones.
+  - iptables is symlinked to iptables-legacy at image build time. All LVH
+    kernels enable CONFIG_IP_NF_IPTABLES_LEGACY but disable
+    CONFIG_NFT_NAT/COMPAT, so the nft backend fails on "TABLE_ADD nat" and
+    legacy is the only one Docker can use.
+  - 'GOCACHE' and 'TMPDIR' are pointed at /build (overlay over qcow2 ~20GB)
+    rather than tmpfs /tmp, so heavy Go builds (verifier test pulls k8s.io
+    deps) don't OOM the 8GB-RAM tmpfs.

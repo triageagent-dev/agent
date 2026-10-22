@@ -1,0 +1,384 @@
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package discover
+
+import (
+	"iter"
+	"log/slog"
+	"testing"
+
+	lru "github.com/hashicorp/golang-lru/v2"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"go.opentelemetry.io/obi/pkg/appolly/app"
+	"go.opentelemetry.io/obi/pkg/appolly/app/svc"
+	"go.opentelemetry.io/obi/pkg/appolly/discover/exec"
+	"go.opentelemetry.io/obi/pkg/appolly/services"
+	"go.opentelemetry.io/obi/pkg/export"
+	attr "go.opentelemetry.io/obi/pkg/export/attributes/names"
+	"go.opentelemetry.io/obi/pkg/export/otel/perapp"
+	"go.opentelemetry.io/obi/pkg/internal/ebpf/gotracer"
+	"go.opentelemetry.io/obi/pkg/internal/goexec"
+	"go.opentelemetry.io/obi/pkg/obi"
+	"go.opentelemetry.io/obi/pkg/selection"
+	"go.opentelemetry.io/obi/pkg/transform"
+)
+
+type dummyCriterion struct {
+	name      string
+	namespace string
+	export    services.ExportModes
+	sampler   *services.SamplerConfig
+	routes    *services.CustomRoutesConfig
+	features  export.Features
+}
+
+func (d dummyCriterion) GetName() string                                                { return d.name }
+func (d dummyCriterion) GetOpenPorts() *services.IntEnum                                { return nil }
+func (d dummyCriterion) GetPath() services.StringMatcher                                { return nil }
+func (d dummyCriterion) GetLanguages() services.StringMatcher                           { return nil }
+func (d dummyCriterion) RangeMetadata() iter.Seq2[string, services.StringMatcher]       { return nil }
+func (d dummyCriterion) RangePodAnnotations() iter.Seq2[string, services.StringMatcher] { return nil }
+func (d dummyCriterion) RangePodLabels() iter.Seq2[string, services.StringMatcher]      { return nil }
+func (d dummyCriterion) IsContainersOnly() bool                                         { return false }
+func (d dummyCriterion) GetPathRegexp() services.StringMatcher                          { return nil }
+func (d dummyCriterion) GetCmdArgs() services.StringMatcher                             { return nil }
+func (d dummyCriterion) GetPIDs() ([]app.PID, bool)                                     { return nil, false }
+func (d dummyCriterion) GetNamespace() string                                           { return d.namespace }
+func (d dummyCriterion) GetExportModes() services.ExportModes                           { return d.export }
+func (d dummyCriterion) GetSamplerConfig() *services.SamplerConfig                      { return d.sampler }
+func (d dummyCriterion) GetRoutesConfig() *services.CustomRoutesConfig                  { return d.routes }
+
+func (d dummyCriterion) MetricsConfig() perapp.SvcMetricsConfig {
+	return perapp.SvcMetricsConfig{Features: d.features}
+}
+
+func TestLoadAllGoFunctionNamesIncludesConditionalGoTracerSymbols(t *testing.T) {
+	ty := typer{cfg: &obi.Config{Routes: &transform.RoutesConfig{}}}
+	ty.loadAllGoFunctionNames()
+
+	for _, symbol := range gotracer.GoChannelLinkProbeSymbols() {
+		assert.Contains(t, ty.allGoFunctions, symbol)
+	}
+	for _, symbol := range gotracer.GoRuntimeMetricProbeSymbols() {
+		assert.Contains(t, ty.allGoFunctions, symbol)
+	}
+	for _, symbol := range gotracer.GoAutoSDKActivationProbeSymbols() {
+		assert.Contains(t, ty.allGoFunctions, symbol)
+	}
+}
+
+func TestContextWithValueDoesNotQualifyGoProxy(t *testing.T) {
+	assert.True(t, isGoProxy(&goexec.Offsets{Funcs: map[string][]goexec.FuncOffsets{
+		"runtime.chansend1": {},
+		"context.WithValue": {},
+	}}))
+	assert.False(t, isGoProxy(&goexec.Offsets{Funcs: map[string][]goexec.FuncOffsets{
+		"runtime.chansend1":                {},
+		"context.WithValue":                {},
+		"net/http.serverHandler.ServeHTTP": {},
+	}}))
+}
+
+func TestMakeServiceAttrs(t *testing.T) {
+	pi := services.ProcessInfo{Pid: 1234}
+	proc := &ProcessMatch{
+		Process: &pi,
+		Criteria: []services.Selector{
+			dummyCriterion{name: "svc1", namespace: "ns1", export: services.ExportModeUnset},
+		},
+	}
+	ty := typer{cfg: &obi.Config{Routes: &transform.RoutesConfig{}}}
+	attrs := ty.makeServiceAttrs(proc)
+	assert.Equal(t, "svc1", attrs.UID.Name)
+	assert.Equal(t, "ns1", attrs.UID.Namespace)
+	assert.EqualValues(t, 1234, attrs.ProcPID)
+	assert.Equal(t, services.ExportModeUnset, attrs.ExportModes)
+
+	// Test with sampler and routes
+	sampler := &services.SamplerConfig{}
+	routes := &services.CustomRoutesConfig{
+		Incoming: []string{"/test"},
+		Outgoing: []string{"/test2"},
+	}
+	pi2 := services.ProcessInfo{Pid: 5678}
+	proc2 := &ProcessMatch{
+		Process: &pi2,
+		Criteria: []services.Selector{
+			dummyCriterion{sampler: sampler, routes: routes},
+		},
+	}
+	attrs2 := ty.makeServiceAttrs(proc2)
+	assert.NotNil(t, attrs2.Sampler)
+	assert.NotNil(t, attrs2.CustomInRouteMatcher)
+	assert.NotNil(t, attrs2.CustomOutRouteMatcher)
+}
+
+func TestMakeServiceAttrsDefaultsSDKLanguageToGeneric(t *testing.T) {
+	pi := services.ProcessInfo{Pid: 1234}
+	proc := &ProcessMatch{
+		Process:  &pi,
+		Criteria: []services.Selector{dummyCriterion{name: "svc1"}},
+	}
+	ty := typer{cfg: &obi.Config{Routes: &transform.RoutesConfig{}}}
+
+	attrs := ty.makeServiceAttrs(proc)
+
+	assert.Equal(t, svc.InstrumentableGeneric, attrs.SDKLanguage)
+	assert.Equal(t, "generic", attrs.SDKLanguage.String())
+}
+
+func TestMakeServiceAttrs_DynamicPIDOptions(t *testing.T) {
+	d := NewDynamicPIDSelector()
+	d.Traces().AddPID(42, selection.DynamicPIDOptions{
+		ServiceName:      "dynamic-svc",
+		ServiceNamespace: "dynamic-ns",
+		ResourceAttributes: map[string]string{
+			"deployment.environment": "prod",
+		},
+	})
+	selector := d.appSignals().SelectorForPID(42)
+	require.NotNil(t, selector)
+
+	ty := typer{cfg: &obi.Config{Routes: &transform.RoutesConfig{}}}
+	attrs := ty.makeServiceAttrs(&ProcessMatch{
+		Process:            &services.ProcessInfo{Pid: 42},
+		Criteria:           []services.Selector{selector},
+		DynamicSelectorPID: 42,
+	})
+	assert.Equal(t, "dynamic-svc", attrs.UID.Name)
+	assert.Equal(t, "dynamic-ns", attrs.UID.Namespace)
+	assert.Equal(t, "prod", attrs.Metadata[attr.Name("deployment.environment")])
+}
+
+func TestMakeServiceAttrsDirectionalRouteOverrides(t *testing.T) {
+	global := services.DirectionalRoutePolicies{
+		Incoming: services.RoutePolicy{
+			Unmatch:        services.UnmatchHeuristic,
+			Patterns:       []string{"/global/{id}"},
+			IgnorePatterns: []string{"/health"},
+		},
+		Outgoing: services.RoutePolicy{
+			Unmatch:  services.UnmatchWildcard,
+			Patterns: []string{"/outgoing/{id}"},
+		},
+	}
+	patterns := []string{"/service/{id}"}
+	unmatched := services.UnmatchPath
+	routes := &services.CustomRoutesConfig{
+		PolicyOverrides: &services.DirectionalRoutePolicyOverrides{
+			Incoming: &services.RoutePolicyOverride{
+				Patterns: &patterns,
+				Unmatch:  &unmatched,
+			},
+		},
+	}
+	ty := typer{cfg: &obi.Config{Routes: &transform.RoutesConfig{Directional: &global}}}
+	attrs := ty.makeServiceAttrs(&ProcessMatch{
+		Process: &services.ProcessInfo{Pid: 1234},
+		Criteria: []services.Selector{
+			dummyCriterion{routes: routes},
+		},
+	})
+
+	require.NotNil(t, attrs.IncomingRoutePolicy)
+	require.Nil(t, attrs.OutgoingRoutePolicy)
+	assert.Equal(t, services.UnmatchPath, attrs.IncomingRoutePolicy.Config.Unmatch)
+	assert.Equal(t, "/service/{id}", attrs.IncomingRoutePolicy.Matcher.Find("/service/123"))
+	assert.Equal(t, "/health", attrs.IncomingRoutePolicy.IgnoreMatcher.Find("/health"))
+}
+
+func TestMakeServiceAttrsPreservesAbsentGlobalRouteDirection(t *testing.T) {
+	global := services.DirectionalRoutePolicies{
+		Incoming: services.RoutePolicy{Unmatch: services.UnmatchPath},
+	}
+	ty := typer{cfg: &obi.Config{Routes: &transform.RoutesConfig{
+		Directional: &global,
+		DirectionalPolicyPresence: &transform.DirectionalRoutePolicyPresence{
+			Incoming: true,
+		},
+	}}}
+
+	globalOnly := ty.makeServiceAttrs(&ProcessMatch{
+		Process:  &services.ProcessInfo{Pid: 1234},
+		Criteria: []services.Selector{dummyCriterion{}},
+	})
+	require.Nil(t, globalOnly.IncomingRoutePolicy)
+	require.Nil(t, globalOnly.OutgoingRoutePolicy)
+
+	outgoingPatterns := []string{"/inventory/{id}"}
+	withOverride := ty.makeServiceAttrs(&ProcessMatch{
+		Process: &services.ProcessInfo{Pid: 5678},
+		Criteria: []services.Selector{dummyCriterion{routes: &services.CustomRoutesConfig{
+			PolicyOverrides: &services.DirectionalRoutePolicyOverrides{
+				Outgoing: &services.RoutePolicyOverride{Patterns: &outgoingPatterns},
+			},
+		}}},
+	})
+	require.Nil(t, withOverride.IncomingRoutePolicy)
+	require.NotNil(t, withOverride.OutgoingRoutePolicy)
+	assert.Equal(t, "/inventory/{id}", withOverride.OutgoingRoutePolicy.Matcher.Find("/inventory/123"))
+}
+
+func TestMakeServiceAttrsKeepsGlobalCardinalityPerService(t *testing.T) {
+	global := services.DirectionalRoutePolicies{
+		Incoming: services.RoutePolicy{
+			Unmatch:                   services.UnmatchLowCardinality,
+			MaxPathSegmentCardinality: 2,
+		},
+		Outgoing: services.RoutePolicy{Unmatch: services.UnmatchPath},
+	}
+	ty := typer{cfg: &obi.Config{Routes: &transform.RoutesConfig{Directional: &global}}}
+
+	first := ty.makeServiceAttrs(&ProcessMatch{
+		Process:  &services.ProcessInfo{Pid: 1234},
+		Criteria: []services.Selector{dummyCriterion{}},
+	})
+	second := ty.makeServiceAttrs(&ProcessMatch{
+		Process:  &services.ProcessInfo{Pid: 5678},
+		Criteria: []services.Selector{dummyCriterion{}},
+	})
+
+	assert.Nil(t, first.IncomingRoutePolicy)
+	assert.Nil(t, first.OutgoingRoutePolicy)
+	require.NotNil(t, first.IncomingPathTrie)
+	require.NotNil(t, second.IncomingPathTrie)
+	assert.NotSame(t, first.IncomingPathTrie, second.IncomingPathTrie)
+	assert.Nil(t, first.OutgoingPathTrie)
+}
+
+func TestMakeServiceAttrsRuleOnlyDirectionalRoutes(t *testing.T) {
+	baseline := services.DirectionalRoutePolicies{
+		Incoming: services.RoutePolicy{Unmatch: services.UnmatchUnset},
+		Outgoing: services.RoutePolicy{Unmatch: services.UnmatchUnset},
+	}
+	patterns := []string{"/service/{id}"}
+	routes := &services.CustomRoutesConfig{
+		PolicyOverrides: &services.DirectionalRoutePolicyOverrides{
+			Incoming: &services.RoutePolicyOverride{Patterns: &patterns},
+		},
+	}
+	ty := typer{cfg: &obi.Config{Routes: &transform.RoutesConfig{
+		Directional:         &baseline,
+		DirectionalRuleOnly: true,
+	}}}
+
+	matched := ty.makeServiceAttrs(&ProcessMatch{
+		Process:  &services.ProcessInfo{Pid: 1234},
+		Criteria: []services.Selector{dummyCriterion{routes: routes}},
+	})
+	require.NotNil(t, matched.IncomingRoutePolicy)
+	assert.Equal(t, "/service/{id}", matched.IncomingRoutePolicy.Matcher.Find("/service/123"))
+	assert.Nil(t, matched.OutgoingRoutePolicy)
+
+	unmatched := ty.makeServiceAttrs(&ProcessMatch{
+		Process:  &services.ProcessInfo{Pid: 5678},
+		Criteria: []services.Selector{dummyCriterion{}},
+	})
+	assert.Nil(t, unmatched.IncomingRoutePolicy)
+	assert.Nil(t, unmatched.OutgoingRoutePolicy)
+}
+
+func TestMakeServiceAttrs_FeaturesMatchingMultipleCriteria(t *testing.T) {
+	exTra := services.ExportModes{}
+	exTra.AllowTraces()
+	exMet := services.ExportModes{}
+	exMet.AllowMetrics()
+
+	type testCase struct {
+		name     string
+		criteria []services.Selector
+		expected export.Features
+	}
+
+	for _, tc := range []testCase{{
+		name: "last match wins",
+		criteria: []services.Selector{
+			dummyCriterion{export: exMet, features: export.FeatureGraph},
+			dummyCriterion{
+				export: exTra, name: "svc1", namespace: "ns1",
+				features: export.FeatureApplicationRED | export.FeatureGraph,
+			},
+		},
+		expected: export.FeatureApplicationRED | export.FeatureGraph,
+	}, {
+		name: "if no features are defined, global metrics features prevail",
+		criteria: []services.Selector{
+			dummyCriterion{export: exTra, name: "svc2", namespace: "ns2"},
+			dummyCriterion{name: "svc1", namespace: "ns1"},
+		},
+		expected: export.FeatureSpanOTel,
+	}, {
+		name: "if last match does not define features, global metrics config override any prior match",
+		criteria: []services.Selector{
+			dummyCriterion{name: "svc2", namespace: "ns2", features: export.FeatureGraph},
+			dummyCriterion{export: exTra, name: "svc1", namespace: "ns1"},
+		},
+		expected: export.FeatureSpanOTel,
+	}} {
+		t.Run(tc.name, func(t *testing.T) {
+			proc := &ProcessMatch{
+				Process:  &services.ProcessInfo{Pid: 1234},
+				Criteria: tc.criteria,
+			}
+			ty := typer{cfg: &obi.Config{
+				Routes:  &transform.RoutesConfig{},
+				Metrics: perapp.GlobalMetricsConfig{Features: export.FeatureSpanOTel},
+			}}
+			attrs := ty.makeServiceAttrs(proc)
+			assert.Equal(t, "svc1", attrs.UID.Name)
+			assert.Equal(t, "ns1", attrs.UID.Namespace)
+			assert.EqualValues(t, 1234, attrs.ProcPID)
+
+			// the later matching criteria prevails
+			assert.Equal(t, exTra, attrs.ExportModes)
+			assert.Equal(t, tc.expected, attrs.Features)
+		})
+	}
+}
+
+func TestFilterClassify_EventDeleted_EvictsInstrumentableCache(t *testing.T) {
+	instrumentableCache, _ := lru.New[cacheKey, instrumentedExecutable](100)
+
+	const testDev uint64 = 42
+	const testInode uint64 = 15
+	const testPID app.PID = 100
+
+	key := cacheKey{Dev: testDev, Ino: testInode}
+	instrumentableCache.Add(key, instrumentedExecutable{
+		Type: svc.InstrumentableGeneric,
+	})
+
+	fInfo := exec.New(exec.Init{
+		Pid:        testPID,
+		Dev:        testDev,
+		Ino:        testInode,
+		CmdExePath: "/usr/bin/version-b",
+	})
+
+	ty := typer{
+		cfg:                 &obi.Config{Routes: &transform.RoutesConfig{}},
+		log:                 slog.Default(),
+		currentPids:         map[app.PID]*exec.FileInfo{testPID: fInfo},
+		instrumentableCache: instrumentableCache,
+	}
+
+	deleteEvents := []Event[ProcessMatch]{
+		{
+			Type: EventDeleted,
+			Obj:  ProcessMatch{Process: &services.ProcessInfo{Pid: testPID}},
+		},
+	}
+
+	out := ty.FilterClassify(deleteEvents)
+
+	require.Len(t, out, 1)
+	assert.Equal(t, EventDeleted, out[0].Type)
+	assert.Equal(t, fInfo, out[0].Obj.FileInfo)
+
+	_, cacheHit := instrumentableCache.Get(key)
+	assert.False(t, cacheHit,
+		"instrumentableCache should not contain a stale entry for dev:ino %v after the process owning it is deleted", key)
+}

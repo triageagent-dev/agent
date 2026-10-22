@@ -1,0 +1,1065 @@
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package discover
+
+import (
+	"log/slog"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"gopkg.in/yaml.v3"
+
+	"go.opentelemetry.io/obi/pkg/appolly/app"
+	"go.opentelemetry.io/obi/pkg/appolly/app/svc"
+	"go.opentelemetry.io/obi/pkg/appolly/services"
+	attr "go.opentelemetry.io/obi/pkg/export/attributes/names"
+	"go.opentelemetry.io/obi/pkg/internal/testutil"
+	"go.opentelemetry.io/obi/pkg/obi"
+	"go.opentelemetry.io/obi/pkg/pipe/msg"
+	"go.opentelemetry.io/obi/pkg/pipe/swarm"
+	"go.opentelemetry.io/obi/pkg/selection"
+	"go.opentelemetry.io/obi/pkg/transform"
+)
+
+// TestMatchersMutuallyExclusive wires CriteriaMatcher + DynamicMatcher like ProcessFinder.Start.
+// Exactly one path subscribes to the input: dynamic selector set → only DynamicMatcher runs;
+// no selector → only CriteriaMatcher runs. Prevents duplicate output and wrong criteria source.
+func TestMatchersMutuallyExclusive(t *testing.T) {
+	pipeConfig := obi.Config{}
+	require.NoError(t, yaml.Unmarshal([]byte(`discovery:
+  services:
+  - name: port-only
+    namespace: foo
+    open_ports: 80
+`), &pipeConfig))
+	cfgCriteria := FindingCriteria(&pipeConfig)
+
+	t.Run("dynamic_mode_static_is_noop_config_match_ignored", func(t *testing.T) {
+		sel := NewDynamicPIDSelector()
+		sel.AddPIDs(7)
+
+		inQ := msg.NewQueue[[]Event[ProcessAttrs]](msg.ChannelBufferLen(10))
+		outQ := msg.NewQueue[[]Event[ProcessMatch]](msg.ChannelBufferLen(10))
+		outCh := outQ.Subscribe()
+
+		processInfo = func(pp ProcessAttrs) (*services.ProcessInfo, error) {
+			return &services.ProcessInfo{Pid: pp.pid, ExePath: "/any/bin", OpenPorts: pp.openPorts}, nil
+		}
+
+		swi := swarm.Instancer{}
+		swi.Add(criteriaMatcherProvider(&pipeConfig, inQ, outQ, cfgCriteria, sel), swarm.WithID("CriteriaMatcher"))
+		swi.Add(dynamicMatcherProvider(inQ, outQ, sel.appSignals()), swarm.WithID("DynamicMatcher"))
+		runner, err := swi.Instance(t.Context())
+		require.NoError(t, err)
+		runner.Start(t.Context())
+		time.Sleep(50 * time.Millisecond)
+		defer outQ.Close()
+
+		// Matches static port-only (80) but not dynamic PID set — would appear if CriteriaMatcher ran.
+		inQ.Send([]Event[ProcessAttrs]{{Type: EventCreated, Obj: ProcessAttrs{pid: 99, openPorts: []uint32{80}}}})
+		testutil.ChannelEmpty(t, outCh, 300*time.Millisecond)
+
+		inQ.Send([]Event[ProcessAttrs]{{Type: EventCreated, Obj: ProcessAttrs{pid: 7, openPorts: []uint32{}}}})
+		ms := testutil.ReadChannel(t, outCh, testTimeout)
+		require.Len(t, ms, 1)
+		assert.Equal(t, app.PID(7), ms[0].Obj.Process.Pid)
+
+		inQ.Close()
+		testutil.DrainUntilClosed(outCh)
+	})
+
+	t.Run("static_mode_dynamic_is_noop_single_output", func(t *testing.T) {
+		inQ := msg.NewQueue[[]Event[ProcessAttrs]](msg.ChannelBufferLen(10))
+		outQ := msg.NewQueue[[]Event[ProcessMatch]](msg.ChannelBufferLen(10))
+		outCh := outQ.Subscribe()
+
+		processInfo = func(pp ProcessAttrs) (*services.ProcessInfo, error) {
+			return &services.ProcessInfo{Pid: pp.pid, ExePath: "/bin/app", OpenPorts: pp.openPorts}, nil
+		}
+
+		swi := swarm.Instancer{}
+		swi.Add(criteriaMatcherProvider(&pipeConfig, inQ, outQ, cfgCriteria, nil), swarm.WithID("CriteriaMatcher"))
+		swi.Add(dynamicMatcherProvider(inQ, outQ, nil), swarm.WithID("DynamicMatcher"))
+		runner, err := swi.Instance(t.Context())
+		require.NoError(t, err)
+		runner.Start(t.Context())
+		time.Sleep(50 * time.Millisecond)
+		defer outQ.Close()
+
+		inQ.Send([]Event[ProcessAttrs]{{Type: EventCreated, Obj: ProcessAttrs{pid: 12, openPorts: []uint32{80}}}})
+		ms := testutil.ReadChannel(t, outCh, testTimeout)
+		require.Len(t, ms, 1)
+		assert.Equal(t, app.PID(12), ms[0].Obj.Process.Pid)
+
+		inQ.Close()
+		testutil.DrainUntilClosed(outCh)
+	})
+}
+
+func testMatch(t *testing.T, m Event[ProcessMatch], name string,
+	namespace string, proc services.ProcessInfo,
+) {
+	assert.Equal(t, EventCreated, m.Type)
+	require.Len(t, m.Obj.Criteria, 1)
+	assert.Equal(t, name, m.Obj.Criteria[0].GetName())
+	assert.Equal(t, namespace, m.Obj.Criteria[0].GetNamespace())
+	assert.Equal(t, proc, *m.Obj.Process)
+}
+
+func TestCriteriaMatcher(t *testing.T) {
+	pipeConfig := obi.Config{}
+	require.NoError(t, yaml.Unmarshal([]byte(`discovery:
+  services:
+  - name: port-only
+    namespace: foo
+    open_ports: 80,8080-8089
+  - name: exec-only
+    exe_path: weird\d
+  - name: both
+    open_ports: 443
+    exe_path_regexp: "server"
+  - name: exec-arg
+    exe_path: /bin/python
+    cmd_args: "my-server.py"
+  - name: arg-only
+    cmd_args: "my-server2.py"
+`), &pipeConfig))
+
+	discoveredProcesses := msg.NewQueue[[]Event[ProcessAttrs]](msg.ChannelBufferLen(10))
+	filteredProcessesQu := msg.NewQueue[[]Event[ProcessMatch]](msg.ChannelBufferLen(10))
+	filteredProcesses := filteredProcessesQu.Subscribe()
+	matcherFunc, err := criteriaMatcherProvider(&pipeConfig, discoveredProcesses, filteredProcessesQu, FindingCriteria(&pipeConfig), nil)(t.Context())
+	require.NoError(t, err)
+	go matcherFunc(t.Context())
+	defer filteredProcessesQu.Close()
+
+	// it will filter unmatching processes and return a ProcessMatch for these that match
+	processInfo = func(pp ProcessAttrs) (*services.ProcessInfo, error) {
+		exePath := map[app.PID]string{
+			1: "/bin/weird33", 2: "/bin/weird33", 3: "server",
+			4: "/bin/something", 5: "server", 6: "/bin/clientweird99",
+			7: "/bin/python", 8: "/bin/python", 9: "/bin/frobnitz",
+		}[pp.pid]
+		return &services.ProcessInfo{Pid: pp.pid, ExePath: exePath, OpenPorts: pp.openPorts, CmdArgs: pp.cmdArgs}, nil
+	}
+	discoveredProcesses.Send([]Event[ProcessAttrs]{
+		{Type: EventCreated, Obj: ProcessAttrs{pid: 1, openPorts: []uint32{1, 2, 3}}}, // pass
+		{Type: EventDeleted, Obj: ProcessAttrs{pid: 2, openPorts: []uint32{4}}},       // filter
+		{Type: EventCreated, Obj: ProcessAttrs{pid: 3, openPorts: []uint32{8433}}},    // filter
+		{Type: EventCreated, Obj: ProcessAttrs{pid: 4, openPorts: []uint32{8083}}},    // pass
+		{Type: EventCreated, Obj: ProcessAttrs{pid: 5, openPorts: []uint32{443}}},     // pass
+		{Type: EventCreated, Obj: ProcessAttrs{pid: 6}},                               // pass
+		{Type: EventCreated, Obj: ProcessAttrs{pid: 7, cmdArgs: "my-server.py"}},      // pass
+		{Type: EventCreated, Obj: ProcessAttrs{pid: 8, cmdArgs: "other-server.py"}},   // filter
+		{Type: EventCreated, Obj: ProcessAttrs{pid: 9, cmdArgs: "my-server2.py"}},     // pass
+	})
+
+	matches := testutil.ReadChannel(t, filteredProcesses, testTimeout)
+	require.Len(t, matches, 6)
+
+	testMatch(t, matches[0], "exec-only", "", services.ProcessInfo{Pid: 1, ExePath: "/bin/weird33", OpenPorts: []uint32{1, 2, 3}})
+	testMatch(t, matches[1], "port-only", "foo", services.ProcessInfo{Pid: 4, ExePath: "/bin/something", OpenPorts: []uint32{8083}})
+	testMatch(t, matches[2], "both", "", services.ProcessInfo{Pid: 5, ExePath: "server", OpenPorts: []uint32{443}})
+	testMatch(t, matches[3], "exec-only", "", services.ProcessInfo{Pid: 6, ExePath: "/bin/clientweird99"})
+	testMatch(t, matches[4], "exec-arg", "", services.ProcessInfo{Pid: 7, ExePath: "/bin/python", CmdArgs: "my-server.py"})
+	testMatch(t, matches[5], "arg-only", "", services.ProcessInfo{Pid: 9, ExePath: "/bin/frobnitz", CmdArgs: "my-server2.py"})
+}
+
+func TestCriteriaMatcherLanguage(t *testing.T) {
+	pipeConfig := obi.Config{}
+	require.NoError(t, yaml.Unmarshal([]byte(`discovery:
+  services:
+  - name: go-and-java
+    namespace: foo
+    languages: "go|java"
+  - name: rust
+    languages: rust
+`), &pipeConfig))
+
+	discoveredProcesses := msg.NewQueue[[]Event[ProcessAttrs]](msg.ChannelBufferLen(10))
+	filteredProcessesQu := msg.NewQueue[[]Event[ProcessMatch]](msg.ChannelBufferLen(10))
+	filteredProcesses := filteredProcessesQu.Subscribe()
+	matcherFunc, err := criteriaMatcherProvider(&pipeConfig, discoveredProcesses, filteredProcessesQu, FindingCriteria(&pipeConfig), nil)(t.Context())
+	require.NoError(t, err)
+	go matcherFunc(t.Context())
+	defer filteredProcessesQu.Close()
+
+	// it will filter unmatching processes and return a ProcessMatch for these that match
+	processInfo = func(pp ProcessAttrs) (*services.ProcessInfo, error) {
+		exePath := map[app.PID]string{
+			1: "/bin/weird33", 2: "/bin/weird33", 3: "server",
+			4: "/bin/something", 5: "server", 6: "/bin/clientweird99",
+		}[pp.pid]
+		return &services.ProcessInfo{Pid: pp.pid, ExePath: exePath, OpenPorts: pp.openPorts}, nil
+	}
+	discoveredProcesses.Send([]Event[ProcessAttrs]{
+		{Type: EventCreated, Obj: ProcessAttrs{pid: 1, openPorts: []uint32{1, 2, 3}, detectedType: svc.InstrumentableCPP}},     // filter
+		{Type: EventDeleted, Obj: ProcessAttrs{pid: 2, openPorts: []uint32{4}, detectedType: svc.InstrumentableGeneric}},       // filter
+		{Type: EventCreated, Obj: ProcessAttrs{pid: 3, openPorts: []uint32{8433}, detectedType: svc.InstrumentableJavaNative}}, // pass
+		{Type: EventCreated, Obj: ProcessAttrs{pid: 4, openPorts: []uint32{8083}, detectedType: svc.InstrumentableJava}},       // pass
+		{Type: EventCreated, Obj: ProcessAttrs{pid: 5, openPorts: []uint32{443}, detectedType: svc.InstrumentableGolang}},      // pass
+		{Type: EventCreated, Obj: ProcessAttrs{pid: 6, detectedType: svc.InstrumentableRust}},                                  // pass
+	})
+
+	matches := testutil.ReadChannel(t, filteredProcesses, testTimeout)
+	require.Len(t, matches, 4)
+
+	testMatch(t, matches[0], "go-and-java", "foo", services.ProcessInfo{Pid: 3, ExePath: "server", OpenPorts: []uint32{8433}})
+	testMatch(t, matches[1], "go-and-java", "foo", services.ProcessInfo{Pid: 4, ExePath: "/bin/something", OpenPorts: []uint32{8083}})
+	testMatch(t, matches[2], "go-and-java", "foo", services.ProcessInfo{Pid: 5, ExePath: "server", OpenPorts: []uint32{443}})
+	testMatch(t, matches[3], "rust", "", services.ProcessInfo{Pid: 6, ExePath: "/bin/clientweird99"})
+}
+
+func TestCriteriaMatcher_Exclude(t *testing.T) {
+	pipeConfig := obi.Config{}
+	require.NoError(t, yaml.Unmarshal([]byte(`discovery:
+  services:
+  - name: port-only
+    namespace: foo
+    open_ports: 80,8080-8089
+  - name: exec-only
+    exe_path: weird\d
+  - name: both
+    open_ports: 443
+    exe_path_regexp: "server"
+  exclude_services:
+  - exe_path: s
+`), &pipeConfig))
+
+	discoveredProcesses := msg.NewQueue[[]Event[ProcessAttrs]](msg.ChannelBufferLen(10))
+	filteredProcessesQu := msg.NewQueue[[]Event[ProcessMatch]](msg.ChannelBufferLen(10))
+	filteredProcesses := filteredProcessesQu.Subscribe()
+	matcherFunc, err := criteriaMatcherProvider(&pipeConfig, discoveredProcesses, filteredProcessesQu, FindingCriteria(&pipeConfig), nil)(t.Context())
+	require.NoError(t, err)
+	go matcherFunc(t.Context())
+	defer filteredProcessesQu.Close()
+
+	// it will filter unmatching processes and return a ProcessMatch for these that match
+	processInfo = func(pp ProcessAttrs) (*services.ProcessInfo, error) {
+		exePath := map[app.PID]string{
+			1: "/bin/weird33", 2: "/bin/weird33", 3: "server",
+			4: "/bin/something", 5: "server", 6: "/bin/clientweird99",
+		}[pp.pid]
+		return &services.ProcessInfo{Pid: pp.pid, ExePath: exePath, OpenPorts: pp.openPorts}, nil
+	}
+	discoveredProcesses.Send([]Event[ProcessAttrs]{
+		{Type: EventCreated, Obj: ProcessAttrs{pid: 1, openPorts: []uint32{1, 2, 3}}}, // pass
+		{Type: EventDeleted, Obj: ProcessAttrs{pid: 2, openPorts: []uint32{4}}},       // filter
+		{Type: EventCreated, Obj: ProcessAttrs{pid: 3, openPorts: []uint32{8433}}},    // filter
+		{Type: EventCreated, Obj: ProcessAttrs{pid: 4, openPorts: []uint32{8083}}},    // filter (in exclude)
+		{Type: EventCreated, Obj: ProcessAttrs{pid: 5, openPorts: []uint32{443}}},     // filter (in exclude)
+		{Type: EventCreated, Obj: ProcessAttrs{pid: 6}},                               // pass
+	})
+
+	matches := testutil.ReadChannel(t, filteredProcesses, testTimeout)
+	require.Len(t, matches, 2)
+
+	testMatch(t, matches[0], "exec-only", "", services.ProcessInfo{Pid: 1, ExePath: "/bin/weird33", OpenPorts: []uint32{1, 2, 3}})
+	testMatch(t, matches[1], "exec-only", "", services.ProcessInfo{Pid: 6, ExePath: "/bin/clientweird99"})
+}
+
+func TestCriteriaMatcher_Exclude_Metadata(t *testing.T) {
+	pipeConfig := obi.Config{}
+	require.NoError(t, yaml.Unmarshal([]byte(`discovery:
+  services:
+  - k8s_node_name: .
+  exclude_services:
+  - k8s_node_name: bar
+`), &pipeConfig))
+
+	discoveredProcesses := msg.NewQueue[[]Event[ProcessAttrs]](msg.ChannelBufferLen(10))
+	filteredProcessesQu := msg.NewQueue[[]Event[ProcessMatch]](msg.ChannelBufferLen(10))
+	filteredProcesses := filteredProcessesQu.Subscribe()
+	matcherFunc, err := criteriaMatcherProvider(&pipeConfig, discoveredProcesses, filteredProcessesQu, FindingCriteria(&pipeConfig), nil)(t.Context())
+	require.NoError(t, err)
+	go matcherFunc(t.Context())
+	defer filteredProcessesQu.Close()
+
+	// it will filter unmatching processes and return a ProcessMatch for these that match
+	processInfo = func(pp ProcessAttrs) (*services.ProcessInfo, error) {
+		exePath := map[app.PID]string{
+			1: "/bin/weird33", 2: "/bin/weird33", 3: "server",
+			4: "/bin/something", 5: "server", 6: "/bin/clientweird99",
+		}[pp.pid]
+		return &services.ProcessInfo{Pid: pp.pid, ExePath: exePath, OpenPorts: pp.openPorts}, nil
+	}
+	nodeFoo := map[string]string{"k8s_node_name": "foo"}
+	nodeBar := map[string]string{"k8s_node_name": "bar"}
+	discoveredProcesses.Send([]Event[ProcessAttrs]{
+		{Type: EventCreated, Obj: ProcessAttrs{pid: 1, metadata: nodeFoo}}, // pass
+		{Type: EventDeleted, Obj: ProcessAttrs{pid: 2, metadata: nodeFoo}}, // filter
+		{Type: EventCreated, Obj: ProcessAttrs{pid: 3, metadata: nodeFoo}}, // pass
+		{Type: EventCreated, Obj: ProcessAttrs{pid: 4, metadata: nodeBar}}, // filter (in exclude)
+		{Type: EventDeleted, Obj: ProcessAttrs{pid: 5, metadata: nodeFoo}}, // filter
+		{Type: EventCreated, Obj: ProcessAttrs{pid: 6, metadata: nodeBar}}, // filter (in exclude)
+	})
+
+	matches := testutil.ReadChannel(t, filteredProcesses, 1000*testTimeout)
+	require.Len(t, matches, 2)
+	testMatch(t, matches[0], "", "", services.ProcessInfo{Pid: 1, ExePath: "/bin/weird33"})
+	testMatch(t, matches[1], "", "", services.ProcessInfo{Pid: 3, ExePath: "server"})
+}
+
+func TestCriteriaMatcher_MetadataWithDeprecatedPathRegexp(t *testing.T) {
+	pipeConfig := obi.Config{}
+	require.NoError(t, yaml.Unmarshal([]byte(`discovery:
+  services:
+  - name: server
+    exe_path_regexp: "^/bin/server$"
+    k8s_namespace: prod
+`), &pipeConfig))
+
+	criteria := FindingCriteria(&pipeConfig)
+	require.Len(t, criteria, 1)
+	assert.False(t, criteria[0].GetPath().IsSet())
+	assert.True(t, criteria[0].GetPathRegexp().IsSet())
+
+	discoveredProcesses := msg.NewQueue[[]Event[ProcessAttrs]](msg.ChannelBufferLen(10))
+	filteredProcessesQu := msg.NewQueue[[]Event[ProcessMatch]](msg.ChannelBufferLen(10))
+	filteredProcesses := filteredProcessesQu.Subscribe()
+	matcherFunc, err := criteriaMatcherProvider(&pipeConfig, discoveredProcesses, filteredProcessesQu, criteria, nil)(t.Context())
+	require.NoError(t, err)
+	go matcherFunc(t.Context())
+	defer func() {
+		discoveredProcesses.Close()
+		testutil.DrainUntilClosed(filteredProcesses)
+	}()
+
+	processInfo = func(pp ProcessAttrs) (*services.ProcessInfo, error) {
+		exePath := map[app.PID]string{
+			1: "/bin/server",
+			2: "/bin/worker",
+		}[pp.pid]
+		return &services.ProcessInfo{Pid: pp.pid, ExePath: exePath}, nil
+	}
+
+	discoveredProcesses.Send([]Event[ProcessAttrs]{
+		{Type: EventCreated, Obj: ProcessAttrs{pid: 1, metadata: map[string]string{services.AttrNamespace: "prod"}}},
+		{Type: EventCreated, Obj: ProcessAttrs{pid: 2, metadata: map[string]string{services.AttrNamespace: "prod"}}},
+	})
+
+	matches := testutil.ReadChannel(t, filteredProcesses, testTimeout)
+	require.Len(t, matches, 1)
+	testMatch(t, matches[0], "server", "", services.ProcessInfo{Pid: 1, ExePath: "/bin/server"})
+}
+
+func TestCriteriaMatcher_MustMatchAllAttributes(t *testing.T) {
+	pipeConfig := obi.Config{}
+	require.NoError(t, yaml.Unmarshal([]byte(`discovery:
+  services:
+  - name: all-attributes-must-match
+    namespace: foons
+    open_ports: 80,8080-8089
+    exe_path: foo
+    k8s_namespace: thens
+    k8s_pod_name: thepod
+    k8s_deployment_name: thedepl
+    k8s_replicaset_name: thers
+    k8s_container_name: foocontainer
+`), &pipeConfig))
+
+	discoveredProcesses := msg.NewQueue[[]Event[ProcessAttrs]](msg.ChannelBufferLen(10))
+	filteredProcessesQu := msg.NewQueue[[]Event[ProcessMatch]](msg.ChannelBufferLen(10))
+	filteredProcesses := filteredProcessesQu.Subscribe()
+	matcherFunc, err := criteriaMatcherProvider(&pipeConfig, discoveredProcesses, filteredProcessesQu, FindingCriteria(&pipeConfig), nil)(t.Context())
+	require.NoError(t, err)
+	go matcherFunc(t.Context())
+	defer filteredProcessesQu.Close()
+
+	processInfo = func(pp ProcessAttrs) (*services.ProcessInfo, error) {
+		exePath := map[app.PID]string{
+			1: "/bin/foo", 2: "/bin/faa", 3: "foo",
+			4: "foool", 5: "thefoool", 6: "foo",
+		}[pp.pid]
+		return &services.ProcessInfo{Pid: pp.pid, ExePath: exePath, OpenPorts: pp.openPorts}, nil
+	}
+	allMeta := map[string]string{
+		"k8s_namespace":       "thens",
+		"k8s_pod_name":        "is-thepod",
+		"k8s_deployment_name": "thedeployment",
+		"k8s_replicaset_name": "thers",
+		"k8s_container_name":  "foocontainer",
+	}
+	incompleteMeta := map[string]string{
+		"k8s_namespace":       "thens",
+		"k8s_pod_name":        "is-thepod",
+		"k8s_replicaset_name": "thers",
+	}
+	differentMeta := map[string]string{
+		"k8s_namespace":       "thens",
+		"k8s_pod_name":        "is-thepod",
+		"k8s_deployment_name": "some-deployment",
+		"k8s_replicaset_name": "thers",
+	}
+	discoveredProcesses.Send([]Event[ProcessAttrs]{
+		{Type: EventCreated, Obj: ProcessAttrs{pid: 1, openPorts: []uint32{8081}, metadata: allMeta}},        // pass
+		{Type: EventDeleted, Obj: ProcessAttrs{pid: 2, openPorts: []uint32{4}, metadata: allMeta}},           // filter: executable does not match
+		{Type: EventCreated, Obj: ProcessAttrs{pid: 3, openPorts: []uint32{7777}, metadata: allMeta}},        // filter: port does not match
+		{Type: EventCreated, Obj: ProcessAttrs{pid: 4, openPorts: []uint32{8083}, metadata: incompleteMeta}}, // filter: not all metadata available
+		{Type: EventCreated, Obj: ProcessAttrs{pid: 5, openPorts: []uint32{80}}},                             // filter: no metadata
+		{Type: EventCreated, Obj: ProcessAttrs{pid: 6, openPorts: []uint32{8083}, metadata: differentMeta}},  // filter: not all metadata matches
+	})
+	matches := testutil.ReadChannel(t, filteredProcesses, testTimeout)
+	require.Len(t, matches, 1)
+	testMatch(t, matches[0], "all-attributes-must-match", "foons", services.ProcessInfo{Pid: 1, ExePath: "/bin/foo", OpenPorts: []uint32{8081}})
+}
+
+func TestCriteriaMatcherMissingPort(t *testing.T) {
+	pipeConfig := obi.Config{}
+	require.NoError(t, yaml.Unmarshal([]byte(`discovery:
+  services:
+  - name: port-only
+    namespace: foo
+    open_ports: 80
+`), &pipeConfig))
+
+	discoveredProcesses := msg.NewQueue[[]Event[ProcessAttrs]](msg.ChannelBufferLen(10))
+	filteredProcessesQu := msg.NewQueue[[]Event[ProcessMatch]](msg.ChannelBufferLen(10))
+	filteredProcesses := filteredProcessesQu.Subscribe()
+	matcherFunc, err := criteriaMatcherProvider(&pipeConfig, discoveredProcesses, filteredProcessesQu, FindingCriteria(&pipeConfig), nil)(t.Context())
+	require.NoError(t, err)
+	go matcherFunc(t.Context())
+	defer filteredProcessesQu.Close()
+
+	// it will filter unmatching processes and return a ProcessMatch for these that match
+	processInfo = func(pp ProcessAttrs) (*services.ProcessInfo, error) {
+		proc := map[app.PID]struct {
+			Exe  string
+			PPid app.PID
+		}{
+			1: {Exe: "/bin/weird33", PPid: 0}, 2: {Exe: "/bin/weird33", PPid: 16}, 3: {Exe: "/bin/weird33", PPid: 1},
+		}[pp.pid]
+		return &services.ProcessInfo{Pid: pp.pid, ExePath: proc.Exe, PPid: proc.PPid, OpenPorts: pp.openPorts}, nil
+	}
+	discoveredProcesses.Send([]Event[ProcessAttrs]{
+		{Type: EventCreated, Obj: ProcessAttrs{pid: 1, openPorts: []uint32{80}}}, // this one is the parent, matches on port
+		{Type: EventDeleted, Obj: ProcessAttrs{pid: 2, openPorts: []uint32{}}},   // we'll skip 2 since PPid is 16, not 1
+		{Type: EventCreated, Obj: ProcessAttrs{pid: 3, openPorts: []uint32{}}},   // this one is the child, without port, but matches the parent by port
+	})
+
+	matches := testutil.ReadChannel(t, filteredProcesses, testTimeout)
+	require.Len(t, matches, 2)
+	testMatch(t, matches[0], "port-only", "foo", services.ProcessInfo{Pid: 1, ExePath: "/bin/weird33", OpenPorts: []uint32{80}, PPid: 0})
+	testMatch(t, matches[1], "port-only", "foo", services.ProcessInfo{Pid: 3, ExePath: "/bin/weird33", OpenPorts: []uint32{}, PPid: 1})
+	assert.Zero(t, matches[0].Obj.DynamicSelectorPID)
+	assert.Zero(t, matches[1].Obj.DynamicSelectorPID)
+}
+
+func TestCriteriaMatcherExcludedChildDoesNotInheritParentMatch(t *testing.T) {
+	pipeConfig := obi.Config{}
+	require.NoError(t, yaml.Unmarshal([]byte(`discovery:
+  instrument:
+  - name: port-only
+    open_ports: 80
+  exclude_instrument:
+  - exe_path: /tmp/provjob*
+`), &pipeConfig))
+
+	discoveredProcesses := msg.NewQueue[[]Event[ProcessAttrs]](msg.ChannelBufferLen(10))
+	filteredProcessesQu := msg.NewQueue[[]Event[ProcessMatch]](msg.ChannelBufferLen(10))
+	filteredProcesses := filteredProcessesQu.Subscribe()
+	matcherFunc, err := criteriaMatcherProvider(&pipeConfig, discoveredProcesses, filteredProcessesQu, FindingCriteria(&pipeConfig), nil)(t.Context())
+	require.NoError(t, err)
+	go matcherFunc(t.Context())
+	defer filteredProcessesQu.Close()
+
+	processInfo = func(pp ProcessAttrs) (*services.ProcessInfo, error) {
+		proc := map[app.PID]struct {
+			Exe  string
+			PPid app.PID
+		}{
+			1: {Exe: "/bin/parent"},
+			2: {Exe: "/bin/allowed", PPid: 1},
+			3: {Exe: "/tmp/provjob123 (deleted)", PPid: 1},
+		}[pp.pid]
+		return &services.ProcessInfo{Pid: pp.pid, ExePath: proc.Exe, PPid: proc.PPid, OpenPorts: pp.openPorts}, nil
+	}
+
+	discoveredProcesses.Send([]Event[ProcessAttrs]{
+		{Type: EventCreated, Obj: ProcessAttrs{pid: 1, openPorts: []uint32{80}}},
+		{Type: EventCreated, Obj: ProcessAttrs{pid: 2}},
+		{Type: EventCreated, Obj: ProcessAttrs{pid: 3}},
+	})
+
+	matches := testutil.ReadChannel(t, filteredProcesses, testTimeout)
+	require.Len(t, matches, 2)
+	assert.Equal(t, app.PID(1), matches[0].Obj.Process.Pid)
+	assert.Equal(t, app.PID(2), matches[1].Obj.Process.Pid)
+	assert.NotContains(t, matches[1].Obj.Process.ExePath, "provjob")
+}
+
+func TestDynamicMatcher_ChildInheritsDynamicSelectorPID(t *testing.T) {
+	dynamicSelector := NewDynamicPIDSelector()
+	dynamicSelector.AddPIDs(100)
+
+	discoveredProcesses := msg.NewQueue[[]Event[ProcessAttrs]](msg.ChannelBufferLen(10))
+	filteredProcessesQu := msg.NewQueue[[]Event[ProcessMatch]](msg.ChannelBufferLen(10))
+	filteredProcesses := filteredProcessesQu.Subscribe()
+	processInfo = func(pp ProcessAttrs) (*services.ProcessInfo, error) {
+		proc := map[app.PID]struct {
+			Exe  string
+			PPid app.PID
+		}{
+			100: {Exe: "/bin/parent", PPid: 0},
+			101: {Exe: "/bin/child", PPid: 100},
+		}[pp.pid]
+		return &services.ProcessInfo{Pid: pp.pid, ExePath: proc.Exe, PPid: proc.PPid, OpenPorts: pp.openPorts}, nil
+	}
+	runFn, err := dynamicMatcherProvider(discoveredProcesses, filteredProcessesQu, dynamicSelector.appSignals())(t.Context())
+	require.NoError(t, err)
+	go runFn(t.Context())
+	time.Sleep(50 * time.Millisecond)
+	defer filteredProcessesQu.Close()
+
+	discoveredProcesses.Send([]Event[ProcessAttrs]{
+		{Type: EventCreated, Obj: ProcessAttrs{pid: 100}},
+		{Type: EventCreated, Obj: ProcessAttrs{pid: 101}},
+	})
+	matches := testutil.ReadChannel(t, filteredProcesses, testTimeout)
+	require.Len(t, matches, 2)
+
+	assert.Equal(t, app.PID(100), matches[0].Obj.Process.Pid)
+	assert.Equal(t, app.PID(100), matches[0].Obj.DynamicSelectorPID)
+
+	assert.Equal(t, app.PID(101), matches[1].Obj.Process.Pid)
+	assert.Equal(t, app.PID(100), matches[1].Obj.DynamicSelectorPID)
+
+	discoveredProcesses.Close()
+	testutil.DrainUntilClosed(filteredProcesses)
+}
+
+func TestCriteriaMatcherContainersOnly(t *testing.T) {
+	pipeConfig := obi.Config{}
+	require.NoError(t, yaml.Unmarshal([]byte(`discovery:
+  services:
+  - name: port-only-containers
+    namespace: foo
+    open_ports: 80
+    containers_only: true
+`), &pipeConfig))
+
+	// override the namespace fetcher
+	namespaceFetcherFunc = func(pid app.PID) (string, error) {
+		switch pid {
+		case 1:
+			return "1", nil
+		case 2:
+			return "2", nil
+		case 3:
+			return "3", nil
+		}
+		panic("pid not exposed by test")
+	}
+
+	// override the os.Getpid func to that OBI is always reported
+	// with pid 1
+	osPidFunc = func() int {
+		return 1
+	}
+
+	discoveredProcesses := msg.NewQueue[[]Event[ProcessAttrs]](msg.ChannelBufferLen(10))
+	filteredProcessesQu := msg.NewQueue[[]Event[ProcessMatch]](msg.ChannelBufferLen(10))
+	filteredProcesses := filteredProcessesQu.Subscribe()
+	matcherFunc, err := criteriaMatcherProvider(&pipeConfig, discoveredProcesses, filteredProcessesQu, FindingCriteria(&pipeConfig), nil)(t.Context())
+	require.NoError(t, err)
+	go matcherFunc(t.Context())
+	defer filteredProcessesQu.Close()
+
+	// it will filter unmatching processes and return a ProcessMatch for these that match
+	processInfo = func(pp ProcessAttrs) (*services.ProcessInfo, error) {
+		proc := map[app.PID]struct {
+			Exe  string
+			PPid app.PID
+		}{
+			1: {Exe: "/bin/weird33", PPid: 0}, 2: {Exe: "/bin/weird33", PPid: 0}, 3: {Exe: "/bin/weird33", PPid: 1},
+		}[pp.pid]
+		return &services.ProcessInfo{Pid: pp.pid, ExePath: proc.Exe, PPid: proc.PPid, OpenPorts: pp.openPorts}, nil
+	}
+	discoveredProcesses.Send([]Event[ProcessAttrs]{
+		{Type: EventCreated, Obj: ProcessAttrs{pid: 1, openPorts: []uint32{80}}}, // this one is the parent, matches on port, not in container
+		{Type: EventCreated, Obj: ProcessAttrs{pid: 2, openPorts: []uint32{80}}}, // another pid, but in a container
+		{Type: EventCreated, Obj: ProcessAttrs{pid: 3, openPorts: []uint32{80}}}, // this one is the child, without port, but matches the parent by port, in a container
+	})
+
+	matches := testutil.ReadChannel(t, filteredProcesses, 5000*testTimeout)
+	require.Len(t, matches, 2)
+	testMatch(t, matches[0], "port-only-containers", "foo", services.ProcessInfo{Pid: 2, ExePath: "/bin/weird33", OpenPorts: []uint32{80}, PPid: 0})
+	testMatch(t, matches[1], "port-only-containers", "foo", services.ProcessInfo{Pid: 3, ExePath: "/bin/weird33", OpenPorts: []uint32{80}, PPid: 1})
+}
+
+func TestInstrumentation_CoexistingWithDeprecatedServices(t *testing.T) {
+	// setup conflicting criteria and see how some of them are ignored and others not
+	type testCase struct {
+		name string
+		cfg  obi.Config
+	}
+	pass := services.NewGlob("*/must-pass")
+	notPass := services.NewGlob("*/dont-pass")
+	neitherPass := services.NewGlob("*/neither-pass")
+	bothPass := services.NewGlob("*/{must,also}-pass")
+
+	passPort := services.IntEnum{Ranges: []services.IntRange{{Start: 80}}}
+	allPorts := services.IntEnum{Ranges: []services.IntRange{{Start: 1, End: 65535}}}
+
+	passRE := services.NewRegexp("must-pass")
+	notPassRE := services.NewRegexp("dont-pass")
+	neitherPassRE := services.NewRegexp("neither-pass")
+	bothPassRE := services.NewRegexp("(must|also)-pass")
+
+	for _, tc := range []testCase{
+		{name: "discovery > instrument", cfg: obi.Config{Discovery: services.DiscoveryConfig{
+			Instrument: services.GlobDefinitionCriteria{{Path: pass}, {OpenPorts: passPort}},
+		}}},
+		{
+			name: "discovery > instrument with discovery > exclude_instrument && default_exclude_instrument",
+			cfg: obi.Config{Discovery: services.DiscoveryConfig{
+				Instrument:               services.GlobDefinitionCriteria{{OpenPorts: allPorts}},
+				ExcludeInstrument:        services.GlobDefinitionCriteria{{Path: notPass}},
+				DefaultExcludeInstrument: services.GlobDefinitionCriteria{{Path: neitherPass}},
+			}},
+		},
+		{
+			name: "discovery > instrument with deprecated discovery > services",
+			cfg: obi.Config{Discovery: services.DiscoveryConfig{
+				Instrument: services.GlobDefinitionCriteria{{Path: pass}, {OpenPorts: passPort}},
+				// To be ignored
+				Services: services.RegexDefinitionCriteria{{OpenPorts: allPorts}},
+			}},
+		},
+		{
+			name: "discovery > instrument with top-level auto-target-exec option",
+			cfg: obi.Config{Discovery: services.DiscoveryConfig{
+				Instrument: services.GlobDefinitionCriteria{{OpenPorts: passPort}},
+			}, AutoTargetExe: pass},
+		},
+		{
+			name: "discovery > instrument with top-level ports option",
+			cfg: obi.Config{Discovery: services.DiscoveryConfig{
+				Instrument: services.GlobDefinitionCriteria{{Path: pass}},
+			}, Port: passPort},
+		},
+		{
+			name: "discovery > instrument ignoring deprecated path option",
+			cfg: obi.Config{Discovery: services.DiscoveryConfig{
+				Instrument: services.GlobDefinitionCriteria{{Path: pass}, {OpenPorts: passPort}},
+			}, Exec: services.NewRegexp("dont-pass")},
+		},
+		// cases below would be removed if the deprecated discovery > services options are removed,
+		{name: "deprecated discovery > services", cfg: obi.Config{Discovery: services.DiscoveryConfig{
+			Services: services.RegexDefinitionCriteria{{Path: passRE}, {OpenPorts: passPort}},
+		}}},
+		{
+			name: "deprecated discovery > services with discovery > exclude_services && default_exclude_services",
+			cfg: obi.Config{Discovery: services.DiscoveryConfig{
+				Services:               services.RegexDefinitionCriteria{{OpenPorts: allPorts}},
+				ExcludeServices:        services.RegexDefinitionCriteria{{Path: notPassRE}},
+				DefaultExcludeServices: services.RegexDefinitionCriteria{{Path: neitherPassRE}},
+			}},
+		},
+		{
+			name: "deprecated discovery > services with top-level deprecated exec option",
+			cfg: obi.Config{Discovery: services.DiscoveryConfig{
+				Services: services.RegexDefinitionCriteria{{OpenPorts: passPort}},
+			}, Exec: passRE},
+		},
+		{
+			name: "deprecated discovery > services with top-level deprecated port option",
+			cfg: obi.Config{Discovery: services.DiscoveryConfig{
+				Services: services.RegexDefinitionCriteria{{Path: passRE}},
+			}, Port: passPort},
+		},
+		{
+			name: "no YAML discovery section, using top-level AutoTargetExe variable",
+			cfg:  obi.Config{AutoTargetExe: bothPass},
+		},
+		{
+			name: "no YAML discovery section, using deprecated top-level discovery variables",
+			cfg:  obi.Config{Exec: bothPassRE},
+		},
+		{name: "prioritizing top-level AutoTarget variable over deprecated exec", cfg: obi.Config{
+			AutoTargetExe: bothPass,
+			// to be ignored
+			Exec: notPassRE,
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// it will filter unmatching processes and return a ProcessMatch for these that match
+			processInfo = func(pp ProcessAttrs) (*services.ProcessInfo, error) {
+				proc := map[app.PID]struct {
+					Exe  string
+					PPid app.PID
+				}{
+					1:  {Exe: "/bin/must-pass", PPid: 0},
+					2:  {Exe: "/bin/also-pass", PPid: 0},
+					11: {Exe: "/bin/dont-pass", PPid: 0},
+					12: {Exe: "/bin/neither-pass", PPid: 0},
+				}[pp.pid]
+				return &services.ProcessInfo{Pid: pp.pid, ExePath: proc.Exe, PPid: proc.PPid, OpenPorts: pp.openPorts}, nil
+			}
+			discoveredProcesses := msg.NewQueue[[]Event[ProcessAttrs]](msg.ChannelBufferLen(10))
+			filteredProcessesQu := msg.NewQueue[[]Event[ProcessMatch]](msg.ChannelBufferLen(10))
+			filteredProcesses := filteredProcessesQu.Subscribe()
+			matcherFunc, err := criteriaMatcherProvider(&tc.cfg, discoveredProcesses, filteredProcessesQu, FindingCriteria(&tc.cfg), nil)(t.Context())
+			require.NoError(t, err)
+			go matcherFunc(t.Context())
+			defer filteredProcessesQu.Close()
+
+			discoveredProcesses.Send([]Event[ProcessAttrs]{
+				{Type: EventCreated, Obj: ProcessAttrs{pid: 1, openPorts: []uint32{1234}}},
+				{Type: EventCreated, Obj: ProcessAttrs{pid: 2, openPorts: []uint32{80}}},
+				{Type: EventCreated, Obj: ProcessAttrs{pid: 11, openPorts: []uint32{4321}}},
+				{Type: EventCreated, Obj: ProcessAttrs{pid: 12, openPorts: []uint32{3456}}},
+			})
+
+			matches := testutil.ReadChannel(t, filteredProcesses, testTimeout)
+			require.Len(t, matches, 2)
+			m := matches[0]
+			assert.Equal(t, EventCreated, m.Type)
+			assert.Equal(t, services.ProcessInfo{Pid: 1, ExePath: "/bin/must-pass", OpenPorts: []uint32{1234}}, *m.Obj.Process)
+			m = matches[1]
+			assert.Equal(t, EventCreated, m.Type)
+			assert.Equal(t, services.ProcessInfo{Pid: 2, ExePath: "/bin/also-pass", OpenPorts: []uint32{80}}, *m.Obj.Process)
+		})
+	}
+}
+
+func TestCriteriaMatcher_TargetPIDs(t *testing.T) {
+	t.Run("single PID", func(t *testing.T) {
+		// When TargetPIDs has one PID, only that PID is matched.
+		pipeConfig := obi.Config{
+			TargetPIDs:       services.IntEnum{Ranges: []services.IntRange{{Start: 42}}},
+			ServiceName:      "targeted-svc",
+			ServiceNamespace: "target-ns",
+		}
+		discoveredProcesses := msg.NewQueue[[]Event[ProcessAttrs]](msg.ChannelBufferLen(10))
+		filteredProcessesQu := msg.NewQueue[[]Event[ProcessMatch]](msg.ChannelBufferLen(10))
+		filteredProcesses := filteredProcessesQu.Subscribe()
+		matcherFunc, err := criteriaMatcherProvider(&pipeConfig, discoveredProcesses, filteredProcessesQu, FindingCriteria(&pipeConfig), nil)(t.Context())
+		require.NoError(t, err)
+		go matcherFunc(t.Context())
+		defer filteredProcessesQu.Close()
+
+		processInfo = func(pp ProcessAttrs) (*services.ProcessInfo, error) {
+			return &services.ProcessInfo{Pid: pp.pid, ExePath: "/any/exe", OpenPorts: pp.openPorts}, nil
+		}
+		discoveredProcesses.Send([]Event[ProcessAttrs]{
+			{Type: EventCreated, Obj: ProcessAttrs{pid: 1, openPorts: []uint32{80}}},
+			{Type: EventCreated, Obj: ProcessAttrs{pid: 42, openPorts: []uint32{}}},
+			{Type: EventCreated, Obj: ProcessAttrs{pid: 100, openPorts: []uint32{443}}},
+		})
+
+		matches := testutil.ReadChannel(t, filteredProcesses, testTimeout)
+		require.Len(t, matches, 1)
+		assert.Equal(t, app.PID(42), matches[0].Obj.Process.Pid)
+		pids, ok := matches[0].Obj.Criteria[0].GetPIDs()
+		assert.True(t, ok)
+		assert.Equal(t, []app.PID{42}, pids)
+	})
+
+	t.Run("multiple PIDs", func(t *testing.T) {
+		pipeConfig := obi.Config{
+			TargetPIDs:       services.IntEnum{Ranges: []services.IntRange{{Start: 10}, {Start: 20}, {Start: 30}}},
+			ServiceName:      "multi-svc",
+			ServiceNamespace: "ns",
+		}
+		discoveredProcesses := msg.NewQueue[[]Event[ProcessAttrs]](msg.ChannelBufferLen(10))
+		filteredProcessesQu := msg.NewQueue[[]Event[ProcessMatch]](msg.ChannelBufferLen(10))
+		filteredProcesses := filteredProcessesQu.Subscribe()
+		matcherFunc, err := criteriaMatcherProvider(&pipeConfig, discoveredProcesses, filteredProcessesQu, FindingCriteria(&pipeConfig), nil)(t.Context())
+		require.NoError(t, err)
+		go matcherFunc(t.Context())
+		defer filteredProcessesQu.Close()
+
+		processInfo = func(pp ProcessAttrs) (*services.ProcessInfo, error) {
+			return &services.ProcessInfo{Pid: pp.pid, ExePath: "/any/exe", OpenPorts: pp.openPorts}, nil
+		}
+		discoveredProcesses.Send([]Event[ProcessAttrs]{
+			{Type: EventCreated, Obj: ProcessAttrs{pid: 1}},
+			{Type: EventCreated, Obj: ProcessAttrs{pid: 10}},
+			{Type: EventCreated, Obj: ProcessAttrs{pid: 15}},
+			{Type: EventCreated, Obj: ProcessAttrs{pid: 20}},
+			{Type: EventCreated, Obj: ProcessAttrs{pid: 30}},
+		})
+
+		matches := testutil.ReadChannel(t, filteredProcesses, testTimeout)
+		require.Len(t, matches, 3)
+		pids := make([]app.PID, len(matches))
+		for i, m := range matches {
+			pids[i] = m.Obj.Process.Pid
+		}
+		assert.ElementsMatch(t, []app.PID{10, 20, 30}, pids)
+	})
+}
+
+func TestMatchProcess_TargetPIDsDoNotBypassOtherCriteria(t *testing.T) {
+	m := &Matcher{Log: slog.Default()}
+	selector := &services.GlobAttributes{
+		PIDs: []uint32{42},
+		Path: services.NewGlob("/bin/expected"),
+	}
+	obj := &ProcessAttrs{pid: 42}
+
+	assert.False(t, m.matchProcess(obj, &services.ProcessInfo{Pid: 42, ExePath: "/bin/other"}, selector))
+	assert.True(t, m.matchProcess(obj, &services.ProcessInfo{Pid: 42, ExePath: "/bin/expected"}, selector))
+}
+
+func TestCriteriaMatcher_DynamicTargetPIDs(t *testing.T) {
+	dynamicSelector := NewDynamicPIDSelector()
+	dynamicSelector.AddPIDs(42)
+
+	discoveredProcesses := msg.NewQueue[[]Event[ProcessAttrs]](msg.ChannelBufferLen(10))
+	filteredProcessesQu := msg.NewQueue[[]Event[ProcessMatch]](msg.ChannelBufferLen(10))
+	filteredProcesses := filteredProcessesQu.Subscribe()
+	processInfo = func(pp ProcessAttrs) (*services.ProcessInfo, error) {
+		return &services.ProcessInfo{Pid: pp.pid, ExePath: "/any/exe", OpenPorts: pp.openPorts}, nil
+	}
+	runFn, err := dynamicMatcherProvider(discoveredProcesses, filteredProcessesQu, dynamicSelector.appSignals())(t.Context())
+	require.NoError(t, err)
+	go runFn(t.Context())
+	time.Sleep(50 * time.Millisecond)
+	defer filteredProcessesQu.Close()
+
+	discoveredProcesses.Send([]Event[ProcessAttrs]{
+		{Type: EventCreated, Obj: ProcessAttrs{pid: 42, openPorts: []uint32{}}},
+		{Type: EventCreated, Obj: ProcessAttrs{pid: 100, openPorts: []uint32{}}},
+	})
+	matches := testutil.ReadChannel(t, filteredProcesses, testTimeout)
+	require.Len(t, matches, 1)
+	assert.Equal(t, app.PID(42), matches[0].Obj.Process.Pid)
+	assert.Equal(t, app.PID(42), matches[0].Obj.DynamicSelectorPID)
+
+	dynamicSelector.AddPIDs(100)
+	discoveredProcesses.Send([]Event[ProcessAttrs]{
+		{Type: EventCreated, Obj: ProcessAttrs{pid: 100, openPorts: []uint32{}}},
+	})
+	matches = testutil.ReadChannel(t, filteredProcesses, testTimeout)
+	require.Len(t, matches, 1)
+	assert.Equal(t, app.PID(100), matches[0].Obj.Process.Pid)
+
+	dynamicSelector.RemovePIDs(100)
+	// Matcher sends synthetic EventDeleted for removed PIDs; drain it before asserting no re-match.
+	deletes := testutil.ReadChannel(t, filteredProcesses, testTimeout)
+	require.Len(t, deletes, 1)
+	assert.Equal(t, EventDeleted, deletes[0].Type)
+	assert.Equal(t, app.PID(100), deletes[0].Obj.Process.Pid)
+
+	discoveredProcesses.Send([]Event[ProcessAttrs]{
+		{Type: EventCreated, Obj: ProcessAttrs{pid: 100, openPorts: []uint32{}}},
+	})
+	testutil.ChannelEmpty(t, filteredProcesses, 100*time.Millisecond)
+
+	// Stop matcher so next test does not race on global processInfo (close input, drain output).
+	discoveredProcesses.Close()
+	testutil.DrainUntilClosed(filteredProcesses)
+}
+
+func TestCriteriaMatcher_DynamicTargetPIDs_RemoveNotification(t *testing.T) {
+	dynamicSelector := NewDynamicPIDSelector()
+	dynamicSelector.AddPIDs(42, 100)
+
+	discoveredProcesses := msg.NewQueue[[]Event[ProcessAttrs]](msg.ChannelBufferLen(10))
+	filteredProcessesQu := msg.NewQueue[[]Event[ProcessMatch]](msg.ChannelBufferLen(10))
+	filteredProcesses := filteredProcessesQu.Subscribe()
+	processInfo = func(pp ProcessAttrs) (*services.ProcessInfo, error) {
+		return &services.ProcessInfo{Pid: pp.pid, ExePath: "/any/exe", OpenPorts: pp.openPorts}, nil
+	}
+	runFn, err := dynamicMatcherProvider(discoveredProcesses, filteredProcessesQu, dynamicSelector.appSignals())(t.Context())
+	require.NoError(t, err)
+	go runFn(t.Context())
+	time.Sleep(50 * time.Millisecond)
+	defer filteredProcessesQu.Close()
+
+	discoveredProcesses.Send([]Event[ProcessAttrs]{
+		{Type: EventCreated, Obj: ProcessAttrs{pid: 42}},
+		{Type: EventCreated, Obj: ProcessAttrs{pid: 100}},
+	})
+	matches := testutil.ReadChannel(t, filteredProcesses, testTimeout)
+	require.Len(t, matches, 2)
+
+	dynamicSelector.RemovePIDs(100)
+	matches = testutil.ReadChannel(t, filteredProcesses, testTimeout)
+	require.Len(t, matches, 1)
+	assert.Equal(t, EventDeleted, matches[0].Type)
+	assert.Equal(t, app.PID(100), matches[0].Obj.Process.Pid)
+
+	dynamicSelector.RemovePIDs(42)
+	matches = testutil.ReadChannel(t, filteredProcesses, testTimeout)
+	require.Len(t, matches, 1)
+	assert.Equal(t, EventDeleted, matches[0].Type)
+	assert.Equal(t, app.PID(42), matches[0].Obj.Process.Pid)
+
+	// Stop matcher so next test does not race on global processInfo (close input, drain output).
+	discoveredProcesses.Close()
+	testutil.DrainUntilClosed(filteredProcesses)
+}
+
+func TestCriteriaMatcher_DynamicTargetPIDs_WithOptions(t *testing.T) {
+	dynamicSelector := NewDynamicPIDSelector()
+	dynamicSelector.Traces().AddPID(42, selection.DynamicPIDOptions{
+		ServiceName:      "runtime-svc",
+		ServiceNamespace: "runtime-ns",
+		ResourceAttributes: map[string]string{
+			"custom.attr": "value",
+		},
+	})
+
+	discoveredProcesses := msg.NewQueue[[]Event[ProcessAttrs]](msg.ChannelBufferLen(10))
+	filteredProcessesQu := msg.NewQueue[[]Event[ProcessMatch]](msg.ChannelBufferLen(10))
+	filteredProcesses := filteredProcessesQu.Subscribe()
+	processInfo = func(pp ProcessAttrs) (*services.ProcessInfo, error) {
+		return &services.ProcessInfo{Pid: pp.pid, ExePath: "/any/exe", OpenPorts: pp.openPorts}, nil
+	}
+	runFn, err := dynamicMatcherProvider(discoveredProcesses, filteredProcessesQu, dynamicSelector.appSignals())(t.Context())
+	require.NoError(t, err)
+	go runFn(t.Context())
+	time.Sleep(50 * time.Millisecond)
+	defer filteredProcessesQu.Close()
+
+	discoveredProcesses.Send([]Event[ProcessAttrs]{
+		{Type: EventCreated, Obj: ProcessAttrs{pid: 42, openPorts: []uint32{}}},
+	})
+	matches := testutil.ReadChannel(t, filteredProcesses, testTimeout)
+	require.Len(t, matches, 1)
+	require.Len(t, matches[0].Obj.Criteria, 1)
+	assert.Equal(t, "runtime-svc", matches[0].Obj.Criteria[0].GetName())
+	assert.Equal(t, "runtime-ns", matches[0].Obj.Criteria[0].GetNamespace())
+	attrs := ResourceAttributesFromSelector(matches[0].Obj.Criteria[0])
+	assert.Equal(t, "value", attrs[attr.Name("custom.attr")])
+
+	discoveredProcesses.Close()
+	testutil.DrainUntilClosed(filteredProcesses)
+}
+
+func TestCriteriaMatcher_Granular(t *testing.T) {
+	pipeConfig := obi.Config{}
+
+	require.NoError(t, yaml.Unmarshal([]byte(`discovery:
+  instrument:
+  - k8s_namespace: default
+    exports: [metrics]
+  - k8s_deployment_name: planet-service
+    exports: [traces]
+    sampler:
+        name: traceidratio
+        arg: 0.5
+  - k8s_deployment_name: satellite-service
+    exports: []
+  - k8s_deployment_name: star-service
+  - k8s_deployment_name: asteroid-service
+    exports: [metrics, traces]
+`), &pipeConfig))
+
+	discoveredProcesses := msg.NewQueue[[]Event[ProcessAttrs]](msg.ChannelBufferLen(10))
+	filteredProcessesQu := msg.NewQueue[[]Event[ProcessMatch]](msg.ChannelBufferLen(10))
+
+	filteredProcesses := filteredProcessesQu.Subscribe()
+
+	matcherFunc, err := criteriaMatcherProvider(&pipeConfig, discoveredProcesses, filteredProcessesQu, FindingCriteria(&pipeConfig), nil)(t.Context())
+
+	require.NoError(t, err)
+
+	go matcherFunc(t.Context())
+	defer filteredProcessesQu.Close()
+
+	processInfo = func(pp ProcessAttrs) (*services.ProcessInfo, error) {
+		exePath := map[app.PID]string{
+			1: "/bin/planet-service",
+			2: "/bin/satellite-service",
+			3: "/bin/star-service",
+			4: "/bin/asteroid-service",
+		}[pp.pid]
+
+		return &services.ProcessInfo{Pid: pp.pid, ExePath: exePath, OpenPorts: pp.openPorts}, nil
+	}
+
+	discoveredProcesses.Send([]Event[ProcessAttrs]{
+		{
+			Type: EventCreated,
+			Obj: ProcessAttrs{
+				pid: 1,
+				metadata: map[string]string{
+					"k8s_namespace":       "default",
+					"k8s_deployment_name": "planet-service",
+				},
+			},
+		},
+		{
+			Type: EventCreated,
+			Obj: ProcessAttrs{
+				pid: 2,
+				metadata: map[string]string{
+					"k8s_namespace":       "default",
+					"k8s_deployment_name": "satellite-service",
+				},
+			},
+		},
+		{
+			Type: EventCreated,
+			Obj: ProcessAttrs{
+				pid: 3,
+				metadata: map[string]string{
+					"k8s_namespace":       "default",
+					"k8s_deployment_name": "star-service",
+				},
+			},
+		},
+		{
+			Type: EventCreated,
+			Obj: ProcessAttrs{
+				pid: 4,
+				metadata: map[string]string{
+					"k8s_namespace":       "default",
+					"k8s_deployment_name": "asteroid-service",
+				},
+			},
+		},
+	})
+
+	matches := testutil.ReadChannel(t, filteredProcesses, testTimeout)
+	require.Len(t, matches, 4)
+
+	planetMatch := matches[0].Obj
+
+	require.Len(t, planetMatch.Criteria, 2)
+
+	ty := typer{cfg: &obi.Config{Routes: &transform.RoutesConfig{}}}
+	planetAttrs := ty.makeServiceAttrs(&planetMatch)
+
+	assert.True(t, planetAttrs.ExportModes.CanExportTraces())
+	assert.False(t, planetAttrs.ExportModes.CanExportMetrics())
+	require.NotNil(t, planetAttrs.Sampler)
+	assert.Equal(t, "TraceIDRatioBased{0.5}", planetAttrs.Sampler.Description())
+
+	satelliteMatch := matches[1].Obj
+
+	require.Len(t, satelliteMatch.Criteria, 2)
+
+	satelliteAttrs := ty.makeServiceAttrs(&satelliteMatch)
+
+	assert.False(t, satelliteAttrs.ExportModes.CanExportTraces())
+	assert.False(t, satelliteAttrs.ExportModes.CanExportMetrics())
+	require.Nil(t, satelliteAttrs.Sampler)
+
+	starMatch := matches[2].Obj
+
+	require.Len(t, starMatch.Criteria, 2)
+
+	starAttrs := ty.makeServiceAttrs(&starMatch)
+
+	assert.False(t, starAttrs.ExportModes.CanExportTraces())
+	assert.True(t, starAttrs.ExportModes.CanExportMetrics())
+	require.Nil(t, starAttrs.Sampler)
+
+	asteroidMatch := matches[3].Obj
+
+	require.Len(t, asteroidMatch.Criteria, 2)
+
+	asteroidAttrs := ty.makeServiceAttrs(&asteroidMatch)
+
+	assert.True(t, asteroidAttrs.ExportModes.CanExportTraces())
+	assert.True(t, asteroidAttrs.ExportModes.CanExportMetrics())
+	require.Nil(t, asteroidAttrs.Sampler)
+}

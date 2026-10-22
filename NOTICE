@@ -1,0 +1,31 @@
+triage-agent
+
+Copyright 2026 Denys Vasyliev.
+
+Every file is copyright its authors and is released under the Apache License,
+Version 2.0.
+
+You may obtain a copy of the Apache License, Version 2.0 in the LICENSE file
+distributed alongside this NOTICE, or at:
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+---
+
+This product also includes OpenTelemetry eBPF Instrumentation (OBI,
+go.opentelemetry.io/obi), from https://github.com/open-telemetry/
+opentelemetry-ebpf-instrumentation, Copyright The OpenTelemetry Authors,
+licensed under the Apache License, Version 2.0. OBI is vendored in full at
+version v0.12.2 under third_party/obi (see LICENSE and NOTICE in that
+directory) and referenced via a go.mod replace directive; its own upstream
+per-file copyright headers are retained unchanged.
+
+Two local modifications, each marked "LOCAL PATCH (triage-agent)" at the
+point of change, are carried on top of that vendored version:
+
+  - third_party/obi/pkg/export/connector/prommgr.go: hands the Prometheus
+    mux to an embedding caller instead of opening its own listener when one
+    is registered.
+  - third_party/obi/pkg/export/connector/prommgr.go: binds OBI's standalone
+    metrics listener to loopback only, rather than the upstream wildcard
+    bind, when it does run unembedded.

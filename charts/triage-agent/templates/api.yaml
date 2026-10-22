@@ -1,0 +1,97 @@
+{{- $api := .Values.api | default dict }}
+{{- if and $api.listen (or (($api.tokens | default dict).existingSecret) $api.serviceAccountAuth) }}
+{{- if $api.serviceAccountAuth }}
+{{- /* Callers present a ServiceAccount token (audience triage-agent-api); the
+       agent checks it with a TokenReview and RBAC with a SubjectAccessReview.
+       Bind this ClusterRole cluster-wide for every tenant, or with a RoleBinding
+       in a tenant-annotated namespace for that tenant. */}}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "triage-agent.fullname" . }}-api-reader
+  labels:
+    {{- include "triage-agent.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["triageagent.dev"]
+    resources: ["agent-api"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "triage-agent.fullname" . }}-api-review
+  labels:
+    {{- include "triage-agent.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["authentication.k8s.io"]
+    resources: ["tokenreviews"]
+    verbs: ["create"]
+  - apiGroups: ["authorization.k8s.io"]
+    resources: ["subjectaccessreviews"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "triage-agent.fullname" . }}-api-review
+  labels:
+    {{- include "triage-agent.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "triage-agent.fullname" . }}-api-review
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "triage-agent.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+---
+{{- end }}
+{{- /* Monitoring API (docs/adr/0020-monitoring-api.md): Prometheus /metrics,
+       /.well-known/triage-agent and the JSON API, behind bearer tokens. Off
+       unless api.listen is set with api.tokens.existingSecret or
+       api.serviceAccountAuth. */}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "triage-agent.fullname" . }}-api
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "triage-agent.labels" . | nindent 4 }}
+spec:
+  selector:
+    {{- include "triage-agent.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: api
+      port: {{ include "triage-agent.apiPort" . }}
+      targetPort: api
+      protocol: TCP
+{{- $sm := $api.serviceMonitor | default dict }}
+{{- if $sm.enabled }}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "triage-agent.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "triage-agent.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "triage-agent.selectorLabels" . | nindent 6 }}
+  endpoints:
+    - port: api
+      path: /metrics
+      interval: {{ $sm.interval | default "30s" }}
+      {{- if (($api.tls | default dict).existingSecret) }}
+      scheme: https
+      tlsConfig:
+        insecureSkipVerify: {{ $sm.insecureSkipVerify | default false }}
+      {{- end }}
+      authorization:
+        type: Bearer
+        credentials:
+          name: {{ required "api.serviceMonitor.tokenSecret.name is required: a Secret holding the scrape token alone" (($sm.tokenSecret | default dict).name) }}
+          key: {{ ($sm.tokenSecret | default dict).key | default "token" }}
+{{- end }}
+{{- end }}

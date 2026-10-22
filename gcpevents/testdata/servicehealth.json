@@ -1,0 +1,29 @@
+{
+  "insertId": "1a2b3c4d5e",
+  "logName": "projects/example-project-0000/logs/servicehealth.googleapis.com%2Factivity",
+  "timestamp": "2026-07-24T10:15:00.000Z",
+  "receiveTimestamp": "2026-07-24T10:15:02.114Z",
+  "severity": "NOTICE",
+  "resource": {
+    "type": "servicehealth.googleapis.com/Event",
+    "labels": {
+      "project_id": "example-project-0000",
+      "location": "global",
+      "event_name": "ABcd1234EFgh5678"
+    }
+  },
+  "jsonPayload": {
+    "@type": "type.googleapis.com/google.cloud.servicehealth.logging.v1.EventLog",
+    "category": "INCIDENT",
+    "title": "Elevated query failure rates in BigQuery and Dataflow",
+    "description": "We are investigating elevated error rates affecting BigQuery query execution and Dataflow job submission in multiple regions.",
+    "state": "ACTIVE",
+    "detailedState": "CONFIRMED",
+    "relevance": "IMPACTED",
+    "impactedProducts": "['Google BigQuery', 'Google Cloud Dataflow']",
+    "impactedLocations": "['us-east1', 'europe-west3']",
+    "startTime": "2026-07-24T09:42:00.000Z",
+    "updateTime": "2026-07-24T10:15:00.000Z",
+    "nextUpdateTime": "2026-07-24T11:15:00.000Z"
+  }
+}

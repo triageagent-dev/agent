@@ -1,0 +1,299 @@
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
+
+// Package appolly provides public access to eBPF application observability as a library
+package appolly // import "go.opentelemetry.io/obi/pkg/internal/appolly"
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"sync"
+	"time"
+
+	"go.opentelemetry.io/obi/pkg/appolly"
+	"go.opentelemetry.io/obi/pkg/appolly/app/request"
+	"go.opentelemetry.io/obi/pkg/appolly/discover"
+	"go.opentelemetry.io/obi/pkg/appolly/discover/exec"
+	"go.opentelemetry.io/obi/pkg/appolly/traces"
+	"go.opentelemetry.io/obi/pkg/ebpf"
+	ebpfcommon "go.opentelemetry.io/obi/pkg/ebpf/common"
+	msg2 "go.opentelemetry.io/obi/pkg/internal/helpers/msg"
+	"go.opentelemetry.io/obi/pkg/obi"
+	"go.opentelemetry.io/obi/pkg/pipe/global"
+	"go.opentelemetry.io/obi/pkg/pipe/msg"
+	"go.opentelemetry.io/obi/pkg/pipe/swarm"
+	"go.opentelemetry.io/obi/pkg/pipe/swarm/swarms"
+	"go.opentelemetry.io/obi/pkg/runtimemetrics"
+	"go.opentelemetry.io/obi/pkg/transform"
+)
+
+var errShutdownTimeout = errors.New("graceful shutdown has timed out while waiting for eBPF tracers to finish")
+
+func log() *slog.Logger {
+	return slog.With("component", "obi.Instrumenter")
+}
+
+// Instrumenter finds and instrument a service/process, and forwards the traces as
+// configured by the user
+type Instrumenter struct {
+	config    *obi.Config
+	ctxInfo   *global.ContextInfo
+	tracersWg *sync.WaitGroup
+	bp        *appolly.Instrumenter
+
+	// tracesInput is used to communicate the found traces between the ProcessFinder and
+	// the ProcessTracer.
+	tracesInput       *msg.Queue[[]request.Span]
+	processEventInput *msg.Queue[exec.ProcessEvent]
+	peGraphBuilder    *swarm.Instancer
+
+	// global data structures for all eBPF tracers
+	ebpfEventContext *ebpfcommon.EBPFEventContext
+
+	runtimeMetrics *msg.Queue[[]runtimemetrics.RuntimeMetricSnapshot]
+
+	// dynamicPIDSelector is the runtime PID set; from WithDynamicPIDSelector or created in New. Finder preloads from config.
+	dynamicPIDSelector *discover.DynamicPIDSelector
+	finishers          []finisher
+}
+
+type finisher struct {
+	name string
+	done <-chan error
+}
+
+// New Instrumenter, given a Config
+func New(ctx context.Context, ctxInfo *global.ContextInfo, config *obi.Config) (*Instrumenter, error) {
+	setupFeatureContextInfo(ctx, ctxInfo, config)
+
+	tracesInput := msg2.QueueFromConfig[[]request.Span](config, "tracesInput")
+
+	swi := &swarm.Instancer{}
+
+	processEventsInput := msg2.QueueFromConfig[exec.ProcessEvent](config, "processEventsInput")
+	processEventsHostDecorated := msg2.QueueFromConfig[exec.ProcessEvent](config, "processEventsHostDecorated")
+
+	swi.Add(traces.HostProcessEventDecoratorProvider(
+		&config.Attributes.InstanceID,
+		processEventsInput,
+		processEventsHostDecorated,
+	), swarm.WithID("HostProcessEventDecoratorProvider"))
+
+	processEventsKubeDecorated := msg2.QueueFromConfig[exec.ProcessEvent](config, "processEventsKubeDecorated")
+	swi.Add(transform.KubeProcessEventDecoratorProvider(
+		ctxInfo,
+		&config.Attributes.Kubernetes,
+		processEventsHostDecorated,
+		processEventsKubeDecorated,
+	), swarm.WithID("KubeProcessEventDecoratorProvider"))
+
+	processEventsDockerDecorated := msg2.QueueFromConfig[exec.ProcessEvent](config, "processEventsDockerDecorated")
+	swi.Add(transform.DockerProcessEventDecoratorProvider(
+		ctxInfo,
+		processEventsKubeDecorated,
+		processEventsDockerDecorated,
+	), swarm.WithID("DockerProcessEventDecorator"))
+
+	runtimeMetrics := newRuntimeMetricsQueue(config)
+	ebpfEventContext := ebpfcommon.NewEBPFEventContext()
+
+	bp, err := appolly.Build(ctx, config, ctxInfo, tracesInput, processEventsDockerDecorated, runtimeMetrics)
+	if err != nil {
+		return nil, fmt.Errorf("can't instantiate instrumentation pipeline: %w", err)
+	}
+
+	sel, _ := ctxInfo.DynamicPIDSelector.(*discover.DynamicPIDSelector)
+	// When sel is nil, finder gets nil: config target_pids are used as static criteria (FindingCriteria(cfg, false)).
+	if sel != nil {
+		sel.SetOnFileInfoUpdated(func(fi *exec.FileInfo) {
+			processEventsInput.SendCtx(ctx, exec.ProcessEvent{Type: exec.ProcessEventCreated, File: fi})
+		})
+	}
+	instr := &Instrumenter{
+		config:             config,
+		ctxInfo:            ctxInfo,
+		tracersWg:          &sync.WaitGroup{},
+		tracesInput:        tracesInput,
+		processEventInput:  processEventsInput,
+		bp:                 bp,
+		peGraphBuilder:     swi,
+		ebpfEventContext:   ebpfEventContext,
+		runtimeMetrics:     runtimeMetrics,
+		dynamicPIDSelector: sel,
+	}
+	return instr, nil
+}
+
+func newRuntimeMetricsQueue(config *obi.Config) *msg.Queue[[]runtimemetrics.RuntimeMetricSnapshot] {
+	jointMetricsConfig := appolly.JoinMetricsConfig(config)
+	runtimeMetricsEnabled := runtimemetrics.EnabledFeatures(jointMetricsConfig.Features)
+
+	if !runtimeMetricsEnabled.Any() ||
+		!jointMetricsConfig.Features.AnyAppO11yMetric() ||
+		(!config.OTELMetrics.EndpointEnabled() && !config.Prometheus.EndpointEnabled()) {
+		return nil
+	}
+
+	return msg2.QueueFromConfig[[]runtimemetrics.RuntimeMetricSnapshot](config, "runtimeMetrics")
+}
+
+// FindAndInstrument searches in background for any new executable matching the
+// selection criteria.
+// Returns a channel that is closed when the Instrumenter completed all its tasks.
+// This is: when the context is cancelled, it has unloaded all the eBPF probes.
+func (i *Instrumenter) FindAndInstrument(ctx context.Context) error {
+	finder := discover.NewProcessFinder(i.config, i.ctxInfo, i.tracesInput, i.runtimeMetrics, i.ebpfEventContext)
+	opts := []discover.ProcessFinderStartOpt{
+		discover.WithDynamicPIDSelector(i.dynamicPIDSelector),
+	}
+	processEvents, err := finder.Start(ctx, opts...)
+	if err != nil {
+		return fmt.Errorf("couldn't start Process Finder: %w", err)
+	}
+
+	// In the background process any process found events and annotate them with
+	// the Host or Kubernetes metadata
+	graph, err := i.peGraphBuilder.Instance(ctx)
+	if err != nil {
+		return fmt.Errorf("couldn't start Process Event pipeline: %w", err)
+	}
+	i.processEventsPipeline(ctx, graph)
+
+	// registers resources that must be done before exiting OBI
+	i.finishers = append(i.finishers,
+		finisher{name: "process finder", done: finder.Done()},
+		finisher{name: "process instrumenter", done: graph.Done()})
+
+	// In background, listen indefinitely for each new process and run its
+	// associated ebpf.ProcessTracer once it is found.
+	go i.instrumentedEventLoop(ctx, processEvents)
+
+	return nil
+}
+
+func (i *Instrumenter) WaitUntilFinished() error {
+	shutDownTimeout := time.After(i.config.ShutdownTimeout)
+	for _, f := range i.finishers {
+		select {
+		case <-shutDownTimeout:
+			return fmt.Errorf("timed out waiting for finisher %s to finish", f.name)
+		case err := <-f.done:
+			if err != nil {
+				return fmt.Errorf("node %q couldn't finish: %w", f.name, err)
+			}
+		}
+	}
+	return nil
+}
+
+func (i *Instrumenter) instrumentedEventLoop(ctx context.Context, processEvents <-chan discover.Event[*ebpf.Instrumentable]) {
+	log := log()
+	swarms.ForEachInput(ctx, processEvents, log.Debug, func(ev discover.Event[*ebpf.Instrumentable]) {
+		switch ev.Type {
+		case discover.EventCreated:
+			pt := ev.Obj
+			log.Debug("running tracer for new process",
+				"inode", pt.FileInfo.Ino(), "pid", pt.FileInfo.Pid(), "exec", pt.FileInfo.CmdExePath())
+			if pt.Tracer != nil {
+				i.tracersWg.Go(func() {
+					pt.Tracer.Run(ctx, i.ebpfEventContext, i.tracesInput)
+				})
+			}
+			i.handleAndDispatchProcessEvent(exec.ProcessEvent{Type: exec.ProcessEventCreated, File: pt.FileInfo})
+		case discover.EventDeleted:
+			dp := ev.Obj
+			log.Debug("stopping ProcessTracer because there are no more instances of such process",
+				"inode", dp.FileInfo.Ino(), "pid", dp.FileInfo.Pid(), "exec", dp.FileInfo.CmdExePath())
+			if dp.Tracer != nil {
+				dp.Tracer.UnlinkExecutable(dp.FileInfo, dp.ExecutableGeneration)
+			}
+			i.handleAndDispatchProcessEvent(exec.ProcessEvent{Type: exec.ProcessEventTerminated, File: dp.FileInfo})
+		case discover.EventInstanceDeleted:
+			i.handleAndDispatchProcessEvent(exec.ProcessEvent{Type: exec.ProcessEventTerminated, File: ev.Obj.FileInfo})
+		default:
+			log.Error("BUG ALERT! unknown event type", "type", ev.Type)
+		}
+	})
+}
+
+// ReadAndForward keeps listening for traces in the BPF map, then reads,
+// processes and forwards them
+func (i *Instrumenter) ReadAndForward(ctx context.Context) error {
+	log := log()
+	log.Debug("creating instrumentation pipeline")
+
+	log.Info("Starting main node")
+
+	i.finishers = append(i.finishers, finisher{
+		name: "Instrumenter Pipeline",
+		done: i.bp.Start(ctx),
+	})
+	<-ctx.Done()
+
+	log.Info("exiting auto-instrumenter")
+
+	if err := i.stop(); err != nil {
+		return fmt.Errorf("failed to stop auto-instrumenter: %w", err)
+	}
+
+	return nil
+}
+
+func (i *Instrumenter) stop() error {
+	log := log()
+
+	stopped := make(chan struct{})
+	go func() {
+		log.Debug("stopped searching for new processes to instrument. Waiting for the eBPF tracers to be unloaded")
+		i.tracersWg.Wait()
+		close(stopped)
+		log.Debug("tracers unloaded, exiting FindAndInstrument")
+	}()
+
+	select {
+	case <-time.After(i.config.ShutdownTimeout):
+		return errShutdownTimeout
+	case <-stopped:
+		return nil
+	}
+}
+
+func (i *Instrumenter) handleAndDispatchProcessEvent(pe exec.ProcessEvent) {
+	i.processEventInput.Send(pe)
+}
+
+func setupFeatureContextInfo(ctx context.Context, ctxInfo *global.ContextInfo, config *obi.Config) {
+	ctxInfo.AppO11y.ReportRoutes = config.Routes != nil
+	setupKubernetes(ctx, ctxInfo)
+}
+
+// setupKubernetes sets up common Kubernetes database and API clients that need to be accessed
+// from different stages in the OBI pipeline
+func setupKubernetes(ctx context.Context, ctxInfo *global.ContextInfo) {
+	if !ctxInfo.K8sInformer.IsKubeEnabled() {
+		return
+	}
+
+	if err := refreshK8sInformerCache(ctx, ctxInfo); err != nil {
+		slog.Error("can't init Kubernetes informer. You can't setup Kubernetes discovery and your"+
+			" traces won't be decorated with Kubernetes metadata", "error", err)
+		ctxInfo.K8sInformer.ForceDisable()
+		// Kubernetes turned out to be unavailable, so Docker becomes the fallback for
+		// container metadata. Start its event watcher now: BuildCommonContextInfo skipped
+		// it earlier because Kubernetes was still considered enabled at that point.
+		ctxInfo.DockerMetadata.Start(ctx)
+		return
+	}
+}
+
+func refreshK8sInformerCache(ctx context.Context, ctxInfo *global.ContextInfo) error {
+	// force the cache to be populated and cached
+	_, err := ctxInfo.K8sInformer.Get(ctx)
+	return err
+}
+
+func (i *Instrumenter) processEventsPipeline(ctx context.Context, graph *swarm.Runner) {
+	graph.Start(ctx, swarm.WithCancelTimeout(i.config.ShutdownTimeout))
+}

@@ -1,0 +1,2123 @@
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package request
+
+import (
+	"encoding/json"
+	"fmt"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"go.opentelemetry.io/otel/trace"
+
+	"go.opentelemetry.io/obi/pkg/appolly/app/svc"
+	"go.opentelemetry.io/obi/pkg/export/attributes"
+	attr "go.opentelemetry.io/obi/pkg/export/attributes/names"
+)
+
+func TestSpanClientServer(t *testing.T) {
+	for _, st := range []EventType{EventTypeHTTP, EventTypeGRPC, EventTypeKafkaServer, EventTypeMQTTServer, EventTypeNATSServer, EventTypeSunRPCServer, EventTypeRedisServer, EventTypeMemcachedServer, EventTypeSQLServer} {
+		span := &Span{
+			Type: st,
+		}
+		assert.False(t, span.IsClientSpan())
+	}
+
+	for _, st := range []EventType{
+		EventTypeHTTPClient, EventTypeGRPCClient, EventTypeSQLClient,
+		EventTypeRedisClient, EventTypeKafkaClient, EventTypeMQTTClient, EventTypeNATSClient, EventTypeAMQPClient, EventTypeSunRPCClient,
+		EventTypeMongoClient, EventTypeMemcachedClient, EventTypeFailedConnect,
+	} {
+		span := &Span{
+			Type: st,
+		}
+		assert.True(t, span.IsClientSpan())
+	}
+}
+
+func TestEventTypeString(t *testing.T) {
+	typeStringMap := map[EventType]string{
+		EventTypeHTTP:            "HTTP",
+		EventTypeGRPC:            "GRPC",
+		EventTypeHTTPClient:      "HTTPClient",
+		EventTypeGRPCClient:      "GRPCClient",
+		EventTypeSQLClient:       "SQLClient",
+		EventTypeSQLServer:       "SQLServer",
+		EventTypeRedisClient:     "RedisClient",
+		EventTypeMemcachedClient: "MemcachedClient",
+		EventTypeKafkaClient:     "KafkaClient",
+		EventTypeMQTTClient:      "MQTTClient",
+		EventTypeNATSClient:      "NATSClient",
+		EventTypeAMQPClient:      "AMQPClient",
+		EventTypeSunRPCClient:    "SunRPCClient",
+		EventTypeSunRPCServer:    "SunRPCServer",
+		EventTypeRedisServer:     "RedisServer",
+		EventTypeMemcachedServer: "MemcachedServer",
+		EventTypeKafkaServer:     "KafkaServer",
+		EventTypeMQTTServer:      "MQTTServer",
+		EventTypeNATSServer:      "NATSServer",
+		EventTypeMongoClient:     "MongoClient",
+		EventType(99):            "UNKNOWN (99)",
+	}
+
+	for ev, str := range typeStringMap {
+		assert.Equal(t, ev.String(), str)
+	}
+}
+
+func TestKindString(t *testing.T) {
+	m := map[*Span]string{
+		{Type: EventTypeHTTP}:                                  "SPAN_KIND_SERVER",
+		{Type: EventTypeGRPC}:                                  "SPAN_KIND_SERVER",
+		{Type: EventTypeKafkaServer}:                           "SPAN_KIND_SERVER",
+		{Type: EventTypeMQTTServer}:                            "SPAN_KIND_SERVER",
+		{Type: EventTypeNATSServer}:                            "SPAN_KIND_SERVER",
+		{Type: EventTypeSunRPCServer}:                          "SPAN_KIND_SERVER",
+		{Type: EventTypeSunRPCClient}:                          "SPAN_KIND_CLIENT",
+		{Type: EventTypeRedisServer}:                           "SPAN_KIND_SERVER",
+		{Type: EventTypeMemcachedServer}:                       "SPAN_KIND_SERVER",
+		{Type: EventTypeSQLServer}:                             "SPAN_KIND_SERVER",
+		{Type: EventTypeHTTPClient}:                            "SPAN_KIND_CLIENT",
+		{Type: EventTypeGRPCClient}:                            "SPAN_KIND_CLIENT",
+		{Type: EventTypeSQLClient}:                             "SPAN_KIND_CLIENT",
+		{Type: EventTypeRedisClient}:                           "SPAN_KIND_CLIENT",
+		{Type: EventTypeMemcachedClient}:                       "SPAN_KIND_CLIENT",
+		{Type: EventTypeMongoClient}:                           "SPAN_KIND_CLIENT",
+		{Type: EventTypeKafkaClient, Method: MessagingPublish}: "SPAN_KIND_PRODUCER",
+		{Type: EventTypeKafkaClient, Method: MessagingProcess}: "SPAN_KIND_CONSUMER",
+		{Type: EventTypeMQTTClient, Method: MessagingPublish}:  "SPAN_KIND_PRODUCER",
+		{Type: EventTypeMQTTClient, Method: MessagingProcess}:  "SPAN_KIND_CONSUMER",
+		{Type: EventTypeNATSClient, Method: MessagingPublish}:  "SPAN_KIND_PRODUCER",
+		{Type: EventTypeNATSClient, Method: MessagingProcess}:  "SPAN_KIND_CONSUMER",
+		{Type: EventTypeAMQPClient, Method: MessagingPublish}:  "SPAN_KIND_PRODUCER",
+		{Type: EventTypeAMQPClient, Method: MessagingProcess}:  "SPAN_KIND_CONSUMER",
+		{}: "SPAN_KIND_INTERNAL",
+	}
+
+	for span, str := range m {
+		assert.Equal(t, span.ServiceGraphKind(), str)
+	}
+}
+
+func TestServiceGraphConnectionType(t *testing.T) {
+	tests := []struct {
+		name     string
+		span     *Span
+		expected string
+	}{
+		// Database client spans should return "database"
+		{name: "SQL client", span: &Span{Type: EventTypeSQLClient}, expected: "database"},
+		{name: "Redis client", span: &Span{Type: EventTypeRedisClient}, expected: "database"},
+		{name: "Memcached client", span: &Span{Type: EventTypeMemcachedClient}, expected: "database"},
+		{name: "Mongo client", span: &Span{Type: EventTypeMongoClient}, expected: "database"},
+		{name: "Elasticsearch client", span: &Span{Type: EventTypeHTTPClient, SubType: HTTPSubtypeElasticsearch}, expected: "database"},
+
+		// Messaging client spans should return "messaging_system"
+		{name: "Kafka client producer", span: &Span{Type: EventTypeKafkaClient, Method: MessagingPublish}, expected: "messaging_system"},
+		{name: "Kafka client consumer", span: &Span{Type: EventTypeKafkaClient, Method: MessagingProcess}, expected: "messaging_system"},
+		{name: "MQTT client publisher", span: &Span{Type: EventTypeMQTTClient, Method: MessagingPublish}, expected: "messaging_system"},
+		{name: "MQTT client subscriber", span: &Span{Type: EventTypeMQTTClient, Method: MessagingProcess}, expected: "messaging_system"},
+		{name: "NATS client publisher", span: &Span{Type: EventTypeNATSClient, Method: MessagingPublish}, expected: "messaging_system"},
+		{name: "NATS client subscriber", span: &Span{Type: EventTypeNATSClient, Method: MessagingProcess}, expected: "messaging_system"},
+		{name: "AMQP client publisher", span: &Span{Type: EventTypeAMQPClient, Method: MessagingPublish}, expected: "messaging_system"},
+		{name: "AMQP client subscriber", span: &Span{Type: EventTypeAMQPClient, Method: MessagingProcess}, expected: "messaging_system"},
+		{name: "AWS SQS client", span: &Span{Type: EventTypeHTTPClient, SubType: HTTPSubtypeAWSSQS}, expected: "messaging_system"},
+
+		// Server spans should return empty
+		{name: "Redis server", span: &Span{Type: EventTypeRedisServer}, expected: ""},
+		{name: "Memcached server", span: &Span{Type: EventTypeMemcachedServer}, expected: ""},
+		{name: "SQL server", span: &Span{Type: EventTypeSQLServer}, expected: ""},
+		{name: "Kafka server", span: &Span{Type: EventTypeKafkaServer}, expected: ""},
+		{name: "MQTT server", span: &Span{Type: EventTypeMQTTServer}, expected: ""},
+		{name: "NATS server", span: &Span{Type: EventTypeNATSServer}, expected: ""},
+
+		// Regular HTTP/gRPC spans should return empty (unset)
+		{name: "HTTP server", span: &Span{Type: EventTypeHTTP}, expected: ""},
+		{name: "HTTP client", span: &Span{Type: EventTypeHTTPClient}, expected: ""},
+		{name: "GRPC server", span: &Span{Type: EventTypeGRPC}, expected: ""},
+		{name: "GRPC client", span: &Span{Type: EventTypeGRPCClient}, expected: ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.expected, tt.span.ServiceGraphConnectionType())
+		})
+	}
+}
+
+func TestTraceName(t *testing.T) {
+	tests := []struct {
+		name     string
+		span     *Span
+		expected string
+	}{
+		// HTTP spans
+		{name: "HTTP server", span: &Span{Type: EventTypeHTTP, Method: "GET", Route: "/users"}, expected: "GET /users"},
+		{name: "HTTP client", span: &Span{Type: EventTypeHTTPClient, Method: "POST", Route: "/api"}, expected: "POST /api"},
+		{name: "HTTP no route", span: &Span{Type: EventTypeHTTP, Method: "GET"}, expected: "GET"},
+
+		// gRPC spans
+		{name: "gRPC server", span: &Span{Type: EventTypeGRPC, Path: "/service/Method"}, expected: "/service/Method"},
+		{name: "gRPC client", span: &Span{Type: EventTypeGRPCClient, Path: "/service/Call"}, expected: "/service/Call"},
+
+		// SQL spans
+		{name: "SQL client", span: &Span{Type: EventTypeSQLClient, Method: "SELECT", Path: "users"}, expected: "SELECT users"},
+		{name: "SQL server", span: &Span{Type: EventTypeSQLServer, Method: "SELECT", Path: "users"}, expected: "SELECT users"},
+		{name: "SQL no table", span: &Span{Type: EventTypeSQLClient, Method: "BEGIN"}, expected: "BEGIN"},
+		{name: "SQL no table with namespace", span: &Span{Type: EventTypeSQLClient, Method: "SELECT", DBNamespace: "mydb"}, expected: "SELECT mydb"},
+		{name: "SQL table wins over namespace", span: &Span{Type: EventTypeSQLClient, Method: "SELECT", Path: "users", DBNamespace: "mydb"}, expected: "SELECT users"},
+		{name: "SQL query summary wins", span: &Span{Type: EventTypeSQLClient, Method: "SELECT", DBQuerySummary: "SELECT users orders", DBNamespace: "mydb"}, expected: "SELECT users orders"},
+		{name: "SQL empty", span: &Span{Type: EventTypeSQLClient}, expected: "SQL"},
+
+		// Redis spans
+		{name: "Redis client", span: &Span{Type: EventTypeRedisClient, Method: "GET"}, expected: "GET"},
+		{name: "Redis empty", span: &Span{Type: EventTypeRedisClient}, expected: "REDIS"},
+		{name: "Memcached client", span: &Span{Type: EventTypeMemcachedClient, Method: "GET", Path: "cache-key"}, expected: "GET"},
+		{name: "Memcached empty", span: &Span{Type: EventTypeMemcachedClient}, expected: "MEMCACHED"},
+
+		// Kafka spans
+		{name: "Kafka client publish", span: &Span{Type: EventTypeKafkaClient, Method: MessagingPublish, Path: "orders"}, expected: "publish orders"},
+		{name: "Kafka client process", span: &Span{Type: EventTypeKafkaClient, Method: MessagingProcess, Path: "events"}, expected: "process events"},
+		{name: "Kafka server", span: &Span{Type: EventTypeKafkaServer, Method: MessagingProcess, Path: "topic"}, expected: "process topic"},
+		{name: "Kafka no topic", span: &Span{Type: EventTypeKafkaClient, Method: MessagingPublish}, expected: "publish"},
+
+		// MQTT spans
+		{name: "MQTT client publish", span: &Span{Type: EventTypeMQTTClient, Method: MessagingPublish, Path: "sensors/temperature"}, expected: "publish sensors/temperature"},
+		{name: "MQTT client subscribe", span: &Span{Type: EventTypeMQTTClient, Method: MessagingProcess, Path: "sensors/#"}, expected: "process sensors/#"},
+		{name: "MQTT server", span: &Span{Type: EventTypeMQTTServer, Method: MessagingProcess, Path: "home/lights"}, expected: "process home/lights"},
+		{name: "MQTT no topic", span: &Span{Type: EventTypeMQTTClient, Method: MessagingPublish}, expected: "publish"},
+		{name: "NATS client publish", span: &Span{Type: EventTypeNATSClient, Method: MessagingPublish, Path: "updates.orders"}, expected: "publish updates.orders"},
+		{name: "NATS client process", span: &Span{Type: EventTypeNATSClient, Method: MessagingProcess, Path: "updates.orders"}, expected: "process updates.orders"},
+		{name: "NATS server", span: &Span{Type: EventTypeNATSServer, Method: MessagingProcess, Path: "updates.orders"}, expected: "process updates.orders"},
+		{name: "NATS no subject", span: &Span{Type: EventTypeNATSClient, Method: MessagingPublish}, expected: "publish"},
+		{name: "AMQP client publish", span: &Span{Type: EventTypeAMQPClient, Method: MessagingPublish, Path: "orders"}, expected: "publish orders"},
+		{name: "AMQP client process", span: &Span{Type: EventTypeAMQPClient, Method: MessagingProcess, Path: "orders"}, expected: "process orders"},
+		{name: "AMQP no destination", span: &Span{Type: EventTypeAMQPClient, Method: MessagingPublish}, expected: "publish"},
+
+		// SunRPC spans
+		{name: "SunRPC client", span: &Span{Type: EventTypeSunRPCClient, Path: "portmapper", Method: "0"}, expected: "portmapper/0"},
+		{name: "SunRPC no program", span: &Span{Type: EventTypeSunRPCServer, Method: "6"}, expected: "sunrpc/6"},
+
+		// JSON-RPC spans
+		{name: "JSON-RPC with method", span: &Span{Type: EventTypeHTTP, SubType: HTTPSubtypeJSONRPC, JSONRPC: &JSONRPC{Method: "subtract", Version: "2.0"}}, expected: "subtract"},
+		{name: "JSON-RPC no method", span: &Span{Type: EventTypeHTTP, SubType: HTTPSubtypeJSONRPC, JSONRPC: &JSONRPC{Version: "2.0"}}, expected: "jsonrpc"},
+		{name: "JSON-RPC client", span: &Span{Type: EventTypeHTTPClient, SubType: HTTPSubtypeJSONRPC, JSONRPC: &JSONRPC{Method: "getUser", Version: "2.0"}}, expected: "getUser"},
+
+		// Other spans
+		{name: "Mongo client", span: &Span{Type: EventTypeMongoClient, Method: "find", Path: "users"}, expected: "find users"},
+		{name: "Failed connect", span: &Span{Type: EventTypeFailedConnect}, expected: "CONNECT"},
+		{name: "DNS", span: &Span{Type: EventTypeDNS, Method: "A", Path: "example.com"}, expected: "A example.com"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.expected, tt.span.TraceName())
+		})
+	}
+}
+
+func TestSpanStatusCode_JSONRPC(t *testing.T) {
+	tests := []struct {
+		name         string
+		span         *Span
+		expectedCode string
+	}{
+		{
+			name: "server span with JSON-RPC error",
+			span: &Span{
+				Type:    EventTypeHTTP,
+				Status:  200,
+				SubType: HTTPSubtypeJSONRPC,
+				JSONRPC: &JSONRPC{Method: "subtract", Version: "2.0", ErrorCode: -32601, ErrorMessage: "Method not found"},
+			},
+			expectedCode: StatusCodeError,
+		},
+		{
+			name: "server span without JSON-RPC error",
+			span: &Span{
+				Type:    EventTypeHTTP,
+				Status:  200,
+				SubType: HTTPSubtypeJSONRPC,
+				JSONRPC: &JSONRPC{Method: "subtract", Version: "2.0"},
+			},
+			expectedCode: StatusCodeUnset,
+		},
+		{
+			name: "client span with JSON-RPC error",
+			span: &Span{
+				Type:    EventTypeHTTPClient,
+				Status:  200,
+				SubType: HTTPSubtypeJSONRPC,
+				JSONRPC: &JSONRPC{Method: "subtract", Version: "2.0", ErrorCode: -32600, ErrorMessage: "Invalid Request"},
+			},
+			expectedCode: StatusCodeError,
+		},
+		{
+			name: "client span without JSON-RPC error",
+			span: &Span{
+				Type:    EventTypeHTTPClient,
+				Status:  200,
+				SubType: HTTPSubtypeJSONRPC,
+				JSONRPC: &JSONRPC{Method: "subtract", Version: "2.0"},
+			},
+			expectedCode: StatusCodeUnset,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.expectedCode, SpanStatusCode(tt.span))
+		})
+	}
+}
+
+func TestSpanStatusMessage_JSONRPC(t *testing.T) {
+	tests := []struct {
+		name            string
+		span            *Span
+		expectedMessage string
+	}{
+		{
+			name: "server span with error message",
+			span: &Span{
+				Type:    EventTypeHTTP,
+				Status:  200,
+				SubType: HTTPSubtypeJSONRPC,
+				JSONRPC: &JSONRPC{Method: "subtract", ErrorCode: -32601, ErrorMessage: "Method not found"},
+			},
+			expectedMessage: "Method not found",
+		},
+		{
+			name: "client span with error message",
+			span: &Span{
+				Type:    EventTypeHTTPClient,
+				Status:  200,
+				SubType: HTTPSubtypeJSONRPC,
+				JSONRPC: &JSONRPC{Method: "subtract", ErrorCode: -32600, ErrorMessage: "Invalid Request"},
+			},
+			expectedMessage: "Invalid Request",
+		},
+		{
+			name: "server span without error",
+			span: &Span{
+				Type:    EventTypeHTTP,
+				Status:  200,
+				SubType: HTTPSubtypeJSONRPC,
+				JSONRPC: &JSONRPC{Method: "subtract", Version: "2.0"},
+			},
+			expectedMessage: "",
+		},
+		{
+			name: "client span without error",
+			span: &Span{
+				Type:    EventTypeHTTPClient,
+				Status:  200,
+				SubType: HTTPSubtypeJSONRPC,
+				JSONRPC: &JSONRPC{Method: "subtract", Version: "2.0"},
+			},
+			expectedMessage: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.expectedMessage, SpanStatusMessage(tt.span))
+		})
+	}
+}
+
+func TestSpanStatusMessage_DBResponseErrorOptional(t *testing.T) {
+	traceAttrs := map[attr.Name]struct{}{attr.DBResponseError: {}}
+
+	tests := []struct {
+		name            string
+		span            *Span
+		expectedDefault string
+		expectedAllowed string
+	}{
+		{
+			name: "redis error",
+			span: &Span{
+				Type:    EventTypeRedisClient,
+				Status:  1,
+				DBError: DBError{ErrorCode: "WRONGTYPE", Description: "WRONGTYPE Operation against a key holding the wrong kind of value"},
+			},
+			expectedDefault: "",
+			expectedAllowed: "WRONGTYPE Operation against a key holding the wrong kind of value",
+		},
+		{
+			name: "sql error",
+			span: &Span{
+				Type:     EventTypeSQLClient,
+				Status:   1,
+				SQLError: &SQLError{Code: 8, SQLState: "ABC", Message: "SQL error message"},
+			},
+			expectedDefault: "",
+			expectedAllowed: "SQL Server errored: error_code=8 sql_state=ABC message=SQL error message",
+		},
+		{
+			name: "sqlpp error",
+			span: &Span{
+				Type:    EventTypeHTTPClient,
+				SubType: HTTPSubtypeSQLPP,
+				Status:  1,
+				DBError: DBError{ErrorCode: "12003", Description: "Keyspace not found in CB datastore"},
+			},
+			expectedDefault: "",
+			expectedAllowed: "Keyspace not found in CB datastore",
+		},
+		{
+			name: "redis success",
+			span: &Span{
+				Type:   EventTypeRedisClient,
+				Status: 0,
+			},
+			expectedDefault: "",
+			expectedAllowed: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			messageAllowed := attributes.DBResponseErrorAttr(traceAttrs, tt.expectedAllowed)
+			messageDefault := attributes.DBResponseErrorAttr(nil, tt.expectedAllowed)
+			if len(messageDefault) > 0 {
+				assert.Equal(t, tt.expectedDefault, SpanDBStatusMessage(tt.span, messageDefault[0].Value.AsString()))
+			} else {
+				assert.Equal(t, tt.expectedDefault, SpanDBStatusMessage(tt.span, ""))
+			}
+			if len(messageAllowed) > 0 {
+				assert.Equal(t, tt.expectedAllowed, SpanDBStatusMessage(tt.span, messageAllowed[0].Value.AsString()))
+			} else {
+				assert.Equal(t, tt.expectedAllowed, SpanDBStatusMessage(tt.span, ""))
+			}
+		})
+	}
+}
+
+func TestSpanStatusCode_MCP(t *testing.T) {
+	tests := []struct {
+		name         string
+		span         *Span
+		expectedCode string
+	}{
+		{
+			name: "server span with MCP error",
+			span: &Span{
+				Type:    EventTypeHTTP,
+				Status:  200,
+				SubType: HTTPSubtypeMCP,
+				GenAI:   &GenAI{MCP: &MCPCall{Method: "tools/call", ErrorCode: -32602, ErrorMessage: "Unknown tool"}},
+			},
+			expectedCode: StatusCodeError,
+		},
+		{
+			name: "server span without MCP error",
+			span: &Span{
+				Type:    EventTypeHTTP,
+				Status:  200,
+				SubType: HTTPSubtypeMCP,
+				GenAI:   &GenAI{MCP: &MCPCall{Method: "tools/call"}},
+			},
+			expectedCode: StatusCodeUnset,
+		},
+		{
+			name: "client span with MCP error",
+			span: &Span{
+				Type:    EventTypeHTTPClient,
+				Status:  200,
+				SubType: HTTPSubtypeMCP,
+				GenAI:   &GenAI{MCP: &MCPCall{Method: "tools/call", ErrorCode: -32600, ErrorMessage: "Invalid Request"}},
+			},
+			expectedCode: StatusCodeError,
+		},
+		{
+			name: "client span without MCP error",
+			span: &Span{
+				Type:    EventTypeHTTPClient,
+				Status:  200,
+				SubType: HTTPSubtypeMCP,
+				GenAI:   &GenAI{MCP: &MCPCall{Method: "tools/call"}},
+			},
+			expectedCode: StatusCodeUnset,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.expectedCode, SpanStatusCode(tt.span))
+		})
+	}
+}
+
+func TestSpanStatusMessage_MCP(t *testing.T) {
+	tests := []struct {
+		name            string
+		span            *Span
+		expectedMessage string
+	}{
+		{
+			name: "server span with MCP error message",
+			span: &Span{
+				Type:    EventTypeHTTP,
+				Status:  200,
+				SubType: HTTPSubtypeMCP,
+				GenAI:   &GenAI{MCP: &MCPCall{Method: "tools/call", ErrorCode: -32602, ErrorMessage: "Unknown tool"}},
+			},
+			expectedMessage: "Unknown tool",
+		},
+		{
+			name: "client span with MCP error message",
+			span: &Span{
+				Type:    EventTypeHTTPClient,
+				Status:  200,
+				SubType: HTTPSubtypeMCP,
+				GenAI:   &GenAI{MCP: &MCPCall{Method: "tools/call", ErrorCode: -32600, ErrorMessage: "Invalid Request"}},
+			},
+			expectedMessage: "Invalid Request",
+		},
+		{
+			name: "server span without MCP error",
+			span: &Span{
+				Type:    EventTypeHTTP,
+				Status:  200,
+				SubType: HTTPSubtypeMCP,
+				GenAI:   &GenAI{MCP: &MCPCall{Method: "tools/call"}},
+			},
+			expectedMessage: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.expectedMessage, SpanStatusMessage(tt.span))
+		})
+	}
+}
+
+type jsonObject = map[string]any
+
+func deserializeJSONObject(data []byte) (jsonObject, error) {
+	var object jsonObject
+	err := json.Unmarshal(data, &object)
+
+	return object, err
+}
+
+func TestSerializeJSONSpans(t *testing.T) {
+	type testData struct {
+		eventType EventType
+		attribs   map[string]any
+	}
+
+	tData := []testData{
+		{
+			eventType: EventTypeHTTP,
+			attribs: map[string]any{
+				"method":      "method",
+				"status":      "200",
+				"url":         "path",
+				"contentLen":  "1024",
+				"responseLen": "2048",
+				"route":       "route",
+				"clientAddr":  "peername",
+				"serverAddr":  "hostname",
+				"serverPort":  "5678",
+			},
+		},
+		{
+			eventType: EventTypeHTTPClient,
+			attribs: map[string]any{
+				"method":     "method",
+				"status":     "200",
+				"url":        "path",
+				"clientAddr": "peername",
+				"serverAddr": "hostname",
+				"serverPort": "5678",
+			},
+		},
+		{
+			eventType: EventTypeGRPC,
+			attribs: map[string]any{
+				"method":     "path",
+				"status":     "200",
+				"clientAddr": "peername",
+				"serverAddr": "hostname",
+				"serverPort": "5678",
+			},
+		},
+		{
+			eventType: EventTypeGRPCClient,
+			attribs: map[string]any{
+				"method":     "path",
+				"status":     "200",
+				"serverAddr": "hostname",
+				"serverPort": "5678",
+			},
+		},
+		{
+			eventType: EventTypeSQLClient,
+			attribs: map[string]any{
+				"serverAddr":       "hostname",
+				"serverPort":       "5678",
+				"operation":        "method",
+				"table":            "path",
+				"statement":        "statement",
+				"errorCode":        "123",
+				"errorDescription": "SQL Server errored for command 'COM_QUERY': error_code=123 sql_state=s123 message=err123",
+				"errorMessage":     "err123",
+				"sqlCommand":       "QUERY",
+				"sqlState":         "s123",
+			},
+		},
+		{
+			eventType: EventTypeRedisClient,
+			attribs: map[string]any{
+				"serverAddr": "hostname",
+				"serverPort": "5678",
+				"operation":  "method",
+				"statement":  "statement",
+				"query":      "path",
+			},
+		},
+		{
+			eventType: EventTypeKafkaClient,
+			attribs: map[string]any{
+				"serverAddr": "hostname",
+				"serverPort": "5678",
+				"operation":  "method",
+				"clientId":   "statement",
+				"topic":      "path",
+				"partition":  "5",
+			},
+		},
+		{
+			eventType: EventTypeNATSClient,
+			attribs: map[string]any{
+				"serverAddr": "hostname",
+				"serverPort": "5678",
+				"operation":  "method",
+				"clientId":   "statement",
+				"subject":    "path",
+			},
+		},
+		{
+			eventType: EventTypeRedisServer,
+			attribs: map[string]any{
+				"serverAddr": "hostname",
+				"serverPort": "5678",
+				"operation":  "method",
+				"statement":  "statement",
+				"query":      "path",
+			},
+		},
+		{
+			eventType: EventTypeKafkaServer,
+			attribs: map[string]any{
+				"serverAddr": "hostname",
+				"serverPort": "5678",
+				"operation":  "method",
+				"clientId":   "statement",
+				"topic":      "path",
+				"partition":  "5",
+			},
+		},
+		{
+			eventType: EventTypeMongoClient,
+			attribs: map[string]any{
+				"serverAddr": "hostname",
+				"serverPort": "5678",
+				"operation":  "method",
+				"table":      "path",
+			},
+		},
+	}
+
+	test := func(t *testing.T, tData *testData) {
+		span := Span{
+			Type:           tData.eventType,
+			Method:         "method",
+			Path:           "path",
+			Route:          "route",
+			Peer:           "peer",
+			PeerPort:       1234,
+			Host:           "host",
+			HostPort:       5678,
+			Status:         200,
+			ContentLength:  1024,
+			ResponseLength: 2048,
+			RequestStart:   10000,
+			Start:          15000,
+			End:            35000,
+			TraceID:        trace.TraceID{0x1, 0x2, 0x3},
+			SpanID:         trace.SpanID{0x1, 0x2, 0x3},
+			ParentSpanID:   trace.SpanID{0x1, 0x2, 0x3},
+			TraceFlags:     1,
+			PeerName:       "peername",
+			HostName:       "hostname",
+			OtherNamespace: "otherns",
+			Statement:      "statement",
+			SQLCommand:     "QUERY",
+			SQLError: &SQLError{
+				SQLState: "s123",
+				Message:  "err123",
+				Code:     123,
+			},
+			MessagingInfo: &MessagingInfo{
+				Partition: 5,
+			},
+		}
+
+		data, err := json.MarshalIndent(span, "", " ")
+
+		require.NoError(t, err)
+
+		s, err := deserializeJSONObject(data)
+
+		require.NoError(t, err)
+
+		assert.Equal(t, map[string]any{
+			"type":                tData.eventType.String(),
+			"kind":                span.ServiceGraphKind(),
+			"peer":                "peer",
+			"peerPort":            "1234",
+			"host":                "host",
+			"hostPort":            "5678",
+			"peerName":            "peername",
+			"hostName":            "hostname",
+			"start":               s["start"],
+			"handlerStart":        s["handlerStart"],
+			"end":                 s["end"],
+			"duration":            "25µs",
+			"durationUSec":        "25",
+			"handlerDuration":     "20µs",
+			"handlerDurationUSec": "20",
+			"traceID":             "01020300000000000000000000000000",
+			"spanID":              "0102030000000000",
+			"parentSpanID":        "0102030000000000",
+			"traceFlags":          "1",
+			"attributes":          tData.attribs,
+		}, s)
+	}
+
+	for i := range tData {
+		test(t, &tData[i])
+	}
+}
+
+func TestSpanAttributesGraphQLOmitsDocument(t *testing.T) {
+	attrs := spanAttributes(&Span{
+		Type:    EventTypeHTTP,
+		SubType: HTTPSubtypeGraphQL,
+		GraphQL: &GraphQL{
+			Document:      `mutation ChangeEmail { updateUser(email: "secret@example.com") { id } }`,
+			OperationName: "ChangeEmail",
+			OperationType: "mutation",
+		},
+	})
+
+	assert.NotContains(t, attrs, "graphqlDocument")
+	assert.Equal(t, "ChangeEmail", attrs["graphqlOperationName"])
+	assert.Equal(t, "mutation", attrs["graphqlOperationType"])
+}
+
+func TestDetectsOTelExport(t *testing.T) {
+	const defaultOtlpGRPCPort = 4317
+	// Metrics
+	tests := []struct {
+		name    string
+		span    Span
+		exports bool
+	}{
+		{
+			name:    "HTTP server spans don't export",
+			span:    Span{Type: EventTypeHTTP, Method: "GET", Path: "/v1/metrics", RequestStart: 100, End: 200, Status: 200},
+			exports: false,
+		},
+		{
+			name:    "HTTP /foo doesn't export",
+			span:    Span{Type: EventTypeHTTPClient, Method: "GET", Path: "/foo", RequestStart: 100, End: 200, Status: 200},
+			exports: false,
+		},
+		{
+			name:    "HTTP failed spans don't export",
+			span:    Span{Type: EventTypeHTTPClient, Method: "GET", Path: "/v1/metrics", RequestStart: 100, End: 200, Status: 401},
+			exports: false,
+		},
+		{
+			name:    "Successful HTTP /v1/metrics spans export",
+			span:    Span{Type: EventTypeHTTPClient, Method: "GET", Path: "/v1/metrics", RequestStart: 100, End: 200, Status: 200},
+			exports: true,
+		},
+		{
+			name:    "Successful HTTP /prefix/v1/metrics spans export",
+			span:    Span{Type: EventTypeHTTPClient, Method: "GET", Path: "/prefix/v1/metrics", RequestStart: 100, End: 200, Status: 200},
+			exports: true,
+		},
+		{
+			name:    "GRPC server spans don't export",
+			span:    Span{Type: EventTypeGRPC, Method: "GET", Path: "/opentelemetry.proto.collector.metrics.v1.MetricsService/Export", RequestStart: 100, End: 200, Status: 0},
+			exports: false,
+		},
+		{
+			name:    "GRPC /v1/metrics doesn't export",
+			span:    Span{Type: EventTypeGRPCClient, Method: "GET", Path: "/v1/metrics", RequestStart: 100, End: 200, Status: 0},
+			exports: false,
+		},
+		{
+			name:    "GRPC failed spans don't export",
+			span:    Span{Type: EventTypeGRPCClient, Method: "GET", Path: "/opentelemetry.proto.collector.metrics.v1.MetricsService/Export", RequestStart: 100, End: 200, Status: 1},
+			exports: false,
+		},
+		{
+			name:    "Successful GRPC /v1/metrics spans export",
+			span:    Span{Type: EventTypeGRPCClient, Method: "GET", Path: "/opentelemetry.proto.collector.metrics.v1.MetricsService/Export", RequestStart: 100, End: 200, Status: 0},
+			exports: true,
+		},
+		{
+			name: "OTEL_EXPORTER_OTLP_METRICS_PROTOCOL != grpc doesn't export",
+			span: Span{
+				Type: EventTypeGRPCClient, Method: "GET", Path: "*", RequestStart: 100, End: 200, Status: 0,
+				Service: svc.Attrs{EnvVars: map[string]string{"OTEL_EXPORTER_OTLP_METRICS_PROTOCOL": "http/protobuf"}},
+			},
+			exports: false,
+		},
+		{
+			name: "OTEL_EXPORTER_OTLP_PROTOCOL != grpc doesn't export",
+			span: Span{
+				Type: EventTypeGRPCClient, Method: "GET", Path: "*", RequestStart: 100, End: 200, Status: 0,
+				Service: svc.Attrs{EnvVars: map[string]string{"OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf"}},
+			},
+			exports: false,
+		},
+		{
+			name: "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT is not a valid endpoint doesn't export",
+			span: Span{
+				Type: EventTypeGRPCClient, Method: "GET", Path: "*", RequestStart: 100, End: 200, Status: 0,
+				Service: svc.Attrs{EnvVars: map[string]string{"OTEL_EXPORTER_OTLP_METRICS_ENDPOINT": "notanendpoint"}},
+			},
+			exports: false,
+		},
+		{
+			name: "OTEL_EXPORTER_OTLP_ENDPOINT is not a valid endpoint doesn't export",
+			span: Span{
+				Type: EventTypeGRPCClient, Method: "GET", Path: "*", RequestStart: 100, End: 200, Status: 0,
+				Service: svc.Attrs{EnvVars: map[string]string{"OTEL_EXPORTER_OTLP_ENDPOINT": "notanendpoint"}},
+			},
+			exports: false,
+		},
+		{
+			name: "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT != span.HostPort doesn't export",
+			span: Span{
+				Type: EventTypeGRPCClient, HostPort: 8080, Method: "GET", Path: "*", RequestStart: 100, End: 200, Status: 0,
+				Service: svc.Attrs{EnvVars: map[string]string{"OTEL_EXPORTER_OTLP_METRICS_ENDPOINT": "http://localhost:4317"}},
+			},
+			exports: false,
+		},
+		{
+			name: "OTEL_EXPORTER_OTLP_ENDPOINT != span.HostPort doesn't export",
+			span: Span{
+				Type: EventTypeGRPCClient, HostPort: 8080, Method: "GET", Path: "*", RequestStart: 100, End: 200, Status: 0,
+				Service: svc.Attrs{EnvVars: map[string]string{"OTEL_EXPORTER_OTLP_ENDPOINT": "http://localhost:4317"}},
+			},
+			exports: false,
+		},
+		{
+			name: "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT == span.HostPort export",
+			span: Span{
+				Type: EventTypeGRPCClient, HostPort: 9090, Method: "GET", Path: "*", RequestStart: 100, End: 200, Status: 0,
+				Service: svc.Attrs{EnvVars: map[string]string{"OTEL_EXPORTER_OTLP_METRICS_ENDPOINT": "http://localhost:9090"}},
+			},
+			exports: true,
+		},
+		{
+			name: "OTEL_EXPORTER_OTLP_ENDPOINT == span.HostPort export",
+			span: Span{
+				Type: EventTypeGRPCClient, HostPort: 9090, Method: "GET", Path: "*", RequestStart: 100, End: 200, Status: 0,
+				Service: svc.Attrs{EnvVars: map[string]string{"OTEL_EXPORTER_OTLP_ENDPOINT": "http://localhost:9090", "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL": "http/protobuf"}},
+			},
+			exports: true,
+		},
+		{
+			name: fmt.Sprintf("no otel metrics environment sends to %x export", defaultOtlpGRPCPort),
+			span: Span{
+				Type: EventTypeGRPCClient, HostPort: 4317, Method: "GET", Path: "*", RequestStart: 100, End: 200, Status: 0,
+				Service: svc.Attrs{EnvVars: map[string]string{"OTEL_EXPORTER_OTLP_TRACES_PROTOCOL": "http/protobuf"}},
+			},
+			exports: true,
+		},
+		{
+			name:    fmt.Sprintf("no otel environment sends to anything other the %d doesn't export", defaultOtlpGRPCPort),
+			span:    Span{Type: EventTypeGRPCClient, HostPort: 8080, Method: "GET", Path: "*", RequestStart: 100, End: 200, Status: 0},
+			exports: false,
+		},
+		{
+			name: fmt.Sprintf("undecoded path on the default %d port doesn't identify the signal", defaultOtlpGRPCPort),
+			span: Span{
+				Type: EventTypeGRPCClient, HostPort: 4317, Method: "GET", Path: "*", RequestStart: 100, End: 200, Status: 0,
+			},
+			exports: false,
+		},
+		{
+			name: "undecoded path on a generic OTEL_EXPORTER_OTLP_ENDPOINT doesn't identify the signal",
+			span: Span{
+				Type: EventTypeGRPCClient, HostPort: 9090, Method: "GET", Path: "*", RequestStart: 100, End: 200, Status: 0,
+				Service: svc.Attrs{EnvVars: map[string]string{"OTEL_EXPORTER_OTLP_ENDPOINT": "http://localhost:9090"}},
+			},
+			exports: false,
+		},
+		{
+			name: "signal endpoints on distinct ports export",
+			span: Span{
+				Type: EventTypeGRPCClient, HostPort: 4317, Method: "GET", Path: "*", RequestStart: 100, End: 200, Status: 0,
+				Service: svc.Attrs{EnvVars: map[string]string{
+					"OTEL_EXPORTER_OTLP_METRICS_ENDPOINT": "http://localhost:4317",
+					"OTEL_EXPORTER_OTLP_TRACES_ENDPOINT":  "http://localhost:4318",
+				}},
+			},
+			exports: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.exports, tt.span.IsExportMetricsSpan(defaultOtlpGRPCPort))
+			assert.False(t, tt.span.IsExportTracesSpan(defaultOtlpGRPCPort))
+		})
+	}
+
+	// Traces
+	tests = []struct {
+		name    string
+		span    Span
+		exports bool
+	}{
+		{
+			name:    "HTTP server spans don't export",
+			span:    Span{Type: EventTypeHTTP, Method: "GET", Path: "/v1/traces", RequestStart: 100, End: 200, Status: 200},
+			exports: false,
+		},
+		{
+			name:    "/foo doesn't export",
+			span:    Span{Type: EventTypeHTTPClient, Method: "GET", Path: "/foo", RequestStart: 100, End: 200, Status: 200},
+			exports: false,
+		},
+		{
+			name:    "HTTP failed spans don't export",
+			span:    Span{Type: EventTypeHTTPClient, Method: "GET", Path: "/v1/traces", RequestStart: 100, End: 200, Status: 401},
+			exports: false,
+		},
+		{
+			name:    "Successful HTTP /v1/traces spans export",
+			span:    Span{Type: EventTypeHTTPClient, Method: "GET", Path: "/v1/traces", RequestStart: 100, End: 200, Status: 200},
+			exports: true,
+		},
+		{
+			name:    "GRPC server spans don't export",
+			span:    Span{Type: EventTypeGRPC, Method: "GET", Path: "/opentelemetry.proto.collector.trace.v1.TraceService/Export", RequestStart: 100, End: 200, Status: 0},
+			exports: false,
+		},
+		{
+			name:    "GRPC /v1/traces doesn't export",
+			span:    Span{Type: EventTypeGRPCClient, Method: "GET", Path: "/v1/traces", RequestStart: 100, End: 200, Status: 0},
+			exports: false,
+		},
+		{
+			name:    "GRPC failed spans don't export",
+			span:    Span{Type: EventTypeGRPCClient, Method: "GET", Path: "/opentelemetry.proto.collector.trace.v1.TraceService/Export", RequestStart: 100, End: 200, Status: 1},
+			exports: false,
+		},
+		{
+			name:    "Successful GRPC /v1/traces spans export",
+			span:    Span{Type: EventTypeGRPCClient, Method: "GET", Path: "/opentelemetry.proto.collector.trace.v1.TraceService/Export", RequestStart: 100, End: 200, Status: 0},
+			exports: true,
+		},
+		{
+			name: "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL != grpc doesn't export",
+			span: Span{
+				Type: EventTypeGRPCClient, Method: "GET", Path: "*", RequestStart: 100, End: 200, Status: 0,
+				Service: svc.Attrs{EnvVars: map[string]string{"OTEL_EXPORTER_OTLP_TRACES_PROTOCOL": "http/protobuf"}},
+			},
+			exports: false,
+		},
+		{
+			name: "OTEL_EXPORTER_OTLP_PROTOCOL != grpc doesn't export",
+			span: Span{
+				Type: EventTypeGRPCClient, Method: "GET", Path: "*", RequestStart: 100, End: 200, Status: 0,
+				Service: svc.Attrs{EnvVars: map[string]string{"OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf"}},
+			},
+			exports: false,
+		},
+		{
+			name: "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT is not a valid endpoint doesn't export",
+			span: Span{
+				Type: EventTypeGRPCClient, Method: "GET", Path: "*", RequestStart: 100, End: 200, Status: 0,
+				Service: svc.Attrs{EnvVars: map[string]string{"OTEL_EXPORTER_OTLP_TRACES_ENDPOINT": "notanendpoint"}},
+			},
+			exports: false,
+		},
+		{
+			name: "OTEL_EXPORTER_OTLP_ENDPOINT is not a valid endpoint doesn't export",
+			span: Span{
+				Type: EventTypeGRPCClient, Method: "GET", Path: "*", RequestStart: 100, End: 200, Status: 0,
+				Service: svc.Attrs{EnvVars: map[string]string{"OTEL_EXPORTER_OTLP_ENDPOINT": "notanendpoint"}},
+			},
+			exports: false,
+		},
+		{
+			name: "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT != span.HostPort doesn't export",
+			span: Span{
+				Type: EventTypeGRPCClient, HostPort: 8080, Method: "GET", Path: "*", RequestStart: 100, End: 200, Status: 0,
+				Service: svc.Attrs{EnvVars: map[string]string{"OTEL_EXPORTER_OTLP_METRICS_ENDPOINT": "http://localhost:4317"}},
+			},
+			exports: false,
+		},
+		{
+			name: "OTEL_EXPORTER_OTLP_ENDPOINT != span.HostPort doesn't export",
+			span: Span{
+				Type: EventTypeGRPCClient, HostPort: 8080, Method: "GET", Path: "*", RequestStart: 100, End: 200, Status: 0,
+				Service: svc.Attrs{EnvVars: map[string]string{"OTEL_EXPORTER_OTLP_ENDPOINT": "http://localhost:4317"}},
+			},
+			exports: false,
+		},
+		{
+			name: "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT == span.HostPort export",
+			span: Span{
+				Type: EventTypeGRPCClient, HostPort: 9090, Method: "GET", Path: "*", RequestStart: 100, End: 200, Status: 0,
+				Service: svc.Attrs{EnvVars: map[string]string{"OTEL_EXPORTER_OTLP_TRACES_ENDPOINT": "http://localhost:9090"}},
+			},
+			exports: true,
+		},
+		{
+			name: "OTEL_EXPORTER_OTLP_ENDPOINT == span.HostPort export",
+			span: Span{
+				Type: EventTypeGRPCClient, HostPort: 9090, Method: "GET", Path: "*", RequestStart: 100, End: 200, Status: 0,
+				Service: svc.Attrs{EnvVars: map[string]string{"OTEL_EXPORTER_OTLP_ENDPOINT": "http://localhost:9090", "OTEL_EXPORTER_OTLP_METRICS_PROTOCOL": "http/protobuf"}},
+			},
+			exports: true,
+		},
+		{
+			name: fmt.Sprintf("no otel traces environment sends to %d export", defaultOtlpGRPCPort),
+			span: Span{
+				Type: EventTypeGRPCClient, HostPort: 4317, Method: "GET", Path: "*", RequestStart: 100, End: 200, Status: 0,
+				Service: svc.Attrs{EnvVars: map[string]string{"OTEL_EXPORTER_OTLP_METRICS_PROTOCOL": "http/protobuf"}},
+			},
+			exports: true,
+		},
+		{
+			name:    fmt.Sprintf("no otel environment sends to anything other the %d doesn't export", defaultOtlpGRPCPort),
+			span:    Span{Type: EventTypeGRPCClient, HostPort: 8080, Method: "GET", Path: "*", RequestStart: 100, End: 200, Status: 0},
+			exports: false,
+		},
+		{
+			name: fmt.Sprintf("undecoded path on the default %d port doesn't identify the signal", defaultOtlpGRPCPort),
+			span: Span{
+				Type: EventTypeGRPCClient, HostPort: 4317, Method: "GET", Path: "*", RequestStart: 100, End: 200, Status: 0,
+			},
+			exports: false,
+		},
+		{
+			name: "undecoded path on a generic OTEL_EXPORTER_OTLP_ENDPOINT doesn't identify the signal",
+			span: Span{
+				Type: EventTypeGRPCClient, HostPort: 9090, Method: "GET", Path: "*", RequestStart: 100, End: 200, Status: 0,
+				Service: svc.Attrs{EnvVars: map[string]string{"OTEL_EXPORTER_OTLP_ENDPOINT": "http://localhost:9090"}},
+			},
+			exports: false,
+		},
+		{
+			name: "signal endpoints on distinct ports export",
+			span: Span{
+				Type: EventTypeGRPCClient, HostPort: 4318, Method: "GET", Path: "*", RequestStart: 100, End: 200, Status: 0,
+				Service: svc.Attrs{EnvVars: map[string]string{
+					"OTEL_EXPORTER_OTLP_METRICS_ENDPOINT": "http://localhost:4317",
+					"OTEL_EXPORTER_OTLP_TRACES_ENDPOINT":  "http://localhost:4318",
+				}},
+			},
+			exports: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.exports, tt.span.IsExportTracesSpan(defaultOtlpGRPCPort))
+			assert.False(t, tt.span.IsExportMetricsSpan(defaultOtlpGRPCPort))
+		})
+	}
+}
+
+func TestSelfReferencingSpan(t *testing.T) {
+	// Metrics
+	tests := []struct {
+		name    string
+		span    Span
+		selfref bool
+	}{
+		{
+			name:    "Not a self-reference",
+			span:    Span{Type: EventTypeHTTP, Method: "GET", Path: "/v1/metrics", RequestStart: 100, End: 200, Status: 200, Host: "10.10.10.10", Peer: "10.11.10.11", OtherNamespace: "", Service: svc.Attrs{UID: svc.UID{Namespace: ""}}},
+			selfref: false,
+		},
+		{
+			name:    "Not a self-reference, same IP, different namespace",
+			span:    Span{Type: EventTypeHTTP, Method: "GET", Path: "/v1/metrics", RequestStart: 100, End: 200, Status: 200, Host: "10.10.10.10", Peer: "10.10.10.10", OtherNamespace: "B", Service: svc.Attrs{UID: svc.UID{Namespace: "A"}}},
+			selfref: false,
+		},
+		{
+			name:    "Same IP different namespace, but the other namespace is empty",
+			span:    Span{Type: EventTypeHTTP, Method: "GET", Path: "/v1/metrics", RequestStart: 100, End: 200, Status: 200, Host: "10.10.10.10", Peer: "10.10.10.10", OtherNamespace: "", Service: svc.Attrs{UID: svc.UID{Namespace: "A"}}},
+			selfref: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.selfref, tt.span.IsSelfReferenceSpan())
+		})
+	}
+}
+
+func TestHostPeerClientServer(t *testing.T) {
+	// Metrics
+	tests := []struct {
+		name   string
+		span   Span
+		client string
+		server string
+	}{
+		{
+			name:   "Same namespaces HTTP",
+			span:   Span{Type: EventTypeHTTP, PeerName: "client", HostName: "server", OtherNamespace: "same", Service: svc.Attrs{UID: svc.UID{Namespace: "same"}}},
+			client: "client",
+			server: "server",
+		},
+		{
+			name:   "Client in different namespace",
+			span:   Span{Type: EventTypeHTTP, PeerName: "client", HostName: "server", OtherNamespace: "far", Service: svc.Attrs{UID: svc.UID{Namespace: "same"}}},
+			client: "client.far",
+			server: "server",
+		},
+		{
+			name:   "Client in different namespace",
+			span:   Span{Type: EventTypeHTTP, Peer: "1.1.1.1", HostName: "server", OtherNamespace: "far", Service: svc.Attrs{UID: svc.UID{Namespace: "same"}}},
+			client: "1.1.1.1",
+			server: "server",
+		},
+		{
+			name:   "Same namespaces for HTTP client",
+			span:   Span{Type: EventTypeHTTPClient, PeerName: "client", HostName: "server", OtherNamespace: "same", Service: svc.Attrs{UID: svc.UID{Namespace: "same"}}},
+			client: "client",
+			server: "server",
+		},
+		{
+			name:   "Server in different namespace ",
+			span:   Span{Type: EventTypeHTTPClient, PeerName: "client", HostName: "server", OtherNamespace: "far", Service: svc.Attrs{UID: svc.UID{Namespace: "same"}}},
+			client: "client",
+			server: "server.far",
+		},
+		{
+			name:   "Server in different namespace ",
+			span:   Span{Type: EventTypeHTTPClient, PeerName: "client", Host: "2.2.2.2", OtherNamespace: "far", Service: svc.Attrs{UID: svc.UID{Namespace: "same"}}},
+			client: "client",
+			server: "2.2.2.2",
+		},
+		{
+			name:   "Same namespaces GRPC",
+			span:   Span{Type: EventTypeGRPC, PeerName: "client", HostName: "server", OtherNamespace: "same", Service: svc.Attrs{UID: svc.UID{Namespace: "same"}}},
+			client: "client",
+			server: "server",
+		},
+		{
+			name:   "Client in different namespace GRPC",
+			span:   Span{Type: EventTypeGRPC, PeerName: "client", HostName: "server", OtherNamespace: "far", Service: svc.Attrs{UID: svc.UID{Namespace: "same"}}},
+			client: "client.far",
+			server: "server",
+		},
+		{
+			name:   "Same namespaces for GRPC client",
+			span:   Span{Type: EventTypeGRPCClient, PeerName: "client", HostName: "server", OtherNamespace: "same", Service: svc.Attrs{UID: svc.UID{Namespace: "same"}}},
+			client: "client",
+			server: "server",
+		},
+		{
+			name:   "Server in different namespace GRPC",
+			span:   Span{Type: EventTypeGRPCClient, PeerName: "client", HostName: "server", OtherNamespace: "far", Service: svc.Attrs{UID: svc.UID{Namespace: "same"}}},
+			client: "client",
+			server: "server.far",
+		},
+		{
+			name:   "Same namespaces for SQL client",
+			span:   Span{Type: EventTypeSQLClient, PeerName: "client", HostName: "server", OtherNamespace: "same", Service: svc.Attrs{UID: svc.UID{Namespace: "same"}}},
+			client: "client",
+			server: "server",
+		},
+		{
+			name:   "Server in different namespace SQL",
+			span:   Span{Type: EventTypeSQLClient, PeerName: "client", HostName: "server", OtherNamespace: "far", Service: svc.Attrs{UID: svc.UID{Namespace: "same"}}},
+			client: "client",
+			server: "server.far",
+		},
+		{
+			name:   "Same namespaces for Redis client",
+			span:   Span{Type: EventTypeRedisClient, PeerName: "client", HostName: "server", OtherNamespace: "same", Service: svc.Attrs{UID: svc.UID{Namespace: "same"}}},
+			client: "client",
+			server: "server",
+		},
+		{
+			name:   "Server in different namespace Redis",
+			span:   Span{Type: EventTypeRedisClient, PeerName: "client", HostName: "server", OtherNamespace: "far", Service: svc.Attrs{UID: svc.UID{Namespace: "same"}}},
+			client: "client",
+			server: "server.far",
+		},
+		{
+			name:   "Client in different namespace Redis",
+			span:   Span{Type: EventTypeRedisServer, PeerName: "client", HostName: "server", OtherNamespace: "far", Service: svc.Attrs{UID: svc.UID{Namespace: "same"}}},
+			client: "client.far",
+			server: "server",
+		},
+		{
+			name:   "Same namespaces for Mongo client",
+			span:   Span{Type: EventTypeMongoClient, PeerName: "client", HostName: "server", OtherNamespace: "same", Service: svc.Attrs{UID: svc.UID{Namespace: "same"}}},
+			client: "client",
+			server: "server",
+		},
+		{
+			name:   "Same namespaces for NATS client",
+			span:   Span{Type: EventTypeNATSClient, PeerName: "client", HostName: "server", OtherNamespace: "same", Service: svc.Attrs{UID: svc.UID{Namespace: "same"}}},
+			client: "client",
+			server: "server",
+		},
+		{
+			name:   "Server in different namespace NATS",
+			span:   Span{Type: EventTypeNATSClient, PeerName: "client", HostName: "server", OtherNamespace: "far", Service: svc.Attrs{UID: svc.UID{Namespace: "same"}}},
+			client: "client",
+			server: "server.far",
+		},
+		{
+			name:   "Server in different namespace Mongo",
+			span:   Span{Type: EventTypeMongoClient, PeerName: "client", HostName: "server", OtherNamespace: "far", Service: svc.Attrs{UID: svc.UID{Namespace: "same"}}},
+			client: "client",
+			server: "server.far",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.client, PeerAsClient(&tt.span))
+			assert.Equal(t, tt.server, HostAsServer(&tt.span))
+		})
+	}
+}
+
+func TestRequestBodyLength(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		s        Span
+		expected int64
+	}{
+		{
+			name: "With ContentLength less than zero",
+			s: Span{
+				ContentLength: -1,
+			},
+			expected: 0,
+		},
+		{
+			name: "With ContentLength equal to zero",
+			s: Span{
+				ContentLength: 0,
+			},
+			expected: 0,
+		},
+		{
+			name: "With ContentLength greater than zero",
+			s: Span{
+				ContentLength: 128,
+			},
+			expected: 128,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			assert.Equal(t, tt.expected, tt.s.RequestBodyLength())
+		})
+	}
+}
+
+func TestResponseBodyLength(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		s        Span
+		expected int64
+	}{
+		{
+			name: "With ResponseLength less than zero",
+			s: Span{
+				ResponseLength: -1,
+			},
+			expected: 0,
+		},
+		{
+			name: "With ResponseLength equal to zero",
+			s: Span{
+				ResponseLength: 0,
+			},
+			expected: 0,
+		},
+		{
+			name: "With ResponseLength greater than zero",
+			s: Span{
+				ResponseLength: 128,
+			},
+			expected: 128,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			assert.Equal(t, tt.expected, tt.s.ResponseBodyLength())
+		})
+	}
+}
+
+func TestIsHTTPSpan(t *testing.T) {
+	spanHTTP := &Span{Type: EventTypeHTTP}
+	spanHTTPClient := &Span{Type: EventTypeHTTPClient}
+	spanGRPC := &Span{Type: EventTypeGRPC}
+	spanOther := &Span{Type: EventTypeSQLClient}
+
+	assert.True(t, spanHTTP.IsHTTPSpan(), "EventTypeHTTP should be HTTP span")
+	assert.True(t, spanHTTPClient.IsHTTPSpan(), "EventTypeHTTPClient should be HTTP span")
+	assert.False(t, spanGRPC.IsHTTPSpan(), "EventTypeGRPC should not be HTTP span")
+	assert.False(t, spanOther.IsHTTPSpan(), "Other types should not be HTTP span")
+}
+
+func TestHTTPSpanStatusCode_OpenAI(t *testing.T) {
+	tests := []struct {
+		name     string
+		span     *Span
+		expected string
+	}{
+		{
+			name: "non-OpenAI 2xx → unset",
+			span: &Span{
+				Type:   EventTypeHTTPClient,
+				Status: 200,
+			},
+			expected: StatusCodeUnset,
+		},
+		{
+			name: "OpenAI 2xx, no error field → unset",
+			span: &Span{
+				Type:    EventTypeHTTPClient,
+				SubType: HTTPSubtypeOpenAI,
+				Status:  200,
+				GenAI: &GenAI{
+					OpenAI: &VendorOpenAI{
+						OperationName: "response",
+						ResponseModel: "gpt-5-mini-2025-08-07",
+					},
+				},
+			},
+			expected: StatusCodeUnset,
+		},
+		{
+			name: "OpenAI 2xx, error.type set → error",
+			span: &Span{
+				Type:    EventTypeHTTPClient,
+				SubType: HTTPSubtypeOpenAI,
+				Status:  200,
+				GenAI: &GenAI{
+					OpenAI: &VendorOpenAI{
+						Error: OpenAIError{
+							Type:    "insufficient_quota",
+							Message: "You exceeded your current quota.",
+						},
+					},
+				},
+			},
+			expected: StatusCodeError,
+		},
+		{
+			name: "OpenAI 2xx, OpenAI is nil → unset (nil guard)",
+			span: &Span{
+				Type:    EventTypeHTTPClient,
+				SubType: HTTPSubtypeOpenAI,
+				Status:  200,
+				GenAI:   nil,
+			},
+			expected: StatusCodeUnset,
+		},
+		{
+			name: "OpenAI 4xx → error (HTTP status wins regardless)",
+			span: &Span{
+				Type:    EventTypeHTTPClient,
+				SubType: HTTPSubtypeOpenAI,
+				Status:  429,
+				GenAI: &GenAI{
+					OpenAI: &VendorOpenAI{
+						Error: OpenAIError{
+							Type:    "insufficient_quota",
+							Message: "You exceeded your current quota.",
+						},
+					},
+				},
+			},
+			expected: StatusCodeError,
+		},
+		{
+			name: "OpenAI status 0 → error (missing status)",
+			span: &Span{
+				Type:    EventTypeHTTPClient,
+				SubType: HTTPSubtypeOpenAI,
+				Status:  0,
+				GenAI:   &GenAI{OpenAI: &VendorOpenAI{}},
+			},
+			expected: StatusCodeError,
+		},
+		{
+			name: "Qwen 2xx, error.type set → error",
+			span: &Span{
+				Type:    EventTypeHTTPClient,
+				SubType: HTTPSubtypeQwen,
+				Status:  200,
+				GenAI: &GenAI{
+					Qwen: &VendorOpenAI{
+						Error: OpenAIError{
+							Type:    "insufficient_quota",
+							Message: "Quota exceeded",
+						},
+					},
+				},
+			},
+			expected: StatusCodeError,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.expected, HTTPSpanStatusCode(tt.span))
+		})
+	}
+}
+
+// Test GenAIInputTokens
+func TestSpan_GenAIInputTokenCount(t *testing.T) {
+	t.Run("GenAI is nil", func(t *testing.T) {
+		span := &Span{GenAI: nil}
+		result := reportedValue(span.GenAIInputTokenCount())
+		assert.Equal(t, 0, result)
+	})
+
+	t.Run("OpenAI present", func(t *testing.T) {
+		span := &Span{
+			GenAI: &GenAI{
+				OpenAI: &VendorOpenAI{
+					Usage: OpenAIUsage{
+						InputTokens: NewTokenCount(100),
+					},
+				},
+			},
+		}
+		result := reportedValue(span.GenAIInputTokenCount())
+		assert.Equal(t, 100, result)
+	})
+
+	t.Run("Anthropic present", func(t *testing.T) {
+		span := &Span{
+			GenAI: &GenAI{
+				Anthropic: &VendorAnthropic{
+					Output: AnthropicResponse{
+						Usage: AnthropicUsage{
+							InputTokens: NewTokenCount(200),
+						},
+					},
+				},
+			},
+		}
+		result := reportedValue(span.GenAIInputTokenCount())
+		assert.Equal(t, 200, result)
+	})
+
+	t.Run("Anthropic with cache tokens", func(t *testing.T) {
+		// Per Anthropic semconv: input_tokens excludes cached tokens, so the
+		// reported total must include cache_read and cache_creation.
+		span := &Span{
+			GenAI: &GenAI{
+				Anthropic: &VendorAnthropic{
+					Output: AnthropicResponse{
+						Usage: AnthropicUsage{
+							InputTokens:              NewTokenCount(200),
+							CacheReadInputTokens:     NewTokenCount(50),
+							CacheCreationInputTokens: NewTokenCount(30),
+						},
+					},
+				},
+			},
+		}
+		result := reportedValue(span.GenAIInputTokenCount())
+		assert.Equal(t, 280, result)
+	})
+
+	t.Run("Gemini present", func(t *testing.T) {
+		span := &Span{
+			GenAI: &GenAI{
+				Gemini: &VendorGemini{
+					Output: GeminiResponse{
+						UsageMetadata: GeminiUsage{
+							PromptTokenCount: NewTokenCount(300),
+						},
+					},
+				},
+			},
+		}
+		result := reportedValue(span.GenAIInputTokenCount())
+		assert.Equal(t, 300, result)
+	})
+
+	t.Run("Qwen present", func(t *testing.T) {
+		span := &Span{
+			GenAI: &GenAI{
+				Qwen: &VendorOpenAI{
+					Usage: OpenAIUsage{
+						InputTokens: NewTokenCount(333),
+					},
+				},
+			},
+		}
+		result := reportedValue(span.GenAIInputTokenCount())
+		assert.Equal(t, 333, result)
+	})
+
+	t.Run("Bedrock present", func(t *testing.T) {
+		span := &Span{
+			GenAI: &GenAI{
+				Bedrock: &VendorBedrock{
+					Output: BedrockResponse{
+						InputTokens: NewTokenCount(25),
+					},
+				},
+			},
+		}
+		result := reportedValue(span.GenAIInputTokenCount())
+		assert.Equal(t, 25, result)
+	})
+
+	t.Run("Rerank present", func(t *testing.T) {
+		span := &Span{
+			GenAI: &GenAI{
+				Rerank: &VendorRerank{
+					Output: RerankResponse{
+						Usage: RerankUsage{TotalTokens: NewTokenCount(411)},
+					},
+				},
+			},
+		}
+		result := reportedValue(span.GenAIInputTokenCount())
+		assert.Equal(t, 411, result)
+	})
+}
+
+// Test GenAIOutputTokens
+func TestSpan_GenAIOutputTokenCount(t *testing.T) {
+	t.Run("GenAI is nil", func(t *testing.T) {
+		span := &Span{GenAI: nil}
+		result := reportedValue(span.GenAIOutputTokenCount())
+		assert.Equal(t, 0, result)
+	})
+
+	t.Run("OpenAI present", func(t *testing.T) {
+		span := &Span{
+			GenAI: &GenAI{
+				OpenAI: &VendorOpenAI{
+					Usage: OpenAIUsage{
+						OutputTokens: NewTokenCount(150),
+					},
+				},
+			},
+		}
+		result := reportedValue(span.GenAIOutputTokenCount())
+		assert.Equal(t, 150, result)
+	})
+
+	t.Run("OpenAI present, no usage", func(t *testing.T) {
+		span := &Span{
+			GenAI: &GenAI{
+				OpenAI: &VendorOpenAI{},
+			},
+		}
+		result := reportedValue(span.GenAIOutputTokenCount())
+		assert.Equal(t, 0, result)
+	})
+
+	t.Run("Anthropic present", func(t *testing.T) {
+		span := &Span{
+			GenAI: &GenAI{
+				Anthropic: &VendorAnthropic{
+					Output: AnthropicResponse{
+						Usage: AnthropicUsage{
+							OutputTokens: NewTokenCount(250),
+						},
+					},
+				},
+			},
+		}
+		result := reportedValue(span.GenAIOutputTokenCount())
+		assert.Equal(t, 250, result)
+	})
+
+	t.Run("Anthropic present no usage", func(t *testing.T) {
+		span := &Span{
+			GenAI: &GenAI{
+				Anthropic: &VendorAnthropic{},
+			},
+		}
+		result := reportedValue(span.GenAIOutputTokenCount())
+		assert.Equal(t, 0, result)
+	})
+
+	t.Run("Gemini present", func(t *testing.T) {
+		span := &Span{
+			GenAI: &GenAI{
+				Gemini: &VendorGemini{
+					Output: GeminiResponse{
+						UsageMetadata: GeminiUsage{
+							CandidatesTokenCount: NewTokenCount(400),
+						},
+					},
+				},
+			},
+		}
+		result := reportedValue(span.GenAIOutputTokenCount())
+		assert.Equal(t, 400, result)
+	})
+
+	t.Run("Gemini present no usage", func(t *testing.T) {
+		span := &Span{
+			GenAI: &GenAI{
+				Gemini: &VendorGemini{},
+			},
+		}
+		result := reportedValue(span.GenAIOutputTokenCount())
+		assert.Equal(t, 0, result)
+	})
+
+	t.Run("Qwen present", func(t *testing.T) {
+		span := &Span{
+			GenAI: &GenAI{
+				Qwen: &VendorOpenAI{
+					Usage: OpenAIUsage{
+						OutputTokens: NewTokenCount(444),
+					},
+				},
+			},
+		}
+		result := reportedValue(span.GenAIOutputTokenCount())
+		assert.Equal(t, 444, result)
+	})
+
+	t.Run("Bedrock present", func(t *testing.T) {
+		span := &Span{
+			GenAI: &GenAI{
+				Bedrock: &VendorBedrock{
+					Output: BedrockResponse{
+						OutputTokens: NewTokenCount(18),
+					},
+				},
+			},
+		}
+		result := reportedValue(span.GenAIOutputTokenCount())
+		assert.Equal(t, 18, result)
+	})
+
+	t.Run("Bedrock present no usage", func(t *testing.T) {
+		span := &Span{
+			GenAI: &GenAI{
+				Bedrock: &VendorBedrock{},
+			},
+		}
+		result := reportedValue(span.GenAIOutputTokenCount())
+		assert.Equal(t, 0, result)
+	})
+
+	t.Run("Rerank present returns zero", func(t *testing.T) {
+		// Rerank has no generated output, so output tokens should always be 0.
+		span := &Span{
+			GenAI: &GenAI{
+				Rerank: &VendorRerank{
+					Output: RerankResponse{
+						Usage: RerankUsage{TotalTokens: NewTokenCount(411)},
+					},
+				},
+			},
+		}
+		result := reportedValue(span.GenAIOutputTokenCount())
+		assert.Equal(t, 0, result)
+	})
+}
+
+// Test GenAIOperationName
+func TestSpan_GenAIOperationName(t *testing.T) {
+	t.Run("nil GenAI", func(t *testing.T) {
+		span := &Span{GenAI: nil}
+		result := span.GenAIOperationName()
+		assert.Empty(t, result)
+	})
+
+	t.Run("OpenAI present", func(t *testing.T) {
+		span := &Span{
+			GenAI: &GenAI{
+				OpenAI: &VendorOpenAI{
+					OperationName: "chat.completion",
+				},
+			},
+		}
+		result := span.GenAIOperationName()
+		assert.Equal(t, "chat.completion", result)
+	})
+
+	t.Run("Anthropic present", func(t *testing.T) {
+		span := &Span{
+			GenAI: &GenAI{
+				Anthropic: &VendorAnthropic{
+					Output: AnthropicResponse{
+						Type: "message",
+					},
+				},
+			},
+		}
+		result := span.GenAIOperationName()
+		assert.Equal(t, "message", result)
+	})
+
+	t.Run("Gemini present", func(t *testing.T) {
+		span := &Span{
+			GenAI: &GenAI{
+				Gemini: &VendorGemini{},
+			},
+		}
+		result := span.GenAIOperationName()
+		assert.Equal(t, "generate_content", result)
+	})
+
+	t.Run("Qwen present", func(t *testing.T) {
+		span := &Span{
+			GenAI: &GenAI{
+				Qwen: &VendorOpenAI{
+					OperationName: "chat.completion",
+				},
+			},
+		}
+		result := span.GenAIOperationName()
+		assert.Equal(t, "chat.completion", result)
+	})
+
+	t.Run("Bedrock present", func(t *testing.T) {
+		span := &Span{
+			GenAI: &GenAI{
+				Bedrock: &VendorBedrock{},
+			},
+		}
+		result := span.GenAIOperationName()
+		assert.Equal(t, "invoke_model", result)
+	})
+}
+
+// Test GenAIProviderName
+func TestSpan_GenAIProviderName(t *testing.T) {
+	t.Run("nil GenAI", func(t *testing.T) {
+		span := &Span{GenAI: nil}
+		result := span.GenAIProviderName()
+		assert.Empty(t, result)
+	})
+
+	t.Run("OpenAI present", func(t *testing.T) {
+		span := &Span{
+			GenAI: &GenAI{
+				OpenAI: &VendorOpenAI{},
+			},
+		}
+		result := span.GenAIProviderName()
+		assert.Equal(t, "openai", result) // Assuming semconv.GenAIProviderNameOpenAI.Value.AsString() returns "openai"
+	})
+
+	t.Run("Anthropic present", func(t *testing.T) {
+		span := &Span{
+			GenAI: &GenAI{
+				Anthropic: &VendorAnthropic{},
+			},
+		}
+		result := span.GenAIProviderName()
+		assert.Equal(t, "anthropic", result) // Assuming semconv.GenAIProviderNameAnthropic.Value.AsString() returns "anthropic"
+	})
+
+	t.Run("Gemini present", func(t *testing.T) {
+		span := &Span{
+			GenAI: &GenAI{
+				Gemini: &VendorGemini{},
+			},
+		}
+		result := span.GenAIProviderName()
+		assert.Equal(t, "gcp.gemini", result)
+	})
+
+	t.Run("Qwen present", func(t *testing.T) {
+		span := &Span{
+			GenAI: &GenAI{
+				Qwen: &VendorOpenAI{},
+			},
+		}
+		result := span.GenAIProviderName()
+		assert.Equal(t, "qwen", result)
+	})
+
+	t.Run("Bedrock present", func(t *testing.T) {
+		span := &Span{
+			GenAI: &GenAI{
+				Bedrock: &VendorBedrock{},
+			},
+		}
+		result := span.GenAIProviderName()
+		assert.Equal(t, "aws.bedrock", result)
+	})
+}
+
+// Test GenAIRequestModel
+func TestSpan_GenAIRequestModel(t *testing.T) {
+	t.Run("nil GenAI", func(t *testing.T) {
+		span := &Span{GenAI: nil}
+		result := span.GenAIRequestModel()
+		assert.Empty(t, result)
+	})
+
+	t.Run("OpenAI present", func(t *testing.T) {
+		span := &Span{
+			GenAI: &GenAI{
+				OpenAI: &VendorOpenAI{
+					Request: OpenAIInput{
+						Model: "gpt-3.5-turbo",
+					},
+				},
+			},
+		}
+		result := span.GenAIRequestModel()
+		assert.Equal(t, "gpt-3.5-turbo", result)
+	})
+
+	t.Run("Anthropic present", func(t *testing.T) {
+		span := &Span{
+			GenAI: &GenAI{
+				Anthropic: &VendorAnthropic{
+					Input: AnthropicRequest{
+						Model: "claude-2",
+					},
+				},
+			},
+		}
+		result := span.GenAIRequestModel()
+		assert.Equal(t, "claude-2", result)
+	})
+
+	t.Run("Gemini present", func(t *testing.T) {
+		span := &Span{
+			GenAI: &GenAI{
+				Gemini: &VendorGemini{
+					Model: "gemini-2.0-flash",
+				},
+			},
+		}
+		result := span.GenAIRequestModel()
+		assert.Equal(t, "gemini-2.0-flash", result)
+	})
+
+	t.Run("Qwen present", func(t *testing.T) {
+		span := &Span{
+			GenAI: &GenAI{
+				Qwen: &VendorOpenAI{
+					Request: OpenAIInput{
+						Model: "qwen-plus",
+					},
+				},
+			},
+		}
+		result := span.GenAIRequestModel()
+		assert.Equal(t, "qwen-plus", result)
+	})
+
+	t.Run("Bedrock present", func(t *testing.T) {
+		span := &Span{
+			GenAI: &GenAI{
+				Bedrock: &VendorBedrock{
+					Model: "anthropic.claude-3-5-sonnet-20241022-v1:0",
+				},
+			},
+		}
+		result := span.GenAIRequestModel()
+		assert.Equal(t, "anthropic.claude-3-5-sonnet-20241022-v1:0", result)
+	})
+}
+
+// Test GenAIResponseModel
+func TestSpan_GenAIResponseModel(t *testing.T) {
+	t.Run("nil GenAI", func(t *testing.T) {
+		span := &Span{GenAI: nil}
+		result := span.GenAIResponseModel()
+		assert.Empty(t, result)
+	})
+
+	t.Run("OpenAI present", func(t *testing.T) {
+		span := &Span{
+			GenAI: &GenAI{
+				OpenAI: &VendorOpenAI{
+					ResponseModel: "gpt-3.5-turbo-0125",
+				},
+			},
+		}
+		result := span.GenAIResponseModel()
+		assert.Equal(t, "gpt-3.5-turbo-0125", result)
+	})
+
+	t.Run("Anthropic present", func(t *testing.T) {
+		span := &Span{
+			GenAI: &GenAI{
+				Anthropic: &VendorAnthropic{
+					Output: AnthropicResponse{
+						Model: "claude-2.1",
+					},
+				},
+			},
+		}
+		result := span.GenAIResponseModel()
+		assert.Equal(t, "claude-2.1", result)
+	})
+
+	t.Run("Gemini present with model version", func(t *testing.T) {
+		span := &Span{
+			GenAI: &GenAI{
+				Gemini: &VendorGemini{
+					Model: "gemini-2.0-flash",
+					Output: GeminiResponse{
+						ModelVersion: "gemini-2.0-flash-001",
+					},
+				},
+			},
+		}
+		result := span.GenAIResponseModel()
+		assert.Equal(t, "gemini-2.0-flash-001", result)
+	})
+
+	t.Run("Gemini present without model version", func(t *testing.T) {
+		span := &Span{
+			GenAI: &GenAI{
+				Gemini: &VendorGemini{
+					Model: "gemini-2.0-flash",
+				},
+			},
+		}
+		result := span.GenAIResponseModel()
+		assert.Equal(t, "gemini-2.0-flash", result)
+	})
+
+	t.Run("Qwen present with response model", func(t *testing.T) {
+		span := &Span{
+			GenAI: &GenAI{
+				Qwen: &VendorOpenAI{
+					ResponseModel: "qwen-plus-2026-01-01",
+					Request: OpenAIInput{
+						Model: "qwen-plus",
+					},
+				},
+			},
+		}
+		result := span.GenAIResponseModel()
+		assert.Equal(t, "qwen-plus-2026-01-01", result)
+	})
+
+	t.Run("Qwen present without response model", func(t *testing.T) {
+		span := &Span{
+			GenAI: &GenAI{
+				Qwen: &VendorOpenAI{
+					Request: OpenAIInput{
+						Model: "qwen-plus",
+					},
+				},
+			},
+		}
+		result := span.GenAIResponseModel()
+		assert.Equal(t, "qwen-plus", result)
+	})
+
+	t.Run("Bedrock present", func(t *testing.T) {
+		span := &Span{
+			GenAI: &GenAI{
+				Bedrock: &VendorBedrock{
+					Model: "anthropic.claude-3-5-sonnet-20241022-v1:0",
+				},
+			},
+		}
+		result := span.GenAIResponseModel()
+		assert.Equal(t, "anthropic.claude-3-5-sonnet-20241022-v1:0", result)
+	})
+}
+
+func TestSpan_GenAIProviderName_OpenAICompatible(t *testing.T) {
+	t.Run("configured provider name", func(t *testing.T) {
+		span := &Span{
+			GenAI: &GenAI{
+				OpenAICompatible: &VendorOpenAI{
+					ProviderName: "litellm",
+				},
+			},
+		}
+		result := span.GenAIProviderName()
+		assert.Equal(t, "litellm", result)
+	})
+
+	t.Run("empty provider fallback to custom", func(t *testing.T) {
+		span := &Span{
+			GenAI: &GenAI{
+				OpenAICompatible: &VendorOpenAI{},
+			},
+		}
+		result := span.GenAIProviderName()
+		assert.Equal(t, "custom", result)
+	})
+}
+
+func TestSpan_GenAIOperationName_OpenAICompatible(t *testing.T) {
+	tests := []struct {
+		name   string
+		opName string
+		want   string
+	}{
+		{name: "chat", opName: ChatOperationName, want: ChatOperationName},
+		{name: "text_completion", opName: CompletionOperationName, want: CompletionOperationName},
+		{name: "embeddings", opName: EmbeddingOperationName, want: EmbeddingOperationName},
+		{name: "empty", opName: "", want: ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			span := &Span{
+				GenAI: &GenAI{
+					OpenAICompatible: &VendorOpenAI{
+						OperationName: tt.opName,
+					},
+				},
+			}
+			assert.Equal(t, tt.want, span.GenAIOperationName())
+		})
+	}
+}
+
+func TestSpan_GenAIInputTokenCount_OpenAICompatible(t *testing.T) {
+	t.Run("input_tokens present", func(t *testing.T) {
+		span := &Span{
+			GenAI: &GenAI{
+				OpenAICompatible: &VendorOpenAI{
+					Usage: OpenAIUsage{InputTokens: NewTokenCount(42)},
+				},
+			},
+		}
+		assert.Equal(t, 42, reportedValue(span.GenAIInputTokenCount()))
+	})
+
+	t.Run("prompt_tokens fallback", func(t *testing.T) {
+		span := &Span{
+			GenAI: &GenAI{
+				OpenAICompatible: &VendorOpenAI{
+					Usage: OpenAIUsage{PromptTokens: NewTokenCount(99)},
+				},
+			},
+		}
+		assert.Equal(t, 99, reportedValue(span.GenAIInputTokenCount()))
+	})
+
+	t.Run("no usage", func(t *testing.T) {
+		span := &Span{
+			GenAI: &GenAI{
+				OpenAICompatible: &VendorOpenAI{},
+			},
+		}
+		assert.Equal(t, 0, reportedValue(span.GenAIInputTokenCount()))
+	})
+}
+
+func TestSpan_GenAIOutputTokenCount_OpenAICompatible(t *testing.T) {
+	t.Run("output_tokens present", func(t *testing.T) {
+		span := &Span{
+			GenAI: &GenAI{
+				OpenAICompatible: &VendorOpenAI{
+					Usage: OpenAIUsage{OutputTokens: NewTokenCount(55)},
+				},
+			},
+		}
+		assert.Equal(t, 55, reportedValue(span.GenAIOutputTokenCount()))
+	})
+
+	t.Run("completion_tokens fallback", func(t *testing.T) {
+		span := &Span{
+			GenAI: &GenAI{
+				OpenAICompatible: &VendorOpenAI{
+					Usage: OpenAIUsage{CompletionTokens: NewTokenCount(77)},
+				},
+			},
+		}
+		assert.Equal(t, 77, reportedValue(span.GenAIOutputTokenCount()))
+	})
+
+	t.Run("no usage", func(t *testing.T) {
+		span := &Span{
+			GenAI: &GenAI{
+				OpenAICompatible: &VendorOpenAI{},
+			},
+		}
+		assert.Equal(t, 0, reportedValue(span.GenAIOutputTokenCount()))
+	})
+}
+
+func TestSpan_GenAIRequestModel_OpenAICompatible(t *testing.T) {
+	span := &Span{
+		GenAI: &GenAI{
+			OpenAICompatible: &VendorOpenAI{
+				Request: OpenAIInput{Model: "gpt-4o-mini"},
+			},
+		},
+	}
+	assert.Equal(t, "gpt-4o-mini", span.GenAIRequestModel())
+}
+
+func TestSpan_GenAIResponseModel_OpenAICompatible(t *testing.T) {
+	tests := []struct {
+		name          string
+		responseModel string
+		requestModel  string
+		want          string
+	}{
+		{name: "response model present", responseModel: "gpt-4o-mini-2024-07-18", requestModel: "gpt-4o-mini", want: "gpt-4o-mini-2024-07-18"},
+		{name: "fallback to request model", responseModel: "", requestModel: "gpt-4o-mini", want: "gpt-4o-mini"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			span := &Span{
+				GenAI: &GenAI{
+					OpenAICompatible: &VendorOpenAI{
+						ResponseModel: tt.responseModel,
+						Request:       OpenAIInput{Model: tt.requestModel},
+					},
+				},
+			}
+			assert.Equal(t, tt.want, span.GenAIResponseModel())
+		})
+	}
+}

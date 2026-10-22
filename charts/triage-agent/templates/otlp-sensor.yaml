@@ -1,0 +1,245 @@
+{{- if include "triage-agent.otlpSensor" . }}
+{{- /* The OTLP receiver as a sensor role (docs/adr/0022-otlp-sensor-role.md):
+       its own pods take the senders' OTLP and stream every source to the
+       controller over the sensor stream, as the eBPF DaemonSet's pods
+       stream theirs. The pods serve the controller's sensor-stream
+       certificate (mounted read-only from its Secret), so senders keep
+       pinning the one in <fullname>-sensor-ca. */}}
+{{- $core := include "triage-agent.core" . | fromYaml }}
+{{- $o := .Values.otlp }}
+{{- $s := $o.sensor }}
+{{- $name := printf "%s-otlp" (include "triage-agent.fullname" .) }}
+{{- $tenants := $core.tenants | default list }}
+{{- if and .Values.target.tenant (not (has .Values.target.tenant $tenants)) }}
+{{- $tenants = append $tenants .Values.target.tenant }}
+{{- end }}
+{{- $insecure := ($o.insecure | default dict) }}
+{{- if $insecure.enabled }}
+{{- if or $o.ownCA $o.clientCASecret $o.allowedServiceAccounts $o.forwarders }}
+{{- fail "otlp.insecure.enabled serves plain gRPC to anonymous senders: it excludes otlp.ownCA, otlp.clientCASecret, otlp.allowedServiceAccounts and otlp.forwarders" }}
+{{- end }}
+{{- if not $insecure.allowFrom }}
+{{- fail "otlp.insecure.enabled needs otlp.insecure.allowFrom: the namespaces that may reach the port, which the chart fences with a NetworkPolicy" }}
+{{- end }}
+{{- if not (or .Values.target.tenant (eq (len $tenants) 1)) }}
+{{- fail "otlp.insecure.enabled files every sender under one tenant: set target.tenant, or exactly one entry in core.tenants" }}
+{{- end }}
+{{- end }}
+{{- $clientCA := "" }}
+{{- if $insecure.enabled }}
+{{- else if $o.clientCASecret }}
+{{- $clientCA = $o.clientCASecret }}
+{{- else if $o.ownCA }}
+{{- $clientCA = printf "%s-otlp-client-ca" (include "triage-agent.fullname" .) }}
+{{- end }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "triage-agent.labels" . | nindent 4 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "triage-agent.labels" . | nindent 4 }}
+spec:
+  selector:
+    {{- include "triage-agent.otlpSensorSelectorLabels" . | nindent 4 }}
+  ports:
+    - name: otlp-grpc
+      port: {{ include "triage-agent.otlpPort" . }}
+      targetPort: otlp-grpc
+      protocol: TCP
+      appProtocol: grpc
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "triage-agent.labels" . | nindent 4 }}
+spec:
+  replicas: {{ $s.replicas | default 2 }}
+  selector:
+    matchLabels:
+      {{- include "triage-agent.otlpSensorSelectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "triage-agent.otlpSensorSelectorLabels" . | nindent 8 }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ $name }}
+      {{- /* The API token is for TokenReview of token senders only. */}}
+      automountServiceAccountToken: {{ if $o.allowedServiceAccounts }}true{{ else }}false{{ end }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      terminationGracePeriodSeconds: 10
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: triage-agent
+          image: {{ include "triage-agent.liteImage" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - --mode=otlp
+            - --otlp-listen=:{{ include "triage-agent.otlpPort" . }}
+            {{- if $insecure.enabled }}
+            - --otlp-insecure
+            {{- else }}
+            - --otlp-tls-cert-file=/etc/triage-otlp-tls/tls.crt
+            - --otlp-tls-key-file=/etc/triage-otlp-tls/tls.key
+            {{- if $clientCA }}
+            - --otlp-client-ca-file=/etc/triage-otlp/ca.crt
+            {{- end }}
+            {{- with $tenants }}
+            - --otlp-tenants={{ join "," . }}
+            {{- end }}
+            {{- end }}
+            {{- with $o.allowedServiceAccounts }}
+            - --otlp-allowed-service-accounts={{ join "," . }}
+            {{- end }}
+            {{- with $o.forwarders }}
+            - --otlp-forwarders={{ join "," . }}
+            {{- end }}
+            {{- with $o.limits }}
+            {{- with .maxResources }}
+            - --otlp-max-resources={{ . | int }}
+            {{- end }}
+            {{- with .maxPointsPerResource }}
+            - --otlp-max-points-per-resource={{ . | int }}
+            {{- end }}
+            {{- with .maxResourcesPerSender }}
+            - --otlp-max-resources-per-sender={{ . | int }}
+            {{- end }}
+            {{- with .maxRequestBytes }}
+            - --otlp-max-request-bytes={{ . | int }}
+            {{- end }}
+            {{- end }}
+            - --sensor-controller={{ include "triage-agent.fullname" . }}-sensors.{{ .Release.Namespace }}.svc:{{ include "triage-agent.sensorStreamPort" . }}
+            {{- /* The pods present the controller's serving certificate, which
+                   they hold to serve OTLP, instead of a ServiceAccount token:
+                   no TokenReview, no ClusterRole for the role. */}}
+            - --sensor-client-cert-file=/etc/triage-otlp-tls/tls.crt
+            - --sensor-client-key-file=/etc/triage-otlp-tls/tls.key
+            - --sensor-tick={{ $s.tick | default "10s" }}
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          ports:
+            - name: otlp-grpc
+              containerPort: {{ include "triage-agent.otlpPort" . }}
+              protocol: TCP
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: sensor-ca
+              mountPath: /etc/triage-sensor
+              readOnly: true
+            - name: otlp-tls
+              mountPath: /etc/triage-otlp-tls
+              readOnly: true
+            {{- if $clientCA }}
+            - name: otlp-client-ca
+              mountPath: /etc/triage-otlp
+              readOnly: true
+            {{- end }}
+          resources:
+            {{- toYaml ($s.resources | default dict) | nindent 12 }}
+      volumes:
+        - name: sensor-ca
+          configMap:
+            name: {{ include "triage-agent.fullname" . }}-sensor-ca
+            optional: true
+        - name: otlp-tls
+          secret:
+            secretName: {{ include "triage-agent.fullname" . }}-sensor-tls
+            items:
+              - key: tls.crt
+                path: tls.crt
+              - key: tls.key
+                path: tls.key
+        {{- if $clientCA }}
+        {{- /* The CA certificate only: the own-CA Secret also holds the key. */}}
+        - name: otlp-client-ca
+          secret:
+            secretName: {{ $clientCA }}
+            items:
+              - key: ca.crt
+                path: ca.crt
+        {{- end }}
+      {{- with $s.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $s.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $s.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- if gt (int ($s.replicas | default 2)) 1 }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "triage-agent.labels" . | nindent 4 }}
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      {{- include "triage-agent.otlpSensorSelectorLabels" . | nindent 6 }}
+{{- end }}
+{{- if $insecure.enabled }}
+---
+{{- /* Anyone who can reach the port can write signals for the tenant, so the
+       pods admit only the namespaces named in otlp.insecure.allowFrom. A
+       policy that selects a pod denies every ingress it does not list; these
+       pods serve nothing else. */}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "triage-agent.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "triage-agent.otlpSensorSelectorLabels" . | nindent 6 }}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        {{- range $insecure.allowFrom }}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ . | quote }}
+        {{- end }}
+      ports:
+        - port: {{ include "triage-agent.otlpPort" $ }}
+          protocol: TCP
+{{- end }}
+{{- end }}

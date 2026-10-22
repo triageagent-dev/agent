@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<meta name="theme-color" content="#1b1d2b">
+<title>Triage Agent TUI</title>
+<link rel="icon" type="image/svg+xml" href="./favicon.svg">
+<link rel="stylesheet" href="./vendor/fonts/jetbrains-mono.css">
+<link rel="preload" href="./vendor/phosphor/Phosphor-Fill.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="stylesheet" href="./vendor/phosphor/fill.css">
+<link rel="stylesheet" href="./styles.css">
+<script type="module" src="./app.js"></script>
+</head>
+<body>
+<div id="splash" class="splash-page" hidden></div>
+<div id="app">
+  <div id="tabbar" class="tabbar"></div>
+  <main id="term" class="term" tabindex="-1">
+    <div id="crumb" class="crumb">
+      <span id="crumb-info" class="crumb-info"></span>
+      <label id="prompt" class="prompt" hidden>
+        <span class="prompt-k">/</span>
+        <input id="filter" type="text" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" enterkeyhint="done" aria-label="filter">
+        <span class="prompt-hint">enter apply · esc clear</span>
+      </label>
+    </div>
+    <div id="panel"></div>
+  </main>
+  <footer id="keybar" class="keybar">
+    <div class="keyrow" id="keyrow">
+      <button type="button" class="kb" data-act="key" data-k="Escape">esc</button>
+      <button type="button" class="kb" data-act="shift" aria-label="shift: show shifted keys">&#8679;</button>
+      <button type="button" class="kb" data-act="key" data-k="Tab">tab</button>
+      <button type="button" class="kb" data-act="key" data-k="Enter">enter</button>
+      <button type="button" class="kb" data-act="key" data-k="/">/</button>
+      <button type="button" class="kb" data-act="key" data-k="ArrowLeft" aria-label="left">&#8592;</button>
+      <button type="button" class="kb" data-act="key" data-k="ArrowDown" aria-label="down">&#8595;</button>
+      <button type="button" class="kb" data-act="key" data-k="ArrowUp" aria-label="up">&#8593;</button>
+      <button type="button" class="kb" data-act="key" data-k="ArrowRight" aria-label="right">&#8594;</button>
+      <span class="kb-spacer"></span>
+    </div>
+    <div class="legend" id="legend"></div>
+    <input id="kbd" class="kbd-sink" type="text" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" aria-label="keyboard input">
+  </footer>
+  <div id="modal" class="modal-wrap" hidden></div>
+</div>
+</body>
+</html>

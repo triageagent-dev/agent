@@ -1,0 +1,749 @@
+# Default values for triage-agent.
+
+# Pull secrets for private registries (e.g. GAR from AKS): [{name: gcp-ar-regcred}]
+imagePullSecrets: []
+
+image:
+  # Placeholder default: point this at the registry you actually publish to.
+  # A placeholder that resolves to no registry. An install names its own
+  # image; `triagectl agent install` refuses this value by name.
+  repository: registry.invalid/example-shared-registry/triage-agent
+  tag: ""            # empty → "v" + Chart.appVersion (the ko-published tag, e.g. v1.4.0)
+  pullPolicy: IfNotPresent
+  # The controller and the OTLP role never run the eBPF role, so they can use
+  # the image built without OBI (about a third smaller, no eBPF code):
+  # <repository>-otlp, published next to the main image with the same tags.
+  # Empty uses the main image. The eBPF DaemonSet always uses the main image.
+  lite:
+    repository: ""
+    tag: ""          # empty → image.tag, then "v" + Chart.appVersion
+
+replicaCount: 1
+
+nameOverride: ""
+fullnameOverride: ""
+
+# Namespace the controller's cache is restricted to. Empty = cluster-wide.
+namespace: ""
+
+# Log verbosity (zap --zap-log-level): "info" (default), "debug", or a number.
+# Set to "1" or "debug" to trace every pushed Application delta + Kubernetes event.
+logLevel: ""
+
+# Resync period in seconds for the manager's informer cache.
+syncPeriod:        # 120 (binary default; unset renders no arg)
+
+# Kubernetes resources the controller watches directly, one
+# --workload-resources flag per entry, form <group>/<version>/<resource>
+# (the GVR's lowercase plural resource name, e.g. "apps/v1/deployments").
+# Empty (default) uses the binary's built-in list: apps/v1/deployments,
+# apps/v1/statefulsets, apps/v1/daemonsets, argoproj.io/v1alpha1/rollouts. A
+# non-empty list REPLACES the built-ins entirely — include any of them you
+# still need alongside whatever you're adding.
+workloadResources: []
+
+# Leader election. Always on when replicaCount is above 1 (only the leader
+# pushes to the core); this turns it on for a single replica too.
+leaderElection:
+  enabled: false
+
+# Metrics server. Disabled by default — no rbac-proxy sidecar is shipped; when
+# enabled, use controller-runtime's built-in secure metrics or scrape the plain
+# endpoint from a trusted network.
+# Sensor stream (docs/adr/0015-sensor-stream-grpc.md): the sensor roles of
+# the DaemonSet (ebpf, node-exporter, log-exporter) send their metrics as
+# OTLP over gRPC to the controller, which is where every collector below
+# reads them. Rendered when core.host and the DaemonSet runs; the sensors
+# open no port of their own. With more than one replica every replica takes
+# sensor streams and they gossip what they receive (ADR-0015 phase 4), so
+# the leader sees every node.
+sensorStream:
+  # The controller's gRPC port, published by the <fullname>-sensors Service.
+  port: 9470
+  # The replica gossip port, published by the headless <fullname>-peers
+  # Service. Mutual TLS on the sensor stream's own certificate.
+  meshPort: 9471
+  # How often each sensor sends its metrics and its own state.
+  tick:                   # 15s
+
+# Local TUI (docs/adr/0019-local-tui.md): a read-only view of the apps, traffic,
+# service graph, sources and events this controller sees. Loopback only, no
+# login: reach it with `kubectl port-forward deploy/<fullname> 8088:8088`.
+# Empty is off. Needs core.host.
+ui:
+  listen: ""     # e.g. 127.0.0.1:8088
+  # How many of the newest events per tenant the TUI and the API keep (10 to
+  # 5000). Older ones are dropped; the event counters keep counting.
+  maxEvents: 100
+  # Login: the TUI asks for an admin key, read from this Secret (mounted as a
+  # file, never an env var or argument). Without it the TUI has no login and
+  # relies on the loopback bind alone. The key must be at least 16 bytes;
+  # create it with
+  #   kubectl -n <ns> create secret generic <name> --from-literal=admin-key="$(openssl rand -base64 32)"
+  adminKey:
+    existingSecret: ""
+    secretKey: admin-key
+
+# Monitoring API (docs/adr/0020-monitoring-api.md): Prometheus /metrics, the
+# discovery document /.well-known/triage-agent and the read-only JSON API for
+# Prometheus, Grafana (Prometheus or Infinity datasource) and other tools. Off
+# by default, and never unauthenticated: every request needs a bearer token.
+# Needs core.host. Only the leader replica exports signal series, so scrape
+# the <fullname>-api Service (or every pod) without deduplicating.
+api:
+  listen: ""     # e.g. ":9480"
+  # Cluster mode: accept ServiceAccount tokens (audience triage-agent-api) and
+  # let RBAC decide. Bind the <fullname>-api-reader ClusterRole with a
+  # ClusterRoleBinding for every tenant, or with a RoleBinding in a
+  # triageagent.dev/tenant-annotated namespace for that tenant.
+  # kubectl create token <sa> --audience triage-agent-api
+  # api.tokens stays for callers outside the cluster; either alone is enough.
+  # Serve api.tls with it: a token sniffed on plain HTTP is replayable until it
+  # expires. Any RBAC rule that grants every verb or resource (cluster-admin)
+  # or a binding to system:authenticated also counts as the grant, and whoever
+  # can patch a Namespace can change the tenant its ServiceAccounts read as.
+  # A ServiceMonitor then needs a long-lived ServiceAccount token as its secret.
+  serviceAccountAuth: false
+  mcp: false     # POST /mcp: read-only MCP tools over the JSON API, same tokens and tenant scope
+  docs: false    # /api/v1/openapi.json and the Swagger page /api/v1/docs
+  tokens:
+    # A Secret with one token per line, `name tenant token` (tenant * is
+    # unrestricted; any other tenant limits the token to it, enforced by the
+    # agent). Tokens are at least 24 bytes. Example:
+    #   printf 'prom * %s\ngrafana-shop shop %s\n' "$(openssl rand -hex 24)" "$(openssl rand -hex 24)" > tokens
+    #   kubectl -n <ns> create secret generic <name> --from-file=tokens=tokens
+    existingSecret: ""
+    secretKey: tokens
+  tls:
+    existingSecret: ""   # a kubernetes.io/tls Secret; empty serves plain HTTP
+  serviceMonitor:
+    enabled: false       # needs the Prometheus Operator CRDs
+    interval: 30s
+    tokenSecret:         # a Secret holding the scrape token alone
+      name: ""
+      key: token
+
+# OTLP receiver (docs/adr/0017-otlp-receiver.md): OpenTelemetry SDKs and
+# Collectors push metrics over OTLP/gRPC to the controller, for clusters with
+# no eBPF DaemonSet or alongside it. Published on the <fullname>-sensors
+# Service with the sensor stream's certificate (pin it from the
+# <fullname>-sensor-ca ConfigMap). Metrics are routed by name: the RED and
+# client histograms and obi.network.flow.bytes feed RED, SIG and topology;
+# use.* the USE collector; log.errors/log.warns/log.lines the log collector.
+# Cumulative temporality only. Needs core.host.
+otlp:
+  enabled: false
+  port: 4317
+  # Senders authenticate with a client certificate (mutual TLS) that chains
+  # to this CA, or with a projected ServiceAccount token (audience
+  # triage-agent-otlp) of an allowed account. At least one is required.
+  # clientCASecret names a Secret in the release namespace with key ca.crt.
+  # The listener is TLS 1.3 only. With clientCASecret alone a client
+  # certificate is mandatory; with allowedServiceAccounts as well it is
+  # optional (a sender without one must present an allowed token), and a
+  # certificate that is given must still chain to the CA.
+  clientCASecret: ""
+  # The agent keeps its own client CA for remote senders: it creates the CA on
+  # first start in the Secret <release>-otlp-client-ca and trusts it for mutual
+  # TLS. Issue a sender's certificate inside the controller pod:
+  #   kubectl -n <ns> exec deploy/<release>-controller -- triage-agent otlp-cert \
+  #     --client-ca-secret <release>-otlp-client-ca --serving-ca-configmap <release>-sensor-ca \
+  #     --tenant <a,b> --cn <sender> > sender-secret.yaml
+  # The certificate names the tenants (spiffe://<domain>/tenant/<name>); a
+  # tenant must also be in core.tenants. Works with clientCASecret too.
+  # Set extraNames (above) BEFORE issuing the first sender certificate: the
+  # output pins the agent's serving certificate, and changing the names
+  # reissues it, which breaks every sender's pin until it gets the new one.
+  # The CA is renewed inside 90 days of expiry when the controller starts; the
+  # old one stays trusted until it expires. Issue certificates only after a
+  # renewal has rolled through every replica.
+  ownCA: false
+  # Host names or IP addresses, beyond the Service's own, that the serving
+  # certificate also covers. Set the address a sender outside the cluster
+  # reaches the OTLP port by (a load balancer's name or IP); the sender must
+  # connect to one of them. The certificate is reissued when this changes, and
+  # the <release>-sensor-ca ConfigMap carries the new one.
+  extraNames: []
+  # namespace/serviceaccount entries, or namespace/* for every account.
+  allowedServiceAccounts: []
+  # A token sender may publish only for its own namespace: points that claim
+  # another k8s.namespace.name are refused, and a missing one is filled in.
+  # List here (namespace/serviceaccount, each also in allowedServiceAccounts)
+  # the accounts that may publish for any namespace: Collectors running the
+  # k8sattributes processor as a gateway. A client certificate without a
+  # SPIFFE URI SAN (spiffe://<domain>/ns/<namespace>/sa/<name>) is a
+  # forwarder credential too; with one it is bound to that namespace.
+  forwarders: []
+  # Run the receiver in its own Deployment (--mode=otlp, ADR-0022) instead of
+  # in the controller. The pods serve the controller's certificate and the
+  # same senders, authenticate them the same ways, and stream every source to
+  # the controller over the sensor stream, which checks the joined tenants and
+  # the workspace scope again. Senders reach them at <fullname>-otlp:<port>
+  # (not <fullname>-sensors, which stays the controller's stream), a name the
+  # serving certificate then also covers: enabling this reissues it, so
+  # senders re-pin <fullname>-sensor-ca once. The controller keeps no OTLP
+  # listener. A client certificate from the agent's own CA (ownCA) must have
+  # been issued by the current CA, not one it replaced.
+  # No authentication, for Collectors inside the cluster that have neither a
+  # client certificate nor a token for the agent (ADR-0022 phase 5). The role's
+  # pods then serve plain gRPC and take anything sent to them, filed under the
+  # one tenant of this agent (target.tenant, or the single core.tenants entry).
+  # Because anyone who can reach the port can write signals for that tenant:
+  #   - it needs otlp.sensor.enabled, and excludes ownCA, clientCASecret,
+  #     allowedServiceAccounts and forwarders;
+  #   - allowFrom must name the namespaces that may reach the port; the chart
+  #     renders a NetworkPolicy that admits only them (default deny), so the
+  #     cluster's CNI must enforce NetworkPolicy;
+  #   - the sender limits below apply per address.
+  # Senders dial <fullname>-otlp:<port> with no TLS (exporter tls: insecure).
+  insecure:
+    enabled: false
+    allowFrom: []   # namespaces, e.g. [otel-demo]
+  sensor:
+    enabled: false
+    replicas: 2
+    resources: {}
+    nodeSelector: {}
+    tolerations: []
+    affinity: {}
+    # How often each pod sends its changed sources to the controller.
+    tick: 10s
+  # Memory bounds; points past one are refused and reported to the sender.
+  limits:
+    maxResources: 2000           # resources (sources) held in all
+    maxPointsPerResource: 5000   # series of one resource
+    maxResourcesPerSender: 500   # resources one authenticated sender may create
+    maxRequestBytes: 4194304     # largest Export request (4 MiB)
+
+metrics:
+  enabled: false
+  # Address the metrics endpoint binds to when enabled. "0" disables.
+  bindAddress: "127.0.0.1:8080"
+
+# Core connection: stream Applications + Kubernetes Warning events to the
+# triage core over an outbound WebSocket (ADR-0005). Off by default.
+# The triage core this agent sends to. Setting core.host (or core.endpoint)
+# turns the connection on; with neither the agent runs standalone. push.* is
+# the old name of this block and is still read when core.host.
+core:
+  # Triage core hostname, e.g. triage.example.com. This is normally the ONLY
+  # address value an installer sets: the scheme and path below default to the
+  # route the core serves, so nothing outside this chart has to restate it.
+  host: ""
+  # One-time agent key (core ADR-090), from the install command the core
+  # returns when a key is minted. A join that carries it is approved at once,
+  # with no admin step; the agent removes it from the join Secret once its
+  # certificate is issued. Needs storage: secret. The key pins clusterName
+  # and the tenants, so keep those as the command gives them.
+  agentKey: ""
+  # Core CA fingerprint from `triagectl agent list`, REQUIRED with host. An
+  # agent running in Kubernetes authenticates to the core only by a join
+  # certificate. Without a key, the agent logs `join pending` with its key
+  # fingerprint after install; an admin approves it with
+  # `triagectl agent approve <cluster> --fingerprint <agent fingerprint>`.
+  caFingerprint: ""
+  # Cluster identifier stamped into events (triage source segment).
+  clusterName: ""
+  # Tenants the join request asks for; empty means target.tenant alone.
+  # A cluster-mode agent lists every tenant it serves. With
+  # kubernetes.watch=false and no target.tenant, a single entry here is the
+  # tenant every frame files under.
+  tenants: []
+  # Where the agent keeps its key, certificate and the saved core CA.
+  #   secret   (default) a Secret in this namespace that the chart creates
+  #            empty; the agent may get and update that Secret only. A new
+  #            pod keeps its identity and needs no new approval.
+  #   emptyDir nothing stored; each new pod has a new key and waits for a
+  #            new approval.
+  #   pvc      the PersistentVolumeClaim named by existingClaim.
+  storage: secret
+  existingClaim: ""
+  # Scheme and path of the core's agent route. Defaults match the core's own
+  # listener (internal/events/server.go mounts the agent receiver at
+  # /events/ws). Override only for a proxy that rewrites the path.
+  scheme: "wss"
+  path: "/events/ws"
+  # Full WebSocket URL, an explicit override for host/scheme/path above. Set
+  # this or host, not both. Left empty in the normal case.
+  endpoint: ""
+  # Heartbeat interval in seconds.
+  heartbeatSeconds:       # 20 (binary default; unset renders no arg)
+  # Skip TLS certificate verification for a wss:// endpoint (dev only).
+  insecureSkipVerify: false
+  # Allow a plaintext ws:// endpoint. Leave false in production.
+  allowPlaintext: false
+
+# Kubernetes watching. false runs the agent on what its OTLP receiver and
+# sensors hand it and nothing else (docs/adr/0021-otlp-only-no-kubernetes-
+# watch.md): no Namespace, Service, Ingress, workload or Event informers, no
+# virtual apps, no owner reads, and no ClusterRole or ClusterRoleBinding, so the
+# install needs only namespace-scoped rights (Role for leases, the join Secret
+# and the sensor/OTLP Secrets). Needs core.host and one tenant, target.tenant
+# or core.tenants with exactly one entry: with no namespace annotation to
+# read, every frame files under that one tenant.
+# target.namespaces still narrows what OTLP senders may report; empty means
+# every namespace the authenticated senders name.
+kubernetes:
+  watch: true
+
+# What this agent OBSERVES — as opposed to core.* above, which is about where
+# the telemetry GOES. The other way to scope observation is the
+# triageagent.dev/tenant namespace annotation (docs/todo/virtual-apps.md
+# "Namespace-scope-by-annotation"): any namespace carrying it is watched
+# automatically, live, no restart. This block is the static, up-front
+# alternative/complement to that. Requires core.host (there is
+# nowhere else to send what's observed).
+target:
+  # Primary tenant this cluster belongs to; selects the triage service graph
+  # and is declared in the hello. Leave empty to run
+  # cluster-mode, identified only by core.clusterName, where every frame's
+  # tenant is derived purely from triageagent.dev/tenant namespace
+  # annotations. This field answers "which tenant does an in-scope namespace
+  # belong to" and never widens scope. With target.namespaces set below and
+  # this left empty, items from those namespaces are dropped for want of a
+  # tenant, never defaulted onto one.
+  tenant: ""
+  # Namespaces to observe. Not configured is not "everything": an empty list
+  # means the triageagent.dev/tenant-annotated set, in both cluster mode and
+  # single-tenant mode, not every namespace on the cluster. Set this to name
+  # namespaces up front without annotating them; an explicit list unions
+  # with the annotated set, it does not replace it. An agent with neither a
+  # list nor any annotation observes nothing. That is deliberate and
+  # fail-closed.
+  namespaces: []
+
+# Virtual apps (docs/todo/virtual-apps.md): label- and annotation-derived
+# Application synthesis, layered onto push mode's existing
+# Deployment/StatefulSet/DaemonSet visibility. No manifests, no CRs, ever
+# written to the cluster; this is the only application-synthesis mechanism
+# this chart ships. "off": no extra informers, no synthesis. "on": merge
+# synthesized apps into the snapshot and push their deltas. Requires
+# core.host (there is nowhere else to send a synthesized app; the
+# chart fails the render otherwise). Left empty here, which omits
+# --virtual-apps from the container args entirely, so the binary's own
+# default applies: "on" (cmd/triage-agent/main.go's flag.StringVar default).
+virtualApps: ""
+
+# Log-based metrics (docs/adr/0006-log-based-metrics.md, ADR-0014): the
+# controller reads the log-exporter role's counters from the sensor stream
+# and sends a log_metrics frame for services whose error or warn count trips
+# errorThreshold. On by default; runs when core.host is set and a source is:
+# logExporter.enabled=true or otlp.enabled=true.
+logMetrics:
+  enabled: true
+  # Gate-evaluation interval in seconds.
+  # Unset on purpose: an unset key renders no arg, so the binary's own default
+  # applies. Set one only to override it. Trailing comments show that default
+  # for reference; they are not read from here.
+  intervalSeconds:        # 60
+  # Minimum error-count OR warn-count delta in one interval for a service to be
+  # reported — either counter crossing this independently qualifies the service.
+  errorThreshold:         # 10
+  # Baseline gate (docs/todo/baseline-gates.md). Once a service has a baseline,
+  # it is reported only on a step: multiplier x its median error lines and at
+  # least errorThreshold. A chronic stream stops re-reporting. Unset keys
+  # render no arg, so the binary default applies.
+  baseline:
+    enabled:              # true; false keeps the presence gate
+    multiplier:           # 3
+    # Lines per interval at or above which a service with no baseline yet
+    # (every one after an agent restart) is reported as a step and not learned
+    # as normal. Unset or 0: off, a cold stream is reported on the presence
+    # gate and learned.
+    coldFloorLines:       # 0 (off)
+
+# Native log-exporter container (docs/adr/0014-log-exporter-in-agent-ds.md):
+# triage-agent's own per-node container-log counter (--mode=log-exporter),
+# the source for the log_metrics signal family. Runs as a role of the SAME
+# DaemonSet pod as ebpf/node-exporter (ebpf-daemonset.yaml) and sends its
+# counters over the sensor stream. Off by default.
+logExporter:
+  enabled: false
+  # Namespaces to tail (exact names, not regex — unlike ebpf.instrumentNamespaces).
+  # Empty falls back to target.namespaces (same reasoning as
+  # ebpf.includeNamespaces: nothing outside the pushed set ever reaches
+  # triage, so tailing wider is pure risk with no observability benefit), then
+  # to tailing every namespace when target.namespaces is also empty.
+  includeNamespaces: []
+  # Regex (RE2/Go regexp syntax) matched against a line's content to classify
+  # it as an error/fatal or warn line. Defaults cover common structured and
+  # unstructured shapes, and match the classification convention an external
+  # Fluent Bit-based source would use (Onigmo syntax — these two default
+  # patterns are valid in both), so switching between this exporter and an
+  # external source sees the same split for the same log stream.
+  # Unset uses the binary's own regexes.
+  errorRegex:
+  warnRegex:
+  # Error-line sample fingerprinting (docs/adr/0007-error-log-sample-
+  # fingerprint.md's behavior, restored natively — docs/adr/0014's Samples
+  # section). ERROR lines only, never warn/total. A fingerprinted, truncated
+  # representative line becomes each error series' `sample` label value.
+  sampleMaxLen:            # 160
+  # Cap on DISTINCT error fingerprints tracked per (namespace, service) —
+  # each is its own permanent, monotonic counter series (never evicted:
+  # evicting or relabeling a series would reset ITS counter and corrupt
+  # logMetrics' delta math). Past the cap, further distinct fingerprints fall
+  # into an unlabeled catch-all series instead of minting unbounded series.
+  maxSamplesPerService:   # 8
+  # JSON message extraction (docs/adr/0014's Samples section): when an error
+  # line's content is a JSON object, the FIRST of these top-level keys
+  # present with a non-empty string value is used as the sample text instead
+  # of the raw envelope — an object value additionally tries ITS OWN
+  # "message" sub-key (covers {"error":{"message":"..."}}). Fixes a real
+  # production sample where a GCP Cloud Logging envelope's metadata
+  # (actor/event/jobId/logging.googleapis.com/operation/...) ate the entire
+  # sampleMaxLen budget before the actual message was ever reached. Checked
+  # in priority order; the first key wins.
+  # Unset uses the binary's own list: message, msg, error, err.
+  sampleJsonFields: []
+  # Modest defaults: this exporter's per-line hot path is a handful of atomic
+  # increments plus a pre-filtered regex confirm, not a general log pipeline
+  # (see the ADR's "Capacity" section for the measured per-core throughput
+  # this sizing is based on).
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 100m
+      memory: 128Mi
+
+# eBPF RED metrics (docs/adr/0009-red-metrics-beyla.md): the controller reads
+# the ebpf role's OTLP from the sensor stream and sends a red_metrics frame for
+# services whose errors trip both gates below. On by default; runs when
+# core.host is set and a source is: ebpf.enabled=true or otlp.enabled=true.
+redMetrics:
+  enabled: true
+  # Gate-evaluation interval in seconds. Also the topology collector's read
+  # cadence when either is enabled: topology.intervalSeconds is its own,
+  # separate FLUSH cadence, accumulated from these ticks.
+  # Unset on purpose: an unset key renders no arg, so the binary's own default
+  # applies. Set one only to override it. Trailing comments show that default
+  # for reference; they are not read from here.
+  intervalSeconds:        # 60
+  # Minimum error-count delta in one interval for a service to be reported.
+  errorThreshold:         # 10
+  # Minimum error rate: errorCount*100 >= minErrorRatePct*requestCount, for a
+  # service to be reported. Both this AND errorThreshold must hold: a busy service
+  # producing a steady trickle of errors at a normal background rate should not
+  # qualify on volume alone.
+  # Nil-tested: 0 is a real setting (no rate floor), not an absence.
+  minErrorRatePct:        # 5
+  # Second, independent way through the gate: a service also qualifies when any
+  # single operation (HTTP method+route, gRPC method) has at least errorThreshold
+  # errors AND this error rate of its own requests in the interval, even when
+  # the service-wide rate is under minErrorRatePct (a fully broken route diluted
+  # by healthy traffic). 0 disables the arm.
+  # Nil-tested: 0 is a real setting (arm off), not an absence.
+  operationErrorRatePct:  # 50
+  # Third, independent way through the gate, for slowdowns with no errors: a
+  # service also qualifies when its p99 in the interval is at least this many
+  # times the median p99 of its own recent normal intervals (up to 30 kept;
+  # a breaching interval is never added). The baseline is in memory only, so
+  # after an agent restart the arm is silent until latencyMinBaselineWindows
+  # intervals have accumulated. 0 disables the arm.
+  # Nil-tested: 0 is a real setting (arm off), not an absence.
+  latencyMultiplier:      # 5
+  # Absolute p99 (milliseconds) the arm also needs, so 1 ms -> 6 ms never fires.
+  latencyFloorMs:         # 1000
+  # Minimum requests in an interval for its p99 to be judged or recorded.
+  latencyMinRequests:     # 10
+  # Prior intervals with a p99 reading a service needs before the arm can fire.
+  latencyMinBaselineWindows:  # 10
+  # Baseline arms (docs/todo/baseline-gates.md): a service or one of its
+  # operations also qualifies when its error rate or p99, summed over up to
+  # evidenceWindows intervals (so a quiet operation accumulates evidence), is
+  # multiplier x its own recent normal and above the floors. Additional OR
+  # arms; the fixed gates above stay.
+  baseline:
+    enabled:              # true
+    multiplier:           # 3
+    evidenceWindows:      # 5
+    errFloorPct:          # 5
+    latFloorMs:           # 300
+    # Readings a service or operation needs before it is judged against its
+    # own baseline, and the evidence a verdict needs, summed over up to
+    # evidenceWindows intervals.
+    minBaselineWindows:   # 5
+    errMinRequests:       # 20
+    errMinErrors:         # 3
+    latMinRequests:       # 10
+    # Cold floors: with no baseline yet (every key after an agent restart, the
+    # baselines are in memory), a reading at or above these is reported and is
+    # not learned as normal, so a restart during an outage reports the outage.
+    # An operation that is at or above one by nature keeps firing: raise the
+    # floor. Negative disables (a cold key is silent and learns what it reads).
+    errColdFloorPct:      # 15
+    latColdFloorMs:       # 5000
+    # Low-volume rule: under errMinRequests requests over the evidence
+    # intervals, a service or operation still qualifies with this many errors
+    # and this failure share. Negative errSparseMinErrors disables it.
+    errSparseMinErrors:   # 5
+    errSparseRatePct:     # 50
+    # Requests a breaching p99 needs before it can get the key muted as
+    # chronically spiky (a p99 over a handful of requests is their maximum).
+    # Negative disables the check.
+    latChronicMinRequests:  # 100
+    # Operations of one service tracked one by one; the rest are judged
+    # together as "(other operations)". Negative removes the cap.
+    maxOperations:        # 100
+
+# OBI DaemonSet: eBPF application-mode instrumentation producing per-service
+# HTTP RED metrics, sent to the controller over the sensor stream. Named "triage-ebpf" (see
+# ebpf-daemonset.yaml) to avoid colliding with any other eBPF instrumentation
+# in the cluster. Off by default: independent toggle from redMetrics.enabled
+# so a fleet can supply its own eBPF instrumentation and only enable
+# redMetrics.
+ebpf:
+  enabled: false
+  # k8s_owner_name glob excludes rendered into the OBI discovery config
+  # (e.g. ["*synthetic*"]). The pod-annotation exclude
+  # triageagent.dev/instrument: "false" is ALWAYS on regardless of this list,
+  # and so is triageagent.dev/triage: "false" on a pod template, which takes
+  # the workload out of triage entirely (see the chart README's "Excluding a
+  # workload from triage").
+  excludeWorkloads: []
+  # exe_path glob excludes (e.g. ["*ms-playwright*"]). Prefer the
+  # triageagent.dev/instrument pod annotation; this is the coarse fallback.
+  excludePaths: []
+  # Instrument a process that already ships its own OTel SDK
+  # (OBI's discovery.exclude_otel_instrumented_services). Default false
+  # covers those processes too: these metrics go only to the agent's own
+  # controller over the sensor stream, so decorating an SDK-instrumented process here does
+  # not duplicate anything in the customer's own telemetry backend. Set true
+  # to restore OBI's own default: SDK-instrumented processes then get no RED
+  # metrics (http_server_request_duration_seconds,
+  # rpc_server_call_duration_seconds), only a target_info entry.
+  excludeOtelInstrumentedServices: false
+  # Application-mode (uprobe-based) instrumentation costs more than network
+  # mode's pure eBPF socket/packet counting — these defaults sit above
+  # logExporter's.
+  #
+  # Sized from measurement, one namespace at a time:
+  #
+  #   instrumented processes      memory
+  #   0                            ~47Mi
+  #   1                           ~285Mi
+  #   5                           ~348Mi
+  #   18                          ~409Mi
+  #
+  # A step, not a slope: the first attach costs ~240Mi (BPF load, maps, ring
+  # buffers, metadata informer), each one after ~7Mi. So a node with one
+  # instrumented pod needs nearly as much as one with eighteen. CPU peaks
+  # ~130m during the attach burst after a restart.
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      cpu: 300m
+      memory: 700Mi
+  # Container securityContext (AUDIT.md finding 1). Default false renders the
+  # unprivileged, scoped-capability securityContext (see ebpf-daemonset.yaml):
+  # the documented set for eBPF application mode on kernels >= 5.11 (GKE
+  # COS is 6.x as of writing). Set true only for an exotic/older kernel that
+  # cannot load eBPF programs under that capability set; the chart then falls
+  # back to a fully-privileged container instead.
+  privileged: false
+  # Extra capabilities appended to the default unprivileged set's `add:` list —
+  # only needed alongside privileged:false above. Documented cases: SYS_RESOURCE
+  # (kernels < 5.11 — relaxes the BPF verifier's instruction-count/memory limits
+  # that the default capability set alone doesn't lift) and SYS_ADMIN (some
+  # kernels require it for Go trace-context propagation across process
+  # boundaries in application-mode instrumentation). Try without either first;
+  # both widen the container's privilege beyond the audited default.
+  #
+  # SYS_ADMIN is also needed for Go services on GKE COS 6.12: without it every
+  # Go uprobe fails with "creating perf_uprobe PMU ... opening perf event:
+  # permission denied" (visible only with log_level: debug in the eBPF
+  # config), OBI's Go tracer attaches nothing, and Go services (gRPC and
+  # net/http) report no RED at all. An unconfined AppArmor profile alone does
+  # not lift it.
+  extraCapabilities: []
+  # Namespaces discovery.instrument should skip (see ebpf-configmap.yaml). Same
+  # allowlist/denylist semantics used across this chart's DaemonSet namespace
+  # scoping (see logExporter.includeNamespaces above): when includeNamespaces is
+  # non-empty, instrument ONLY those namespaces (excludeNamespaces is then
+  # ignored). Empty = instrument all minus excludes.
+  includeNamespaces: []
+  # Explicit instrumentation allowlist (AUDIT.md finding 1), evaluated ONLY when
+  # includeNamespaces above is empty. Entries are plain namespace names: OBI's
+  # discovery.instrument matches k8s_namespace as a GLOB, so a bare name is an
+  # exact match ("prod" does NOT select "prod-2"/"nonprod"), and anchored ^ns$
+  # entries match NOTHING (verified live 2026-08-22 — the regex semantics belong
+  # to the deprecated discovery.services block). Empty falls through to deriving
+  # the same list from target.namespaces below, then to "*" (see
+  # ebpf-configmap.yaml for the full precedence).
+  instrumentNamespaces: []
+  # OBI's Kubernetes metadata cache scope: node-local (each pod's
+  # informer watches only its own node) or cluster-wide (OBI's own
+  # default). Left unset, this chart follows ebpf.networkFlows.enabled:
+  # node-local when flows are off — RED metrics decorate with the local
+  # instrumented pod's identity and topology edges are resolved by the
+  # controller from address text, so nothing here needs remote-pod metadata,
+  # and node-local also cuts API-server load (N cluster-wide informers -> N
+  # node-scoped ones) — and cluster-wide when flows are on, because OBI
+  # decorates L4 flow peers from its OWN pod metadata and a node-restricted
+  # informer never resolves a peer pod on another node, silently dropping
+  # that edge. Set this explicitly (true or false) to override either
+  # default in either direction. A cluster-wide informer's memory cost
+  # scales with total cluster pod count, not with the number of instrumented
+  # processes — size ebpf.resources.limits.memory accordingly on large
+  # clusters.
+  #metaRestrictLocalNode: true
+  # Kubernetes informers to disable ("node", "service"; pods cannot be
+  # disabled). Default disables the node informer — nothing this chart renders
+  # reads node metadata. Clear to [] to run all informers.
+  disableInformers:
+    - node
+  excludeNamespaces:
+    - kube-system
+    - kube-node-lease
+    - kube-public
+  # Nodes this DaemonSet lands on. Default empty (was `[{operator: Exists}]`
+  # before AUDIT.md finding 1's remediation — that toleration matched every
+  # taint, so a tracing DaemonSet reached tainted/dedicated nodes, including
+  # control-plane ones, with no operator opt-in). A tracing DaemonSet has no
+  # business on a tainted node unless the operator explicitly says so; set this
+  # (and/or nodeSelector below) to restore the old blanket-scheduling behavior
+  # or to target a specific pool.
+  tolerations: []
+  # Scope the DaemonSet to a node subset. Empty = all nodes. Note: like every
+  # per-node collector in this chart, instrumentation is per-node — pods on
+  # unselected nodes are invisible.
+  nodeSelector: {}
+  # L4 network-flow topology edges (agent repo's
+  # docs/todo/service-graph-from-obi.md): a SECOND edge source alongside the
+  # L7 RED metrics above (obi.network.flow.bytes instead of the
+  # http/grpc/db client metrics) — observes protocols no L7 client
+  # family ever sees (raw TCP, TLS, NATS, ...). Off by default. Requires
+  # ebpf.enabled=true — the chart fails the render otherwise, same as the
+  # redMetrics/topology guards above.
+  networkFlows:
+    enabled: false
+    # socket_filter captures from the HOST network namespace, not the pod's —
+    # enabling this sets hostNetwork: true + dnsPolicy: ClusterFirstWithHostNet
+    # on the eBPF DaemonSet pod (ebpf-daemonset.yaml). The sensors open no
+    # port, so sharing the node's network namespace exposes nothing new.
+    #
+    # Also switches the Kubernetes metadata informer cluster-wide by default
+    # (see ebpf.metaRestrictLocalNode above), since flow peers need pod
+    # identity beyond the local node. That informer's memory cost scales with
+    # total cluster pod count — raise ebpf.resources.limits.memory on a large
+    # cluster.
+
+# USE metrics via the node-exporter mode (docs/adr/0010-use-metrics-node-exporter.md):
+# a second container on the same DaemonSet pod (triage-agent --mode=node-exporter)
+# reads each local pod's cgroup v2/PSI files and sends per-(namespace,service,pod)
+# utilization/saturation/error gauges+counters over the sensor stream; the controller
+# aggregates per (namespace, service) — max for pressure/utilization, sum for delta
+# counters — and forwards services whose PSI or OOM-kill signal crosses ANY of the
+# three thresholds below (OR, not AND — unlike redMetrics' gate) as use_metrics
+# frames over the push WebSocket above.
+#
+# USE metrics are orthogonal to the RED source: the node-exporter role reads
+# local cgroup files directly, never OBI's data, so it works with or without
+# ebpf.enabled=true. With nodeExporter=true and ebpf.enabled=false the
+# DaemonSet is a lean node-exporter-only pod with no hostPID and no ebpf
+# container.
+useMetrics:
+  # On by default; runs when core.host is set and a source is: the
+  # node-exporter role below or otlp.enabled=true.
+  enabled: true
+  # The node-exporter sensor role on the DaemonSet, opt-in like ebpf.enabled.
+  # false leaves USE to OTLP senders (otlp.enabled).
+  nodeExporter: false
+  # Gate-evaluation interval in seconds.
+  # Unset on purpose: an unset key renders no arg, so the binary's own default
+  # applies. Set one only to override it. Trailing comments show that default
+  # for reference; they are not read from here.
+  intervalSeconds:        # 60
+  # Minimum mem/cpu/io PSI "some avg60" percent (max across a service's pods) for a
+  # service to be reported — any ONE of the three crossing its own threshold
+  # qualifies, independently of the other two, and independently of at least one OOM
+  # kill this window (also an OR arm). Zero is a legitimate value ("always report
+  # this dimension") — do NOT wrap these in `| default` in deployment.yaml, same
+  # falsy-zero trap as redMetrics.minErrorRatePct (commit 6251069).
+  # Nil-tested: 0 means "always report this dimension", a real setting.
+  memPsiThreshold:        # 20
+  cpuPsiThreshold:        # 40
+  ioPsiThreshold:         # 40
+  # Baseline arms (docs/todo/baseline-gates.md): CPU cores used against the
+  # service's own baseline (works with no CPU limit), and throttling when a
+  # limit exists.
+  baseline:
+    enabled:              # true
+    multiplier:           # 3
+    cpuFloorCores:        # 0.25
+    # Cores (summed across a service's pods) at or above which a service with
+    # no baseline yet is reported and not learned as normal. Unset or 0: off,
+    # a cold service is silent on the CPU arm and learns what it reads.
+    cpuColdFloorCores:    # 0 (off)
+  # Resources for the node-exporter container specifically (separate from ebpf.
+  # resources below): it only reads a handful of small text files per local pod
+  # per tick, so it needs far less than OBI's uprobe-based instrumentation.
+  resources:
+    requests:
+      cpu: 10m
+      memory: 32Mi
+    limits:
+      cpu: 50m
+      memory: 64Mi
+
+# Topology snapshot (docs/adr/0011-topology-snapshot.md, ADR-0013): derive an
+# observed service topology from the SAME ebpf metrics redMetrics.* reads —
+# nodes from presence in the server request metric, edges from the client
+# request metrics and network flows — and forward a FULL topology snapshot
+# (level state, not deltas — a lost frame heals on the next flush) as a
+# topology_snapshot frame over the push WebSocket above, every intervalSeconds
+# (deltas accumulate across every redMetrics.intervalSeconds tick since the
+# last flush). No gate: unlike redMetrics/useMetrics/
+# logMetrics, every flush sends whatever it observed, even an empty result. On
+# by default; runs when core.host is set and a source is: ebpf.enabled=true or
+# otlp.enabled=true.
+topology:
+  enabled: true
+  # Snapshot flush cadence in seconds. A full snapshot every flush, not a
+  # gated window — a much longer default than the 60s red/use/
+  # log-metrics collectors.
+  intervalSeconds:        # 600
+
+serviceAccount:
+  # Create a dedicated ServiceAccount + RBAC. When false, uses `name`.
+  create: true
+  name: ""
+
+rbac:
+  # The ClusterRole (templates/rbac.yaml) grants a fixed, minimal set of
+  # read rules for what push mode and the collectors read: namespaces,
+  # events, pods, services, endpoints, ingresses, and the workload kinds
+  # virtual-app synthesis discovers by default (deployments, statefulsets,
+  # daemonsets, replicasets, jobs, cronjobs, rollouts). Write access is
+  # limited to leases and events, both scoped to the leader-election Role
+  # in the agent's own namespace.
+  #
+  # extraWorkloadRules appends read rules for a workload kind named on
+  # --workload-resources (.Values.workloadResources) that is not one of the
+  # defaults above: an operator-added GVR, or a vendor CRD. Example:
+  #   extraWorkloadRules:
+  #     - apiGroups: ["example.com"]
+  #       resources: ["widgets"]
+  #       verbs: ["get", "list", "watch"]
+  extraWorkloadRules: []
+
+# Controller container resources. The default limit accounts for a
+# Deployment watching several hundred workloads across its per-namespace
+# workload/service informers; raise memory.limits further for a
+# cluster-wide install watching many namespaces.
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    cpu: 200m
+    memory: 512Mi
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+podAnnotations: {}

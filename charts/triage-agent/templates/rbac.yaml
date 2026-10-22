@@ -1,0 +1,126 @@
+{{- if .Values.serviceAccount.create -}}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "triage-agent.serviceAccountName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "triage-agent.labels" . | nindent 4 }}
+{{- if include "triage-agent.kubernetesWatch" . }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "triage-agent.fullname" . }}
+  labels:
+    {{- include "triage-agent.labels" . | nindent 4 }}
+rules:
+  # Namespaces: push mode's own informer (push/pusher.go's
+  # registerNamespaceInformer, GetInformer(&corev1.Namespace{})) and the
+  # bootstrap scope list (cmd/triage-agent/main.go's annotatedNamespaces,
+  # a direct List before the manager cache exists) both read every
+  # Namespace to find the triageagent.dev/tenant annotation. Cluster-scoped,
+  # so this is one watch on one low-churn resource, not a per-namespace cost.
+  #
+  # Events: push mode's Warning-event informer (push/pusher.go's
+  # GetInformer(&corev1.Event{}), and push/dynamic_informers.go's
+  # per-namespace fallback for a namespace outside the manager cache's
+  # scope) forwards Kubernetes Warning events to the core.
+  #
+  # Pods: usemetrics' identity resolver (usemetrics/identity.go's
+  # resolveServiceIdentity) reads a scraped pod through the manager's
+  # cached client to walk its owner chain back to the workload that names
+  # it, only active when useMetrics.enabled is set.
+  #
+  # Services: the Service/Ingress index (push/serviceindex.go,
+  # registerServiceIndexInformers) that resolves a topology edge's
+  # server_address to a Service, registered whenever push mode runs,
+  # independent of virtualApps.
+  - apiGroups: [""]
+    resources: ["namespaces", "events", "pods", "services"]
+    verbs: ["get", "list", "watch"]
+  # Ingresses: the same Service/Ingress index resolves a topology edge's
+  # server_address that names an Ingress host (push/serviceindex.go).
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses"]
+    verbs: ["get", "list", "watch"]
+  # Workload kinds virtual-app synthesis reads by default
+  # (push.DefaultWorkloadResources, push/workload_resources.go) when
+  # --workload-resources is left unset, plus replicasets and jobs: the two
+  # intermediate owner kinds usemetrics' identity walk fetches for a
+  # ReplicaSet- or Job-owned pod (usemetrics/identity.go's
+  # resolveOwnerIdentity) on its way to the Deployment, CronJob or Rollout
+  # that actually names it.
+  - apiGroups: ["apps"]
+    resources: ["deployments", "statefulsets", "daemonsets", "replicasets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["batch"]
+    resources: ["jobs", "cronjobs"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["argoproj.io"]
+    resources: ["rollouts"]
+    verbs: ["get", "list", "watch"]
+{{- /* Defaulted local, not .Values.rbac.extraWorkloadRules directly:
+       `helm upgrade --reuse-values` renders with a release's stored values,
+       and extraWorkloadRules is a key some stored releases won't carry yet.
+       A nil .Values.rbac would otherwise fail the whole template instead of
+       rendering with no extra rules. */}}
+{{- $rbac := .Values.rbac | default dict }}
+{{- with $rbac.extraWorkloadRules }}
+  # Read rules for a workload kind named on --workload-resources
+  # (.Values.workloadResources) that is not one of the defaults above: an
+  # operator-added GVR, or a vendor CRD.
+  {{- toYaml . | nindent 2 }}
+{{- end }}
+{{- end }}
+{{- if include "triage-agent.leaderElection" . }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "triage-agent.fullname" . }}-leader-election
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "triage-agent.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "triage-agent.fullname" . }}-leader-election
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "triage-agent.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "triage-agent.fullname" . }}-leader-election
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "triage-agent.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}
+{{- if include "triage-agent.kubernetesWatch" . }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "triage-agent.fullname" . }}
+  labels:
+    {{- include "triage-agent.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "triage-agent.fullname" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "triage-agent.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}
+{{- end }}

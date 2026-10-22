@@ -1,0 +1,137 @@
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+.DS_Store
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool, specifically when used with LiteIDE
+*.out
+testoutput
+
+**/node_modules
+
+# Dependency directories (remove the comment below to include it)
+**/vendor/
+
+deployments/01-grafana-credentials.yml
+internal/test/cmd/pingserver/server
+*.log
+**/.vscode
+.idea/
+internal/test/cmd/grpc/server/server
+internal/test/cmd/grpc/client/client
+
+.tools/
+internal/tools/debug/dlv
+bin/
+dist/
+internal/test/integration/components/server
+internal/test/integration/components/testserver/testserver
+
+internal/test/cmd/rust_pingserver/target
+internal/test/cmd/rust_pingiron/target
+internal/test/cmd/rust_pingrouille/target
+internal/test/cmd/rust_ironssl/target
+*__pycache__/
+internal/test/cmd/pingwrapper/wrapper
+internal/test/cmd/grpc/server/grpcsrv
+internal/test/cmd/greeting-service/target
+internal/test/integration/components/javatestserver/target/
+internal/test/integration/components/rusttestserver/target/
+internal/test/integration/components/rustssltestserver/target/
+internal/test/integration/components/grpc_relay/rust/target/
+internal/test/integration/components/nodejsserver/node_modules/
+# Ruby on Rails test
+# Ignore bundler config.
+internal/test/integration/components/rubytestserver/testapi/.bundle
+
+# Ignore the default SQLite database.
+internal/test/integration/components/rubytestserver/testapi/db/*.sqlite3
+internal/test/integration/components/rubytestserver/testapi/db/*.sqlite3-*
+
+# Ignore all logfiles and tempfiles.
+internal/test/integration/components/rubytestserver/testapi/log/*
+internal/test/integration/components/rubytestserver/testapi/tmp/*
+!internal/test/internal/integration/components/rubytestserver/testapi/log/.keep
+!internal/test/internal/integration/components/rubytestserver/testapi/tmp/.keep
+
+# Ignore pidfiles, but keep the directory.
+internal/test/integration/components/rubytestserver/testapi/tmp/pids/*
+!internal/test/internal/integration/components/rubytestserver/testapi/tmp/pids/
+!internal/test/internal/integration/components/rubytestserver/testapi/tmp/pids/.keep
+
+# Ignore uploaded files in development.
+internal/test/integration/components/rubytestserver/testapi/storage/*
+!internal/test/internal/integration/components/rubytestserver/testapi/storage/.keep
+internal/test/integration/components/rubytestserver/testapi/tmp/storage/*
+!internal/test/internal/integration/components/rubytestserver/testapi/tmp/storage/
+!internal/test/internal/integration/components/rubytestserver/testapi/tmp/storage/.keep
+internal/test/integration/components/dotnetserver/obj/*
+internal/test/oats/*/build/*
+internal/test/cmd/grpc/client/grpclient
+internal/test/integration/components/gohttp2/client/client
+internal/test/integration/components/gohttp2/server/http2srv
+internal/test/integration/components/gokafka/gokafka
+internal/test/integration/components/gokafka-seg/gokafka
+internal/test/integration/components/goredis/goredis
+internal/test/integration/components/go_otel/rolldice
+internal/test/integration/components/go_otel_grpc/rolldice
+internal/test/integration/components/pythonserver/lib/
+internal/test/integration/components/pythonserver/lib64
+internal/test/integration/components/pythonserver/pyvenv.cfg
+internal/test/integration/components/gosql/qosql
+internal/test/integration/components/javakafka-tls/target
+internal/test/integration/components/java_tls/wrapper/wrapper
+*_bpfel.go
+*_bpfel.o
+*_bpfel.go.d
+*_bpfeb.go.d
+
+# bpf/tests C unit-test build artifacts
+bpf/tests/bpf_*
+bpf/tests/test_*
+!bpf/tests/bpf_*.c
+!bpf/tests/bpf_*.h
+!bpf/tests/test_*.c
+!bpf/tests/test_*.h
+bpf/tests/**/*.dSYM/
+
+opentelemetry-ebpf-instrumentation.sln
+obi.sln
+internal/test/integration/components/javakafka/target/*
+internal/test/integration/components/gomongo/mongosrv
+pkg/internal/java/agent/build
+pkg/internal/java/build
+pkg/internal/java/agent/target
+pkg/internal/java/loader/build
+pkg/internal/java/loader/out
+pkg/internal/java/loader/src/main/resources/agent
+pkg/internal/java/.gradle
+internal/test/integration/components/java_tls/netty_tls/target
+internal/test/integration/components/java_tls/sync_async_tls/target
+internal/test/integration/components/java_tls/jdk8/target
+
+# Ignore the generated OpenTelemetry Collector configuration files for development.
+examples/otel-collector/otelcol-dev/*
+internal/test/benchmarks/goshorturl/shorturl
+
+# Pre-fetched upstream OpenTelemetry semantic-conventions registry consumed
+# by weaver. Populated by `make fetch-upstream-semconv` (a prereqs dep).
+schemas/obi/.deps/
+internal/test/vm/lvh/out/
+
+# Route-harvester test fixture emulating a NestJS app that ships only compiled
+# output; the directory must literally be named "dist" (the scan behavior under
+# test keys on that name), so carve it out of the global dist/ ignore.
+!pkg/internal/transform/route/harvest/nodejs/test_files_dist/dist/
+!pkg/internal/transform/route/harvest/nodejs/test_files_dist/dist/**
+!pkg/internal/transform/route/harvest/nodejs/test_files_dist_versioned/dist/
+!pkg/internal/transform/route/harvest/nodejs/test_files_dist_versioned/dist/**
+internal/test/integration/components/ai/openai/mock-server/mock-server
+internal/test/integration/components/ai/openai/go/testserver

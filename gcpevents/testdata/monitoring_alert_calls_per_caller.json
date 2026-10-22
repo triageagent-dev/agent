@@ -1,0 +1,56 @@
+{
+  "version": "1.2",
+  "incident": {
+    "incident_id": "0.def",
+    "scoping_project_id": "example-project",
+    "scoping_project_number": 1053709457608,
+    "url": "https://console.cloud.google.com/monitoring/alerting/incidents/0.def?project=example-project",
+    "started_at": 1757700000,
+    "ended_at": 1757703600,
+    "state": "open",
+    "summary": "Vertex AI API calls per caller is above the threshold of 300 with a value of 412.",
+    "policy_name": "vertex-ai-calls-per-caller",
+    "policy_user_labels": {
+      "severity": "warning",
+      "team": "team-a"
+    },
+    "condition_name": "API calls per caller",
+    "condition": {
+      "name": "projects/example-project/alertPolicies/789/conditions/012",
+      "displayName": "API calls per caller",
+      "conditionThreshold": {
+        "thresholdValue": 300
+      }
+    },
+    "threshold_value": "300",
+    "observed_value": "412",
+    "resource": {
+      "type": "consumed_api",
+      "labels": {
+        "credential_id": "serviceaccount:116448827429795893791",
+        "service": "aiplatform.googleapis.com",
+        "method": "google.cloud.aiplatform.v1beta1.PredictionService.GenerateContent",
+        "project_id": "example-project",
+        "location": "europe-west4"
+      }
+    },
+    "resource_type_display_name": "Consumed API",
+    "resource_display_name": "aiplatform.googleapis.com",
+    "metric": {
+      "type": "serviceruntime.googleapis.com/api/request_count",
+      "displayName": "Request count",
+      "labels": {
+        "response_code_class": "2xx"
+      }
+    },
+    "metadata": {
+      "system_labels": {},
+      "user_labels": {}
+    },
+    "documentation": {
+      "content": "Runbook text…",
+      "mime_type": "text/markdown",
+      "subject": "Vertex AI calls per caller"
+    }
+  }
+}

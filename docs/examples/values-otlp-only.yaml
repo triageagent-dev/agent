@@ -1,0 +1,59 @@
+# Triage agent fed by OTLP only: no eBPF DaemonSet, no log exporter. An
+# OpenTelemetry Collector in the cluster sends RED/SIG/topology (span metrics),
+# USE (cadvisor) and LOG (count connector) to the agent; see
+# otel-collector-triage.yaml for the collector side.
+#
+#   helm upgrade --install triage-agent <chart> -n triage --create-namespace \
+#     -f values-otlp-only.yaml
+#
+# Then approve the join on the core (triagectl agent pending / approve), and
+# issue the collector's client certificate inside the controller pod:
+#   kubectl -n triage exec deploy/triage-agent-controller -- triage-agent otlp-cert \
+#     --client-ca-secret triage-agent-otlp-client-ca \
+#     --serving-ca-configmap triage-agent-sensor-ca \
+#     --tenant <tenant> --cn <collector> > triage-otlp-client.yaml
+# and apply that Secret in the collector's namespace. The collector exports
+# to triage-agent-sensors.triage.svc:4317.
+
+image:
+  repository: <registry>/triage-agent
+  tag: <agent-tag>
+
+replicaCount: 2
+
+push:
+  enabled: true
+  host: <triage-host>
+  clusterName: <cluster>
+  join:
+    caFingerprint: <SHA256:... from `triagectl agent list`>
+    tenants: [<tenant>]
+
+# The OTLP receiver. The agent is its own client CA: senders present a
+# certificate from `triage-agent otlp-cert`, which names their tenant.
+otlp:
+  enabled: true
+  ownCA: true
+
+# Watch no Kubernetes objects at all (ADR-0021): no ClusterRole, namespace-scoped
+# rights only. Needs one tenant, since there is no namespace annotation to read
+# it from. Leave `watch: true` for virtual apps and Warning events.
+#   kubernetes:
+#     watch: false
+#   target:
+#     tenant: <tenant>
+
+# Every collector reads from OTLP; nothing runs on the nodes.
+ebpf:
+  enabled: false
+logExporter:
+  enabled: false
+redMetrics:
+  enabled: true
+useMetrics:
+  enabled: true
+  nodeExporter: false
+logMetrics:
+  enabled: true
+topology:
+  enabled: true

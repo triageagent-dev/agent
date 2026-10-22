@@ -1,0 +1,17 @@
+{{- if gt (int .Values.replicaCount) 1 }}
+{{- /* With more than one replica, a voluntary disruption (a node drain)
+       takes one controller down at a time, so a leader is always there to
+       take over. One replica gets none: it would block every drain. */}}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "triage-agent.fullname" . }}-controller
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "triage-agent.labels" . | nindent 4 }}
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      {{- include "triage-agent.selectorLabels" . | nindent 6 }}
+{{- end }}

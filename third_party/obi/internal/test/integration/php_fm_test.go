@@ -1,0 +1,272 @@
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package integration
+
+import (
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"path"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"go.opentelemetry.io/obi/internal/test/integration/components/docker"
+	"go.opentelemetry.io/obi/internal/test/integration/components/jaeger"
+	"go.opentelemetry.io/obi/internal/test/integration/components/promtest"
+	ti "go.opentelemetry.io/obi/pkg/test/integration"
+)
+
+// does a smoke test to verify that all the components that started
+// asynchronously for the Elixir test are up and communicating properly
+func waitForPHPTestComponents(t *testing.T, url string) {
+	waitForTestComponentsSub(t, url, "/status")
+}
+
+func waitForPHPTraceTestComponents(t *testing.T, url string) {
+	waitForTestComponentsSubStatus(t, url, "/hello", 404)
+	waitForSQLTestComponentsMySQL(t, url, "/")
+}
+
+func testREDMetricsForPHPHTTPLibrary(t *testing.T, url string, nginx, php string) {
+	path := "/ping"
+
+	pq := promtest.Client{HostPort: prometheusHostPort}
+	var results []promtest.Result
+
+	// Call 4 times the instrumented service, forcing it to:
+	// - process multiple calls in a row with, one more than we might need
+	// - returning a 200 code
+	for i := 0; i < 4; i++ {
+		ti.DoHTTPGet(t, fmt.Sprintf("%s%s", url, path), 200)
+	}
+
+	// Eventually, Prometheus would make this query visible
+	require.EventuallyWithT(t, func(ct *assert.CollectT) {
+		var err error
+		results, err = pq.Query(`http_server_request_duration_seconds_count{` +
+			`http_request_method="GET",` +
+			`http_response_status_code="200",` +
+			`service_namespace="integration-test",` +
+			`service_name="` + nginx + `",` +
+			`http_route="/ping"}`)
+		require.NoError(ct, err)
+		enoughPromResults(ct, results)
+		val := totalPromCount(ct, results)
+		assert.LessOrEqual(ct, 3, val)
+		if len(results) > 0 {
+			res := results[0]
+			addr := res.Metric["client_address"]
+			assert.NotNil(ct, addr)
+		}
+	}, testTimeout, 100*time.Millisecond)
+	require.EventuallyWithT(t, func(ct *assert.CollectT) {
+		var err error
+		results, err = pq.Query(`http_server_request_duration_seconds_count{` +
+			`http_request_method="GET",` +
+			`http_response_status_code="200",` +
+			`service_namespace="integration-test",` +
+			`service_name="` + php + `",` +
+			`http_route="/ping"}`)
+		require.NoError(ct, err)
+		enoughPromResults(ct, results)
+		val := totalPromCount(ct, results)
+		assert.LessOrEqual(ct, 3, val)
+		if len(results) > 0 {
+			res := results[0]
+			addr := res.Metric["client_address"]
+			assert.NotNil(ct, addr)
+		}
+	}, testTimeout, 100*time.Millisecond)
+	require.EventuallyWithT(t, func(ct *assert.CollectT) {
+		var err error
+		results, err = pq.Query(`http_client_request_duration_seconds_count{` +
+			`http_request_method="GET",` +
+			`http_response_status_code="200",` +
+			`service_namespace="integration-test",` +
+			`service_name="` + nginx + `",` +
+			`http_route="/ping"}`)
+		require.NoError(ct, err)
+		enoughPromResults(ct, results)
+		val := totalPromCount(ct, results)
+		assert.LessOrEqual(ct, 3, val)
+		if len(results) > 0 {
+			res := results[0]
+			addr := res.Metric["client_address"]
+			assert.NotNil(ct, addr)
+		}
+	}, testTimeout, 100*time.Millisecond)
+}
+
+func testREDMetricsPHPFPM(t *testing.T) {
+	for _, testCaseURL := range []string{
+		"http://localhost:8080",
+	} {
+		t.Run(testCaseURL, func(t *testing.T) {
+			waitForPHPTestComponents(t, testCaseURL)
+			testREDMetricsForPHPHTTPLibrary(t, testCaseURL, "nginx", "php-fpm")
+		})
+	}
+}
+
+func TestPHPFM(t *testing.T) {
+	compose, err := docker.ComposeSuite("docker-compose-php-fpm.yml", path.Join(pathOutput, "test-suite-php-fpm.log"))
+	require.NoError(t, err)
+
+	// we are going to setup discovery directly in the configuration file
+	compose.Env = append(compose.Env, `OTEL_EBPF_EXECUTABLE_PATH=`, `OTEL_EBPF_OPEN_PORT=`)
+	require.NoError(t, compose.Up())
+
+	t.Run("PHP-FM RED metrics", testREDMetricsPHPFPM)
+
+	runWeaverValidation(t)
+
+	require.NoError(t, compose.Close())
+}
+
+func testHTTPTracesPHP(t *testing.T) {
+	for i := 0; i < 4; i++ {
+		ti.DoHTTPGet(t, "http://localhost:8080/", 200)
+	}
+
+	var trace jaeger.Trace
+	require.EventuallyWithT(t, func(ct *assert.CollectT) {
+		resp, err := http.Get(jaegerQueryURL + "?service=php-fpm&operation=GET%20%2F")
+		require.NoError(ct, err)
+		if resp == nil {
+			return
+		}
+		require.Equal(ct, http.StatusOK, resp.StatusCode)
+		var tq jaeger.TracesQuery
+		require.NoError(ct, json.NewDecoder(resp.Body).Decode(&tq))
+		traces := tq.FindBySpan(jaeger.Tag{Key: "url.path", Type: "string", Value: "/"})
+		require.GreaterOrEqual(ct, len(traces), 1)
+		trace = traces[len(traces)-1]
+
+		// Check the information of the parent span
+		res := trace.FindByOperationNameAndService("GET /", "nginx")
+		require.Len(ct, res, 2)
+		parent := res[0]
+		require.NotEmpty(ct, parent.TraceID)
+		traceID := parent.TraceID
+		require.NotEmpty(ct, parent.SpanID)
+		// check duration is at least 2us
+		assert.Less(ct, (2 * time.Microsecond).Microseconds(), parent.Duration)
+
+		res = trace.FindByOperationNameAndService("GET /", "php-fpm")
+		require.Len(ct, res, 1)
+
+		parent = res[0]
+		require.NotEmpty(ct, parent.TraceID)
+		require.Equal(ct, traceID, parent.TraceID)
+		require.NotEmpty(ct, parent.SpanID)
+
+		res = trace.FindByOperationNameAndService("SELECT accounts", "php-fpm")
+		require.Len(ct, res, 1)
+
+		parent = res[0]
+		require.NotEmpty(ct, parent.TraceID)
+		require.Equal(ct, traceID, parent.TraceID)
+		require.NotEmpty(ct, parent.SpanID)
+	}, testTimeout, 100*time.Millisecond)
+
+	// Verify that query parameters from the FastCGI QUERY_STRING field are
+	// propagated to the php-fpm server span as url.query.
+	// Use a unique marker value to avoid matching stale traces from earlier requests.
+	ti.DoHTTPGet(t, "http://localhost:8080/?obi_urlquery_test=1", 200)
+
+	require.EventuallyWithT(t, func(ct *assert.CollectT) {
+		resp, err := http.Get(jaegerQueryURL + "?service=php-fpm&operation=GET%20%2F")
+		require.NoError(ct, err)
+		if resp == nil {
+			return
+		}
+		defer resp.Body.Close()
+		require.Equal(ct, http.StatusOK, resp.StatusCode)
+		var tq jaeger.TracesQuery
+		require.NoError(ct, json.NewDecoder(resp.Body).Decode(&tq))
+
+		// Find any trace that has a php-fpm server span carrying url.query.
+		traces := tq.FindBySpan(jaeger.Tag{Key: "url.query", Type: "string", Value: "obi_urlquery_test=1"})
+		require.GreaterOrEqual(ct, len(traces), 1)
+
+		phpSpans := traces[0].FindByOperationNameAndService("GET /", "php-fpm")
+		require.GreaterOrEqual(ct, len(phpSpans), 1)
+		tag, ok := jaeger.FindIn(phpSpans[0].Tags, "url.query")
+		require.True(ct, ok, "url.query tag missing from php-fpm server span")
+		assert.Equal(ct, "obi_urlquery_test=1", tag.Value)
+	}, testTimeout, 100*time.Millisecond)
+
+	// Verify that sensitive query-parameter values are redacted.
+	// "sig" is in the default redact list, so its value must appear as REDACTED.
+	ti.DoHTTPGet(t, "http://localhost:8080/?obi_urlquery_test=2&sig=secret123", 200)
+
+	require.EventuallyWithT(t, func(ct *assert.CollectT) {
+		resp, err := http.Get(jaegerQueryURL + "?service=php-fpm&operation=GET%20%2F")
+		require.NoError(ct, err)
+		if resp == nil {
+			return
+		}
+		defer resp.Body.Close()
+		require.Equal(ct, http.StatusOK, resp.StatusCode)
+		var tq jaeger.TracesQuery
+		require.NoError(ct, json.NewDecoder(resp.Body).Decode(&tq))
+
+		traces := tq.FindBySpan(jaeger.Tag{Key: "url.query", Type: "string", Value: "obi_urlquery_test=2&sig=REDACTED"})
+		require.GreaterOrEqual(ct, len(traces), 1)
+
+		phpSpans := traces[0].FindByOperationNameAndService("GET /", "php-fpm")
+		require.GreaterOrEqual(ct, len(phpSpans), 1)
+		tag, ok := jaeger.FindIn(phpSpans[0].Tags, "url.query")
+		require.True(ct, ok, "url.query tag missing from php-fpm server span")
+		assert.Equal(ct, "obi_urlquery_test=2&sig=REDACTED", tag.Value)
+	}, testTimeout, 100*time.Millisecond)
+}
+
+func testTracesPHPFPM(t *testing.T) {
+	for _, testCaseURL := range []string{
+		"http://localhost:8080",
+	} {
+		t.Run(testCaseURL, func(t *testing.T) {
+			waitForPHPTraceTestComponents(t, testCaseURL)
+			testHTTPTracesPHP(t)
+		})
+	}
+}
+
+func TestPHPFMUnixSock(t *testing.T) {
+	compose, err := docker.ComposeSuite("docker-compose-php-fpm-sock.yml", path.Join(pathOutput, "test-suite-php-fpm-sock.log"))
+	require.NoError(t, err)
+
+	// we are going to setup discovery directly in the configuration file
+	compose.Env = append(compose.Env, `OTEL_EBPF_EXECUTABLE_PATH=`, `OTEL_EBPF_OPEN_PORT=`)
+	require.NoError(t, compose.Up())
+
+	t.Run("PHP-FM RED metrics", testTracesPHPFPM)
+
+	runWeaverValidation(t)
+
+	require.NoError(t, compose.Close())
+}
+
+func TestPHPFMUnixSockNginxSupportFloor(t *testing.T) {
+	compose, err := docker.ComposeSuite("docker-compose-php-fpm-sock.yml", path.Join(pathOutput, "test-suite-php-fpm-sock-nginx-floor.log"))
+	require.NoError(t, err)
+
+	compose.Env = append(
+		compose.Env,
+		`OTEL_EBPF_EXECUTABLE_PATH=`,
+		`OTEL_EBPF_OPEN_PORT=`,
+		`NGINX_BASE_IMAGE=`+nginxServerTracingSupportFloorImage,
+	)
+	require.NoError(t, compose.Up())
+
+	t.Run("PHP-FM traces", testTracesPHPFPM)
+
+	runWeaverValidation(t)
+
+	require.NoError(t, compose.Close())
+}
