@@ -156,7 +156,7 @@ make bin/triage-agent                 # build the controller binary
 make test                             # unit tests (no cluster needed)
 make lint                             # golangci-lint
 make obi-generate                     # regenerate the vendored eBPF bindings (docker required)
-make ko-push KO_DOCKER_REPO=...       # build and push the image (built with -tags obi)
+make ko-push KO_DOCKER_REPO=...       # build and push the image `agent` (no OBI); ko-push-obi builds `agent-obi` (-tags obi)
 make packages                         # host binaries (-tags obi) and deb/rpm in dist/ (needs nfpm)
 ```
 

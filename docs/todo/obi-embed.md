@@ -25,6 +25,15 @@
   that `third_party/obi` is vendored — it only runs the codegen prerequisite
   (Docker, OBI-version-bump-only) plus go-only sanity builds. See
   `docs/release.md` for the current build commands.
+- **Update, two images again (2026-10-23)**: the OTLP-only install made the
+  split worth having. `.ko.yaml` is the default image `agent`, built without
+  OBI for the controller and the OTLP role; `hack/ko-obi/.ko.yaml` is
+  `agent-obi`, built with `-tags obi`, for the eBPF DaemonSet. `make
+  ko-image-obi`/`ko-push-obi` are back (the OBI image goes to
+  `<KO_DOCKER_REPO>-obi`), and the chart has `image.ebpf.*` and the
+  `triage-agent.ebpfImage` helper again, defaulting to `<image.repository>-obi`.
+  Every file that imports OBI carries the `obi` tag so the plain build links
+  none.
 - **Update, single-image consolidation (2026-09-27)**: `.ko.obi.yaml` is
   gone. `.ko.yaml` itself now carries `-tags obi`, so `make ko-image`/`ko-push`
   build the one image the controller Deployment and the eBPF DaemonSet both

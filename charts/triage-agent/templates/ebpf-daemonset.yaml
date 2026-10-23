@@ -162,7 +162,7 @@ spec:
                  binary, just with --mode repeated per role. There is only one
                  image (built with -tags obi), so this is never overridden
                  separately from image.repository/image.tag. */}}
-          image: {{ include "triage-agent.image" $ | quote }}
+          image: {{ include "triage-agent.ebpfImage" $ | quote }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args:
             - --mode=ebpf

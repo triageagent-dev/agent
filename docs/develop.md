@@ -18,8 +18,9 @@ make install-tools
 
 ```bash
 make bin/triage-agent   # binary
-make ko-image            # OCI image, built with -tags obi (local layout, no push)
-make ko-push             # build and push to $KO_DOCKER_REPO
+make ko-image            # OCI image `agent`, built without OBI (local layout, no push)
+make ko-push             # build and push it to $KO_DOCKER_REPO
+make ko-push-obi         # the image with OBI for the eBPF DaemonSet, to $KO_DOCKER_REPO-obi (needs make obi-generate)
 ```
 
 There is no Dockerfile in this repo — ko builds every image, always with

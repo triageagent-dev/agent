@@ -10,12 +10,12 @@ image:
   repository: registry.invalid/example-shared-registry/triage-agent
   tag: ""            # empty → "v" + Chart.appVersion (the ko-published tag, e.g. v1.4.0)
   pullPolicy: IfNotPresent
-  # The controller and the OTLP role never run the eBPF role, so they can use
-  # the image built without OBI (about 40% smaller, no eBPF code):
-  # <repository>-otlp, published next to the main image with the same tags.
-  # Empty uses the main image. The eBPF DaemonSet always uses the main image.
-  lite:
-    repository: ""
+  # image.repository is built without OBI and runs the controller and the OTLP
+  # role. The eBPF DaemonSet needs the image built with OBI, published next to
+  # it as <repository>-obi (e.g. .../agent and .../agent-obi) with the same
+  # tags. Name another repository here, or another tag, to override that.
+  ebpf:
+    repository: ""   # empty → "<repository>-obi"
     tag: ""          # empty → image.tag, then "v" + Chart.appVersion
 
 replicaCount: 1

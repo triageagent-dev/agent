@@ -63,20 +63,20 @@ carry it.
 | Trigger | Jobs |
 |---------|------|
 | every push / PR | `test` (`make obi-generate` — cached, see below —, vet, build), `gcpevents` (vet, build, `go test ./...`) |
-| push to a branch (not PR) | `image` — multi-arch `ko build` to `ghcr.io/<owner>/<repo>`, tagged with the short sha, plus `latest` on the default branch |
-| tag `v*` | `image` additionally tags `X.Y.Z`, `X.Y` and `X`; `release` builds `linux/{amd64,arm64}` + `darwin/{amd64,arm64}` binaries with SHA256 checksums and creates the GitHub Release |
+| push to a branch (not PR) | `image` — multi-arch `ko build` of `ghcr.io/<owner>/<repo>` (no OBI) and `ghcr.io/<owner>/<repo>-obi` (with OBI), tagged with the short sha and `v<major>.<minor>.<commits since the last tag>-<sha>`, plus `latest` on the default branch |
+| tag `v*` | `image` additionally tags `vX.Y.Z`, `X.Y.Z`, `X.Y` and `X` on both images and publishes the chart; `release` builds `linux/{amd64,arm64}` + `darwin/{amd64,arm64}` binaries with SHA256 checksums and creates the GitHub Release |
 
 The `image` job invokes `ko` directly rather than through `make ko-push`, so it
 must export `VERSION` / `GIT_COMMIT` / `BUILD_DATE` itself — `.ko.yaml` templates
 all three and ko **fails the build** if any is missing (`template: map has no entry
 for key "VERSION"`). Any new ko call site needs them too.
 
-`.ko.yaml` builds with `-tags obi`, so the `image` job needs the generated eBPF
-bindings too. It restores them from the same cache the `test` job populates
-(keyed on `git rev-parse HEAD:third_party/obi`) instead of regenerating them
-itself. `go vet` (and any local `go test`/`make test`) needs them regardless of
-build tag: `cmd/triage-agent`'s untagged `ebpf_config_test.go`/`ebpf_metrics_test.go`
-import OBI packages that reach the generated bindings transitively.
+`.ko.yaml` builds `agent` without OBI, so that image needs no generated eBPF
+bindings; `hack/ko-obi/.ko.yaml` builds `agent-obi` with `-tags obi`, so the
+`image` job needs the bindings for it. It restores them from the same cache
+the `test` job populates (keyed on `git rev-parse HEAD:third_party/obi`)
+instead of regenerating them itself. Plain `go vet`, `go test` and `make test`
+need none (CI fails if the plain build imports OBI); `go vet -tags obi` does.
 
 ## Local image builds
 

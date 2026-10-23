@@ -92,7 +92,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: triage-agent
-          image: {{ include "triage-agent.liteImage" . | quote }}
+          image: {{ include "triage-agent.image" . | quote }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args:
             - --mode=otlp

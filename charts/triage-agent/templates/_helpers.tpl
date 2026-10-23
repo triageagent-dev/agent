@@ -50,17 +50,16 @@ stays the plain semver per Helm convention.
 {{- end -}}
 
 {{/*
-Image of the controller and the OTLP role, which never run the eBPF role. With
-image.lite.repository set it is the image built without OBI; otherwise it is
-the main image. image.lite.tag defaults to image.tag, then to "v" + appVersion.
+Image of the eBPF DaemonSet, the only workload that runs the eBPF role: the
+image built with OBI. image.ebpf.repository names it; empty means
+"<image.repository>-obi". image.ebpf.tag defaults to image.tag, then to "v" +
+appVersion. The controller and the OTLP role run image.repository, built
+without OBI.
 */}}
-{{- define "triage-agent.liteImage" -}}
-{{- if .Values.image.lite.repository -}}
-{{- $tag := .Values.image.lite.tag | default .Values.image.tag | default (printf "v%s" .Chart.AppVersion) -}}
-{{- printf "%s:%s" .Values.image.lite.repository $tag -}}
-{{- else -}}
-{{- include "triage-agent.image" . -}}
-{{- end -}}
+{{- define "triage-agent.ebpfImage" -}}
+{{- $repo := .Values.image.ebpf.repository | default (printf "%s-obi" .Values.image.repository) -}}
+{{- $tag := .Values.image.ebpf.tag | default .Values.image.tag | default (printf "v%s" .Chart.AppVersion) -}}
+{{- printf "%s:%s" $repo $tag -}}
 {{- end -}}
 
 {{/* "true" when the sensor stream renders (docs/adr/0015-sensor-stream-grpc.md):

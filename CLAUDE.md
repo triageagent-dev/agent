@@ -94,23 +94,24 @@ Reads the embedded OBI instrumenter's OTLP metrics (`ebpf` role) from the sensor
 
 ### Container images
 
-**ko only. There is no Dockerfile anywhere in this repo.** One image comes
-off the main package (`.ko.yaml`, `make ko-image`/`ko-push`), built with
-`-tags obi` so it can run `--mode role "ebpf"` (see
-`ebpf_obi.go`/`ebpf_stub.go`: the untagged stub exists only for the plain
-`go vet`/`go test` runs, not for a shipped image). Both the controller
-Deployment and the eBPF DaemonSet in `charts/triage-agent` run this one
-image. The build additionally requires
+**ko only. There is no Dockerfile anywhere in this repo.** Two images come
+off the main package. `agent` (`.ko.yaml`, `make ko-image`/`ko-push`) is built
+without OBI: it links no OBI package, needs no generated eBPF bindings, and
+runs the controller Deployment and the OTLP role (`--mode=otlp`); `--mode role
+"ebpf"` fails fast in it (`ebpf_stub.go`). `agent-obi` (`hack/ko-obi/.ko.yaml`,
+`make ko-image-obi`/`ko-push-obi`, published to `<repo>-obi`) is built with
+`-tags obi` so it can run `--mode role "ebpf"` (`ebpf_obi.go`); the eBPF
+DaemonSet in `charts/triage-agent` runs it (`image.ebpf.*`, default
+`<image.repository>-obi`). Only `agent-obi` requires
 `third_party/obi/pkg/**/*_bpfel.{go,o}` to already be generated (`make
 obi-generate`, Docker required, wraps `third_party/obi`'s own
-`docker-generate` target; `hack/build-obi.sh` runs the same target
-locally). It is a prerequisite, never a build step itself. The build
-without `-tags obi` links no OBI package (every file that imports OBI carries
-the `obi` tag; CI checks this), so plain `go vet`, `go test` and the image
-without OBI (`hack/ko-otlp/.ko.yaml`, `make ko-push-otlp`, for the controller
-and the OTLP role) need no generated files. CI still runs `make obi-generate`
-before the `-tags obi` build (cached on the vendored tree's git hash, see CI
-below). Details: `docs/release.md`, `docs/todo/obi-embed.md`.
+`docker-generate` target; `hack/build-obi.sh` runs the same target locally).
+It is a prerequisite, never a build step itself. Every file that imports OBI
+carries the `obi` build tag and CI checks that the plain build imports none,
+so plain `go vet`, `go test` and the `agent` image need no generated files.
+CI runs `make obi-generate` before the `-tags obi` build (cached on the
+vendored tree's git hash, see CI below). Details: `docs/release.md`,
+`docs/todo/obi-embed.md`.
 
 ### Testing
 

@@ -249,13 +249,14 @@ obi-generate: ## Regenerate third_party/obi's bpf2go eBPF bindings (docker requi
 ## ko
 ## --------------------------------------
 # ko is the ONLY way any container image in this repo gets built — there is
-# no Dockerfile anywhere in this tree. One image comes off the one main
-# package (.ko.yaml, build id `triage-agent`), built with `-tags obi`: the
-# controller Deployment and the eBPF DaemonSet both run it. `-tags obi` is
-# what makes `--mode role ebpf` real (ebpf_stub.go fails fast without it).
-# Requires third_party/obi/pkg/**/*_bpfel.{go,o} to already be generated
-# first via `make obi-generate` — a docker-only prerequisite, never a build
-# step. See hack/build-obi.sh and docs/todo/obi-embed.md.
+# no Dockerfile anywhere in this tree. Two images come off the one main
+# package: `agent` (.ko.yaml), built without OBI, runs the controller and the
+# OTLP role; `agent-obi` (hack/ko-obi/.ko.yaml), built with `-tags obi`, runs
+# the eBPF DaemonSet (`-tags obi` is what makes `--mode role ebpf` real;
+# ebpf_stub.go fails fast without it). Only `agent-obi` requires
+# third_party/obi/pkg/**/*_bpfel.{go,o} to already be generated first via
+# `make obi-generate` — a docker-only prerequisite, never a build step. See
+# hack/build-obi.sh and docs/todo/obi-embed.md.
 #
 # REGISTRY is an optional alias for KO_DOCKER_REPO (wins if both are set) —
 # same knob name as the sibling triageagent-dev/core repo's `make push REGISTRY=...`,
@@ -273,32 +274,31 @@ KO_DOCKER_REPO := $(REGISTRY)
 endif
 
 .PHONY: ko-image
-ko-image: ## Build the container image locally using ko (no push)
+ko-image: ## Build the default image (no OBI) locally using ko (no push)
 	VERSION=$(VER) GIT_COMMIT=$(GIT_COMMIT) BUILD_DATE=$(BUILD_DATE) KO_DOCKER_REPO=ko.local ko build \
 		--oci-layout-path=bin/images/triage-agent \
 		./cmd/triage-agent
 
 .PHONY: ko-push
-ko-push: ## Build and push the container image using ko
+ko-push: ## Build and push the default image (no OBI) using ko
 	VERSION=$(VER) GIT_COMMIT=$(GIT_COMMIT) BUILD_DATE=$(BUILD_DATE) KO_DOCKER_REPO=$(KO_DOCKER_REPO) ko build \
 		--tags=$(VER) \
 		--bare \
 		--image-label org.opencontainers.image.version=$(VER) \
 		./cmd/triage-agent
 
-# The image without OBI (hack/ko-otlp/.ko.yaml): for the controller and the OTLP
-# role, which never run the eBPF role. It links no OBI and needs no generated
-# eBPF bindings.
-# Published to <KO_DOCKER_REPO>-otlp.
-.PHONY: ko-image-otlp
-ko-image-otlp: ## Build the image without OBI locally using ko (no push)
-	KO_CONFIG_PATH=hack/ko-otlp VERSION=$(VER) GIT_COMMIT=$(GIT_COMMIT) BUILD_DATE=$(BUILD_DATE) KO_DOCKER_REPO=ko.local ko build \
-		--oci-layout-path=bin/images/triage-agent-otlp \
+# The image with OBI (hack/ko-obi/.ko.yaml, built with -tags obi) for the eBPF
+# DaemonSet. Published to <KO_DOCKER_REPO>-obi. It needs the generated eBPF
+# bindings (`make obi-generate`).
+.PHONY: ko-image-obi
+ko-image-obi: ## Build the image with OBI locally using ko (no push)
+	KO_CONFIG_PATH=hack/ko-obi VERSION=$(VER) GIT_COMMIT=$(GIT_COMMIT) BUILD_DATE=$(BUILD_DATE) KO_DOCKER_REPO=ko.local ko build \
+		--oci-layout-path=bin/images/triage-agent-obi \
 		./cmd/triage-agent
 
-.PHONY: ko-push-otlp
-ko-push-otlp: ## Build and push the image without OBI using ko, to <KO_DOCKER_REPO>-otlp
-	KO_CONFIG_PATH=hack/ko-otlp VERSION=$(VER) GIT_COMMIT=$(GIT_COMMIT) BUILD_DATE=$(BUILD_DATE) KO_DOCKER_REPO=$(KO_DOCKER_REPO)-otlp ko build \
+.PHONY: ko-push-obi
+ko-push-obi: ## Build and push the image with OBI using ko, to <KO_DOCKER_REPO>-obi
+	KO_CONFIG_PATH=hack/ko-obi VERSION=$(VER) GIT_COMMIT=$(GIT_COMMIT) BUILD_DATE=$(BUILD_DATE) KO_DOCKER_REPO=$(KO_DOCKER_REPO)-obi ko build \
 		--tags=$(VER) \
 		--bare \
 		--image-label org.opencontainers.image.version=$(VER) \

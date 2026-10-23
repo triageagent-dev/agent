@@ -25,7 +25,7 @@ jobs:
           cache: true
 
       # The build without -tags obi (the image for the controller and the OTLP
-      # role, hack/ko-otlp) must not link OBI at all, so it builds without the
+      # role, the default image) must not link OBI at all, so it builds without the
       # generated eBPF bindings. Every file that imports OBI carries the obi tag.
       - name: The plain build links no OBI
         run: |
@@ -255,17 +255,18 @@ jobs:
           # ko prints the pushed reference, <repo>@sha256:<digest>, on stdout.
           REF="$(tail -n1 "$RUNNER_TEMP/ko-ref.txt")"
           echo "digest=${REF##*@}" >> "$GITHUB_OUTPUT"
-          # The image without OBI (hack/ko-otlp/.ko.yaml) for the controller and
-          # the OTLP role: <repo>-otlp, same tags, built without OBI.
-          KO_CONFIG_PATH=hack/ko-otlp KO_DOCKER_REPO="${KO_DOCKER_REPO}-otlp" ko build \
+          # The image with OBI (hack/ko-obi/.ko.yaml, -tags obi) for the eBPF
+          # DaemonSet: <repo>-obi, same tags. The image above is built without
+          # OBI (.ko.yaml) and runs the controller and the OTLP role.
+          KO_CONFIG_PATH=hack/ko-obi KO_DOCKER_REPO="${KO_DOCKER_REPO}-obi" ko build \
             --tags="$TAGS" \
             --bare \
             --platform=linux/amd64,linux/arm64 \
             --image-label org.opencontainers.image.revision=$(git rev-parse HEAD) \
             --image-label org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }} \
-            ./cmd/triage-agent > "$RUNNER_TEMP/ko-ref-otlp.txt"
-          REF="$(tail -n1 "$RUNNER_TEMP/ko-ref-otlp.txt")"
-          echo "digest_otlp=${REF##*@}" >> "$GITHUB_OUTPUT"
+            ./cmd/triage-agent > "$RUNNER_TEMP/ko-ref-obi.txt"
+          REF="$(tail -n1 "$RUNNER_TEMP/ko-ref-obi.txt")"
+          echo "digest_obi=${REF##*@}" >> "$GITHUB_OUTPUT"
 
       # Sign and attest by digest, never by tag: a tag can move.
       - name: Sign the image
@@ -274,10 +275,10 @@ jobs:
           DIGEST: ${{ steps.ko.outputs.digest }}
         run: cosign sign --yes "${IMAGE}@${DIGEST}"
 
-      - name: Sign the image without OBI
+      - name: Sign the image with OBI
         env:
-          IMAGE: ghcr.io/${{ github.repository }}-otlp
-          DIGEST: ${{ steps.ko.outputs.digest_otlp }}
+          IMAGE: ghcr.io/${{ github.repository }}-obi
+          DIGEST: ${{ steps.ko.outputs.digest_obi }}
         run: cosign sign --yes "${IMAGE}@${DIGEST}"
 
       - name: Attest image build provenance
@@ -287,11 +288,11 @@ jobs:
           subject-digest: ${{ steps.ko.outputs.digest }}
           push-to-registry: true
 
-      - name: Attest build provenance of the image without OBI
+      - name: Attest build provenance of the image with OBI
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
-          subject-name: ghcr.io/${{ github.repository }}-otlp
-          subject-digest: ${{ steps.ko.outputs.digest_otlp }}
+          subject-name: ghcr.io/${{ github.repository }}-obi
+          subject-digest: ${{ steps.ko.outputs.digest_obi }}
           push-to-registry: true
 
       # The Helm chart next to the image, on release tags only: the core's
