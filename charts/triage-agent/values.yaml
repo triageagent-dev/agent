@@ -11,7 +11,7 @@ image:
   tag: ""            # empty → "v" + Chart.appVersion (the ko-published tag, e.g. v1.4.0)
   pullPolicy: IfNotPresent
   # The controller and the OTLP role never run the eBPF role, so they can use
-  # the image built without OBI (about a third smaller, no eBPF code):
+  # the image built without the OBI instrumenter (about a third smaller):
   # <repository>-otlp, published next to the main image with the same tags.
   # Empty uses the main image. The eBPF DaemonSet always uses the main image.
   lite:

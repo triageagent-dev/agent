@@ -237,7 +237,7 @@ jobs:
           REF="$(tail -n1 "$RUNNER_TEMP/ko-ref.txt")"
           echo "digest=${REF##*@}" >> "$GITHUB_OUTPUT"
           # The image without OBI (hack/ko-otlp/.ko.yaml) for the controller and
-          # the OTLP role: <repo>-otlp, same tags, no eBPF bindings needed.
+          # the OTLP role: <repo>-otlp, same tags (it compiles with the bindings above).
           KO_CONFIG_PATH=hack/ko-otlp KO_DOCKER_REPO="${KO_DOCKER_REPO}-otlp" ko build \
             --tags="$TAGS" \
             --bare \
