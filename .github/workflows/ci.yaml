@@ -89,11 +89,15 @@ jobs:
         run: go test -race ./...
 
       # The files that import OBI carry the obi tag, so the tests above leave
-      # them out; this run covers them (it needs the bindings generated above).
+      # them out; this run vets the tagged build and runs the tests of those
+      # files (it needs the bindings generated above). The other tests of the
+      # package assume the stub eBPF role (host mode, for one, then registers a
+      # real one on linux), so they run in the plain build only.
       - name: Vet and test with -tags obi
         run: |
           go vet -tags obi ./cmd/triage-agent
-          go test -race -tags obi ./cmd/triage-agent
+          TESTS=$(grep -l '^//go:build obi' cmd/triage-agent/*_test.go | xargs grep -h -o '^func Test[A-Za-z0-9_]*' | sed 's/func //' | paste -sd'|' -)
+          go test -race -tags obi -run "^(${TESTS})$" ./cmd/triage-agent
 
       # third_party/obi is its own module (the root's `./...` does not reach
       # it), and this repo patches its HTTP/2 and gRPC decoding, so that
