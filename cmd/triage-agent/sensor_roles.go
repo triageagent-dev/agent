@@ -108,7 +108,7 @@ func runSensorRoles(roles []string, o sensorRoleOptions) int {
 			setupLog.Info("starting role", "role", role)
 			g.Go(func() error { return exp.Run(gctx) })
 		case metricset.RoleEBPF:
-			sources[role] = obiMetrics
+			sources[role] = ebpfSource()
 			setupLog.Info("starting role", "role", "ebpf (embedded OTel eBPF instrumenter)")
 			g.Go(func() error { return runEBPF(gctx) })
 		default:

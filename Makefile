@@ -287,8 +287,8 @@ ko-push: ## Build and push the container image using ko
 		./cmd/triage-agent
 
 # The image without OBI (hack/ko-otlp/.ko.yaml): for the controller and the OTLP
-# role, which never run the eBPF role. The binary still imports OBI packages, so
-# the generated eBPF bindings are needed to compile it (`make obi-generate`).
+# role, which never run the eBPF role. It links no OBI and needs no generated
+# eBPF bindings.
 # Published to <KO_DOCKER_REPO>-otlp.
 .PHONY: ko-image-otlp
 ko-image-otlp: ## Build the image without OBI locally using ko (no push)

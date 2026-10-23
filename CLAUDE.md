@@ -104,14 +104,13 @@ image. The build additionally requires
 `third_party/obi/pkg/**/*_bpfel.{go,o}` to already be generated (`make
 obi-generate`, Docker required, wraps `third_party/obi`'s own
 `docker-generate` target; `hack/build-obi.sh` runs the same target
-locally). It is a prerequisite, never a build step itself, but it is not
-only-when-bumping-OBI-version: `go vet ./...` and `go test ./...` on the
-untagged build reach the generated files too, because
-`cmd/triage-agent/ebpf_config_test.go` and `ebpf_metrics_test.go` import
-`go.opentelemetry.io/obi/pkg/obi` / `.../pkg/export/connector`
-unconditionally. CI runs `make obi-generate` before `go vet`/`go build` for
-this reason (cached on the vendored tree's git hash, see CI below). Details:
-`docs/release.md`, `docs/todo/obi-embed.md`.
+locally). It is a prerequisite, never a build step itself. The build
+without `-tags obi` links no OBI package (every file that imports OBI carries
+the `obi` tag; CI checks this), so plain `go vet`, `go test` and the image
+without OBI (`hack/ko-otlp/.ko.yaml`, `make ko-push-otlp`, for the controller
+and the OTLP role) need no generated files. CI still runs `make obi-generate`
+before the `-tags obi` build (cached on the vendored tree's git hash, see CI
+below). Details: `docs/release.md`, `docs/todo/obi-embed.md`.
 
 ### Testing
 

@@ -1,3 +1,5 @@
+//go:build obi
+
 // Copyright 2026 Denys Vasyliev.
 // SPDX-License-Identifier: Apache-2.0
 

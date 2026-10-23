@@ -1,3 +1,5 @@
+//go:build obi
+
 // Untagged, like ebpf_config.go itself — runs natively on the darwin dev
 // host (see that file's doc comment for why obi.LoadConfig/obi.Config are
 // safe to exercise without a codegen'd OBI checkout).

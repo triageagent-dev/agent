@@ -24,15 +24,23 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      # The build without -tags obi (the image for the controller and the OTLP
+      # role, hack/ko-otlp) must not link OBI at all, so it builds without the
+      # generated eBPF bindings. Every file that imports OBI carries the obi tag.
+      - name: The plain build links no OBI
+        run: |
+          if go list -deps ./cmd/triage-agent | grep -q '^go.opentelemetry.io/obi'; then
+            echo "the build without -tags obi imports OBI:"
+            go list -deps ./cmd/triage-agent | grep '^go.opentelemetry.io/obi' | head
+            exit 1
+          fi
+
       # third_party/obi is a vendored, checked-in copy of OBI's source; its
       # bpf2go-generated Go bindings (*_bpfel.{go,o}, gitignored per
       # third_party/obi/.gitignore) are not committed, so this checkout
-      # starts without them. `go vet ./...` below reaches them even without
-      # `-tags obi`: cmd/triage-agent's untagged ebpf_config_test.go and
-      # ebpf_metrics_test.go import go.opentelemetry.io/obi/pkg/obi and
-      # .../pkg/export/connector, which transitively need pkg/ebpf/common —
-      # without generation this fails with "undefined: BpfTcpLargeBufferT"
-      # etc. `git rev-parse HEAD:third_party/obi` hashes exactly the
+      # starts without them. The -tags obi build and vet need them (without
+      # generation they fail with "undefined: BpfTcpLargeBufferT" etc.).
+      # `git rev-parse HEAD:third_party/obi` hashes exactly the
       # committed (patched) vendor tree — go.mod/go.sum/*.c/*.h included, the
       # gitignored generated output excluded by construction — so the cache
       # key changes only when there is actually something new to generate.
@@ -79,6 +87,13 @@ jobs:
       # need no cluster and no downloaded test binaries.
       - name: Test
         run: go test -race ./...
+
+      # The files that import OBI carry the obi tag, so the tests above leave
+      # them out; this run covers them (it needs the bindings generated above).
+      - name: Vet and test with -tags obi
+        run: |
+          go vet -tags obi ./cmd/triage-agent
+          go test -race -tags obi ./cmd/triage-agent
 
       # third_party/obi is its own module (the root's `./...` does not reach
       # it), and this repo patches its HTTP/2 and gRPC decoding, so that
@@ -237,7 +252,7 @@ jobs:
           REF="$(tail -n1 "$RUNNER_TEMP/ko-ref.txt")"
           echo "digest=${REF##*@}" >> "$GITHUB_OUTPUT"
           # The image without OBI (hack/ko-otlp/.ko.yaml) for the controller and
-          # the OTLP role: <repo>-otlp, same tags (it compiles with the bindings above).
+          # the OTLP role: <repo>-otlp, same tags, built without OBI.
           KO_CONFIG_PATH=hack/ko-otlp KO_DOCKER_REPO="${KO_DOCKER_REPO}-otlp" ko build \
             --tags="$TAGS" \
             --bare \

@@ -22,7 +22,12 @@ import (
 
 	"github.com/triageagent-dev/agent/internal/annotationkeys"
 	"github.com/triageagent-dev/agent/push"
+	"github.com/triageagent-dev/agent/sensorstream"
 )
+
+// ebpfSource is the ebpf role's metric source: what the embedded instrumenter
+// exports.
+func ebpfSource() sensorstream.RoleSource { return obiMetrics }
 
 func runEBPF(ctx context.Context) error {
 	// Config-FILE first (OBI_CONFIG_PATH, chart-mounted ConfigMap, parsed by

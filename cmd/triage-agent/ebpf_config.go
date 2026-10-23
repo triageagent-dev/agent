@@ -1,3 +1,5 @@
+//go:build obi
+
 // OS-agnostic on purpose: obi.LoadConfig/obi.Config
 // (go.opentelemetry.io/obi/pkg/obi) have no eBPF dependency and build on
 // every OS the vendored module supports, unlike pkg/instrumenter
