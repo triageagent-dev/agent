@@ -18,9 +18,6 @@
 {{- if or $o.ownCA $o.clientCASecret $o.allowedServiceAccounts $o.forwarders }}
 {{- fail "otlp.insecure.enabled serves plain gRPC to anonymous senders: it excludes otlp.ownCA, otlp.clientCASecret, otlp.allowedServiceAccounts and otlp.forwarders" }}
 {{- end }}
-{{- if not $insecure.allowFrom }}
-{{- fail "otlp.insecure.enabled needs otlp.insecure.allowFrom: the namespaces that may reach the port, which the chart fences with a NetworkPolicy" }}
-{{- end }}
 {{- if not (or .Values.target.tenant (eq (len $tenants) 1)) }}
 {{- fail "otlp.insecure.enabled files every sender under one tenant: set target.tenant, or exactly one entry in core.tenants" }}
 {{- end }}
@@ -213,7 +210,7 @@ spec:
     matchLabels:
       {{- include "triage-agent.otlpSensorSelectorLabels" . | nindent 6 }}
 {{- end }}
-{{- if $insecure.enabled }}
+{{- if and $insecure.enabled $insecure.allowFrom }}
 ---
 {{- /* Anyone who can reach the port can write signals for the tenant, so the
        pods admit only the namespaces named in otlp.insecure.allowFrom. A

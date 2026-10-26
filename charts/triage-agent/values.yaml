@@ -191,14 +191,16 @@ otlp:
   # Because anyone who can reach the port can write signals for that tenant:
   #   - it needs otlp.sensor.enabled, and excludes ownCA, clientCASecret,
   #     allowedServiceAccounts and forwarders;
-  #   - allowFrom must name the namespaces that may reach the port; the chart
-  #     renders a NetworkPolicy that admits only them (default deny), so the
-  #     cluster's CNI must enforce NetworkPolicy;
+  #   - allowFrom names the namespaces that may reach the port; the chart
+  #     then renders a NetworkPolicy that admits only them (default deny), so
+  #     the cluster's CNI must enforce NetworkPolicy. Left empty, the chart
+  #     renders no NetworkPolicy and every pod that can reach the Service may
+  #     write signals for the tenant: fence the port some other way;
   #   - the sender limits below apply per address.
   # Senders dial <fullname>-otlp:<port> with no TLS (exporter tls: insecure).
   insecure:
     enabled: false
-    allowFrom: []   # namespaces, e.g. [otel-demo]
+    allowFrom: []   # namespaces, e.g. [otel-demo]; empty = no NetworkPolicy
   sensor:
     enabled: false
     replicas: 2
