@@ -342,7 +342,7 @@ pre .token.comment { color: #8C877C; font-style: italic; }
     <tr><td class="k">&lt;fullname&gt;-peers</td><td>Service, headless</td><td>Port 9471, gossip between controller replicas, mutual TLS</td></tr>
     <tr><td class="k">PodDisruptionBudget</td><td>PodDisruptionBudget</td><td>Keeps a controller replica up during voluntary disruptions, when replicas are above 1</td></tr>
     <tr><td class="k">&lt;fullname&gt;-sensors</td><td>Service, ClusterIP</td><td>Port 9470</td></tr>
-    <tr><td class="k">&lt;fullname&gt;-otlp</td><td>Deployment and Service, ClusterIP</td><td>The OTLP sensor role, when <code>otlp.sensor.enabled</code>: two replicas by default, OTLP on 4317. With <code>otlp.insecure</code> the chart adds a NetworkPolicy that admits only the namespaces in <code>allowFrom</code></td></tr>
+    <tr><td class="k">&lt;fullname&gt;-otlp</td><td>Deployment and Service, ClusterIP</td><td>The OTLP sensor role, when <code>otlp.sensor.enabled</code>: two replicas by default, OTLP on 4317. With <code>otlp.insecure</code> the sensors serve plain gRPC; when <code>allowFrom</code> lists namespaces the chart also adds a NetworkPolicy that admits only those, otherwise it renders none</td></tr>
     <tr><td class="k">OBI config</td><td>ConfigMap</td><td>Mounted as a file; not read through the API</td></tr>
     <tr><td class="k">&lt;fullname&gt;-sensor-ca</td><td>ConfigMap, created empty</td><td>Controller writes <code>ca.crt</code>; sensors pin it</td></tr>
     <tr><td class="k">&lt;fullname&gt;-sensor-tls</td><td>Secret, created empty</td><td>Controller certificate and key</td></tr>
