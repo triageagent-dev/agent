@@ -156,10 +156,41 @@ jobs:
       - name: Test
         run: go test -race ./...
 
-  image:
-    needs: test
+  # Decides whether a push to main can change an image. A push that touches
+  # only the chart, the docs or Markdown files builds none; a tag always does,
+  # because the chart published with a release defaults to that release's image.
+  changes:
     runs-on: ubuntu-latest
-    if: github.event_name != 'pull_request'
+    outputs:
+      code: ${{ steps.diff.outputs.code }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+
+      - id: diff
+        env:
+          BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_REF_TYPE" = tag ] || [ "$GITHUB_EVENT_NAME" != push ] \
+             || ! git cat-file -e "${BEFORE}^{commit}" 2>/dev/null; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          code=false
+          while IFS= read -r f; do
+            case "$f" in
+              charts/*|docs/*|*.md|.github/CODEOWNERS|.github/dependabot.yml) ;;
+              *) echo "image input changed: $f"; code=true ;;
+            esac
+          done < <(git diff --name-only "$BEFORE" "$GITHUB_SHA")
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+
+  image:
+    needs: [test, changes]
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request' && needs.changes.outputs.code == 'true'
     permissions:
       contents: read
       packages: write
