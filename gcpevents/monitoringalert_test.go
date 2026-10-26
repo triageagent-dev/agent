@@ -23,7 +23,7 @@ func vertexCaller(description string) serviceAccount {
 		Email:       "triage-vertexai@example-project.iam.gserviceaccount.com",
 		DisplayName: "Triage Vertex AI caller",
 		Description: description,
-		UniqueID:    "116448827429795893791",
+		UniqueID:    "100000000000000000001",
 	}
 }
 
@@ -161,7 +161,7 @@ func TestDecodeMonitoringAlertPerCallerRoutesByDescription(t *testing.T) {
 
 	for key, want := range map[string]any{
 		"service":             "vertex-ai", // still the API that was called
-		"credentialId":        "serviceaccount:116448827429795893791",
+		"credentialId":        "serviceaccount:100000000000000000001",
 		"callerKind":          callerKindServiceAccount,
 		"callerName":          "triage-vertexai",
 		"serviceAccountEmail": "triage-vertexai@example-project.iam.gserviceaccount.com",
@@ -289,13 +289,13 @@ func TestDecodeMonitoringAlertPerCallerLookupFailure(t *testing.T) {
 	if ev.Source != "vertex-ai" {
 		t.Errorf("source = %q, want vertex-ai", ev.Source)
 	}
-	if got := ev.Raw["callerName"]; got != "116448827429795893791" {
+	if got := ev.Raw["callerName"]; got != "100000000000000000001" {
 		t.Errorf("raw.callerName = %v, want the raw unique id", got)
 	}
 	if _, ok := ev.Raw["serviceAccountEmail"]; ok {
 		t.Errorf("raw.serviceAccountEmail = %v, want absent when the lookup failed", ev.Raw["serviceAccountEmail"])
 	}
-	if !strings.Contains(ev.Message, " caller=116448827429795893791 observed=412") {
+	if !strings.Contains(ev.Message, " caller=100000000000000000001 observed=412") {
 		t.Errorf("message %q missing the caller", ev.Message)
 	}
 }

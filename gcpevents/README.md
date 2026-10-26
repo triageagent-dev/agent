@@ -57,7 +57,7 @@ about the API it fired on. Every tenant calls Vertex AI; what the alert says is
 *who* called it.
 
 The label names that caller by id, not by anything a service graph would
-recognize (`serviceaccount:116448827429795893791`, or
+recognize (`serviceaccount:100000000000000000001`, or
 `oauth2:32555940559.apps.googleusercontent.com`). For a service account the id
 is resolved through the IAM API —
 `GET https://iam.googleapis.com/v1/projects/-/serviceAccounts/<uniqueId>`, with

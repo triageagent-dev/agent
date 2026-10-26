@@ -27,7 +27,7 @@
     "resource": {
       "type": "consumed_api",
       "labels": {
-        "credential_id": "serviceaccount:116448827429795893791",
+        "credential_id": "serviceaccount:100000000000000000001",
         "service": "aiplatform.googleapis.com",
         "method": "google.cloud.aiplatform.v1beta1.PredictionService.GenerateContent",
         "project_id": "example-project",

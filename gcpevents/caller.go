@@ -23,7 +23,7 @@ import (
 // caller, and it names it by id rather than by anything a human — or a service
 // graph — would recognize:
 //
-//	serviceaccount:116448827429795893791            a service account's unique id
+//	serviceaccount:100000000000000000001            a service account's unique id
 //	oauth2:32555940559.apps.googleusercontent.com   a human or tooling OAuth client
 //
 // A per-caller alert is not really about the API that was called — every tenant
