@@ -13,6 +13,8 @@ permissions:
 
 jobs:
   test:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -110,6 +112,8 @@ jobs:
   # builds only the function), which means the root module's `./...` above does not
   # reach it — it needs its own job or it is never compiled or tested here at all.
   gcpevents:
+    needs: changes
+    if: needs.changes.outputs.gcpevents == 'true'
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -135,6 +139,8 @@ jobs:
   # promevents is its own Go module too, with no dependencies (no go.sum, so
   # nothing for setup-go to cache).
   promevents:
+    needs: changes
+    if: needs.changes.outputs.promevents == 'true'
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -156,13 +162,18 @@ jobs:
       - name: Test
         run: go test -race ./...
 
-  # Decides whether a push to main can change an image. A push that touches
-  # only the chart, the docs or Markdown files builds none; a tag always does,
-  # because the chart published with a release defaults to that release's image.
+  # Decides what a push or pull request can change: the image (anything but
+  # the chart, the docs and Markdown), and the two modules of their own,
+  # gcpevents and promevents, which only their directories touch. A tag, or
+  # a push whose previous commit is unknown, changes everything. A required
+  # check whose job is skipped here counts as passed, so a pull request that
+  # touches none of a module still merges.
   changes:
     runs-on: ubuntu-latest
     outputs:
       code: ${{ steps.diff.outputs.code }}
+      gcpevents: ${{ steps.diff.outputs.gcpevents }}
+      promevents: ${{ steps.diff.outputs.promevents }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -171,21 +182,29 @@ jobs:
       - id: diff
         env:
           BEFORE: ${{ github.event.before }}
+          BASE: ${{ github.event.pull_request.base.sha }}
         run: |
           set -euo pipefail
-          if [ "$GITHUB_REF_TYPE" = tag ] || [ "$GITHUB_EVENT_NAME" != push ] \
-             || ! git cat-file -e "${BEFORE}^{commit}" 2>/dev/null; then
-            echo "code=true" >> "$GITHUB_OUTPUT"
-            exit 0
+          all() { printf 'code=true\ngcpevents=true\npromevents=true\n' >> "$GITHUB_OUTPUT"; }
+          case "$GITHUB_EVENT_NAME" in
+            push) from="$BEFORE" ;;
+            pull_request) from="$BASE" ;;
+            *) all; exit 0 ;;
+          esac
+          if [ "$GITHUB_REF_TYPE" = tag ] || ! git cat-file -e "${from}^{commit}" 2>/dev/null; then
+            all; exit 0
           fi
-          code=false
+          code=false gcpevents=false promevents=false
           while IFS= read -r f; do
             case "$f" in
+              .github/workflows/ci.yaml) code=true gcpevents=true promevents=true ;;
+              gcpevents/*) gcpevents=true; code=true ;;
+              promevents/*) promevents=true; code=true ;;
               charts/*|docs/*|*.md|.github/CODEOWNERS|.github/dependabot.yml) ;;
               *) echo "image input changed: $f"; code=true ;;
             esac
-          done < <(git diff --name-only "$BEFORE" "$GITHUB_SHA")
-          echo "code=$code" >> "$GITHUB_OUTPUT"
+          done < <(git diff --name-only "$from" "$GITHUB_SHA")
+          printf 'code=%s\ngcpevents=%s\npromevents=%s\n' "$code" "$gcpevents" "$promevents" >> "$GITHUB_OUTPUT"
 
   image:
     needs: [test, changes]
