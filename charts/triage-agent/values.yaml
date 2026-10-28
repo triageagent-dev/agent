@@ -204,17 +204,29 @@ otlp:
   sensor:
     enabled: false
     replicas: 2
-    resources: {}
+    # The pod holds the latest point of every series it receives, up to
+    # limits.maxSeries; the memory limit is sized for that default and the
+    # process keeps its heap under 90% of it (GOMEMLIMIT from the cgroup).
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        memory: 2Gi
     nodeSelector: {}
     tolerations: []
     affinity: {}
     # How often each pod sends its changed sources to the controller.
     tick: 10s
   # Memory bounds; points past one are refused and reported to the sender.
+  # A series no export updated for 10 minutes is dropped, so a resource that
+  # never goes silent (a node's cAdvisor scrape) does not fill with the
+  # series of pods that are gone.
   limits:
     maxResources: 2000           # resources (sources) held in all
     maxPointsPerResource: 5000   # series of one resource
     maxResourcesPerSender: 500   # resources one authenticated sender may create
+    maxSeries: 250000            # series held in all: what the memory is sized by
     maxRequestBytes: 4194304     # largest Export request (4 MiB)
 
 metrics:

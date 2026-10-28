@@ -64,8 +64,8 @@ func translateCAdvisor(st *resourceState) []*metricspb.Metric {
 			continue
 		}
 		base := cadvisorName(name)
-		for _, p := range s.points {
-			dp, ok := p.(*metricspb.NumberDataPoint)
+		for _, h := range s.points {
+			dp, ok := h.p.(*metricspb.NumberDataPoint)
 			if !ok {
 				continue
 			}

@@ -110,6 +110,7 @@ func (r *Receiver) acceptLogs(p Principal, rls []*logspb.ResourceLogs) (int64, [
 		r.points += nr
 		offered += nr
 		n := func() int { return countRecords(rl) }
+		f.at(rl.GetResource())
 		resource, ok := r.admit(p, &metricspb.ResourceMetrics{Resource: rl.GetResource()}, n, reject)
 		if !ok {
 			continue
@@ -140,7 +141,7 @@ func (r *Receiver) acceptLogs(p Principal, rls []*logspb.ResourceLogs) (int64, [
 			continue
 		}
 		for _, m := range logCounters(st.logs, now) {
-			if cnt, why := r.mergeMetric(st, m); why != "" {
+			if cnt, why := r.mergeMetric(st, m, now); why != "" {
 				reject(cnt, why)
 			}
 		}
