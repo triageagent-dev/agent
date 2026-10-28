@@ -74,7 +74,7 @@ type OTLPSource struct {
 	// resource describes ("deployment/ad"); empty for a service's own metrics.
 	Workload string
 	LastSeen time.Time
-	Families                          []OTLPFamily
+	Families []OTLPFamily
 }
 
 // otlpWorkloadName names the workload a Collector's k8s_cluster receiver

@@ -185,8 +185,9 @@ type Options struct {
 	// MaxResourcesPerSender the resources one sender may hold (500) so that
 	// one allowed sender cannot fill every slot, MaxSeries the series held
 	// in all (250000: what the memory is sized by, since the resource and
-	// per-resource limits together allow 10 million), and MaxRequestBytes
-	// the size of one Export request (4 MiB, the gRPC receive limit).
+	// per-resource limits together allow 10 million; a span histogram counts
+	// beside the point derived from it), and MaxRequestBytes the size of one
+	// Export request (4 MiB, the gRPC receive limit).
 	MaxResources          int
 	MaxPointsPerResource  int
 	MaxResourcesPerSender int
@@ -295,6 +296,12 @@ func New(opts Options) *Receiver {
 
 // NeedLeaderElection is false: every replica accepts OTLP and gossips it.
 func (r *Receiver) NeedLeaderElection() bool { return false }
+
+// Reads reports whether the receiver stores a metric of this name, or drops
+// it at intake (Options.Wanted). Without Wanted every name is stored.
+func (r *Receiver) Reads(name string) bool {
+	return r.opts.Wanted == nil || r.opts.Wanted(name)
+}
 
 // Start serves the listener and flushes to the sink until ctx ends.
 func (r *Receiver) Start(ctx context.Context) error {
@@ -1018,6 +1025,8 @@ func (r *Receiver) sweep(now time.Time) {
 		for k, s := range st.spans {
 			if now.Sub(s.seen) > r.opts.Expire {
 				delete(st.spans, k)
+				r.nseries--
+				r.expired++
 			}
 		}
 	}
@@ -1036,7 +1045,7 @@ func (r *Receiver) flush() {
 	for key, st := range r.res {
 		if now.Sub(st.seen) > r.opts.Expire {
 			delete(r.res, key)
-			r.nseries -= st.npoints
+			r.nseries -= st.npoints + len(st.spans)
 			continue
 		}
 		if !st.dirty {

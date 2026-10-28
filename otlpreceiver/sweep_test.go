@@ -93,9 +93,10 @@ func TestSweep_DropsSpanSeriesSilentForExpire(t *testing.T) {
 			t.Fatalf("the live series was dropped; kept %q", attr(s.attrs, "span.name"))
 		}
 	}
-	// The points derived from the old route's histogram went with it.
-	if r.nseries == 0 || r.nseries != st.npoints {
-		t.Fatalf("series held: %d in all, %d in the resource", r.nseries, st.npoints)
+	// The points derived from the old route's histogram went with it, and
+	// the count holds the live route's histogram beside its points.
+	if r.nseries == 0 || r.nseries != st.npoints+len(st.spans) {
+		t.Fatalf("series held: %d in all, %d points and %d span histograms in the resource", r.nseries, st.npoints, len(st.spans))
 	}
 	for _, s := range st.metrics {
 		for _, h := range s.points {
@@ -126,6 +127,30 @@ func TestMaxSeries_RefusesPastTotal(t *testing.T) {
 	}
 	if r.nseries != 2 {
 		t.Fatalf("series held: %d, want 2", r.nseries)
+	}
+}
+
+// A span histogram counts against the total series limit like a point, so
+// traces cannot grow past it either.
+func TestMaxSeries_CountsSpanHistograms(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0)
+	r := New(Options{Auth: okAuth{}, Log: logr.Discard(), MaxSeries: 2, now: func() time.Time { return now }})
+	res := resource("service.name", "api", "k8s.namespace.name", "shop")
+	// One route: its histogram and the one point derived from it fill the limit.
+	exportSpans(t, r, res, span("GET /a", tracepb.Span_SPAN_KIND_SERVER, tracepb.Status_STATUS_CODE_OK, 5_000_000))
+	if r.nseries != 2 {
+		t.Fatalf("series held after one route: %d, want 2", r.nseries)
+	}
+	resp := exportSpans(t, r, res, span("GET /b", tracepb.Span_SPAN_KIND_SERVER, tracepb.Status_STATUS_CODE_OK, 5_000_000))
+	if resp.GetPartialSuccess().GetRejectedSpans() != 1 {
+		t.Fatalf("a second route past MaxSeries=2 was not refused: %+v", resp.GetPartialSuccess())
+	}
+	var st *resourceState
+	for _, s := range r.res { // the derived resource carries the replica attribute
+		st = s
+	}
+	if st == nil || len(st.spans) != 1 || r.nseries != 2 {
+		t.Fatalf("the refused route left a histogram behind: %+v, %d series", st, r.nseries)
 	}
 }
 

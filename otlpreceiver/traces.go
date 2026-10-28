@@ -197,11 +197,15 @@ func (r *Receiver) foldSpan(st *resourceState, sp *tracepb.Span, now time.Time) 
 	k := pointKey(attrs)
 	s := st.spans[k]
 	if s == nil {
-		if len(st.spans) >= r.opts.MaxPointsPerResource {
+		// A span histogram is a series the receiver holds, like the point
+		// derived from it: both count against the resource's and the total
+		// limit.
+		if len(st.spans) >= r.opts.MaxPointsPerResource || r.nseries >= r.opts.MaxSeries {
 			return "", true
 		}
 		s = &spanSeries{attrs: attrs, start: sp.GetStartTimeUnixNano(), counts: make([]uint64, len(spanDurationBounds)+1)}
 		st.spans[k] = s
+		r.nseries++
 	}
 	s.seen = now
 	d := float64(0)
