@@ -119,7 +119,7 @@ func main() {
 	var sensorStale time.Duration
 	var meshListen, meshService string
 	var otlpListen, otlpAllowed, otlpForwarders, otlpClientCA, otlpClientCASecret, sensorExtraNames string
-	var otlpMaxResources, otlpMaxPoints, otlpMaxPerSender, otlpMaxRequest int
+	var otlpMaxResources, otlpMaxPoints, otlpMaxPerSender, otlpMaxRequest, otlpMaxSeries int
 	var otlpTLSCert, otlpTLSKey, otlpTenantsFlag, sensorClientCert, sensorClientKey string
 	var otlpInsecure, sensorOTLPRole bool
 	var sensorController, sensorCAFile, sensorTokenFile string
@@ -223,6 +223,7 @@ func main() {
 	flag.IntVar(&otlpMaxPoints, "otlp-max-points-per-resource", 5000, "controller: most series the receiver holds for one OTLP resource.")
 	flag.IntVar(&otlpMaxPerSender, "otlp-max-resources-per-sender", 500, "controller: most OTLP resources one authenticated sender may create.")
 	flag.IntVar(&otlpMaxRequest, "otlp-max-request-bytes", 4<<20, "controller: largest OTLP Export request, in bytes (the gRPC receive limit).")
+	flag.IntVar(&otlpMaxSeries, "otlp-max-series", 250_000, "controller: most series the receiver holds over every OTLP resource; new ones past it are refused. This is what its memory is sized by.")
 	flag.StringVar(&otlpClientCASecret, "otlp-client-ca-secret", "", "controller: Secret in the pod namespace for the agent's own client CA for the OTLP receiver. The controller creates the CA on first use and trusts it for mutual TLS; issue a sender's certificate with `triage-agent otlp-cert`.")
 	flag.StringVar(&otlpClientCA, "otlp-client-ca-file", "", "controller: PEM CA for mutual TLS on the OTLP receiver; a sender whose client certificate chains to it needs no token.")
 	// The otlp sensor role (docs/adr/0022-otlp-sensor-role.md): --mode=otlp
@@ -313,6 +314,7 @@ func main() {
 	flag.Parse()
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
+	applyMemoryLimit(setupLog)
 
 	// First line in `kubectl logs`, before the node-exporter branch below, so every
 	// mode identifies which build is running. Reports "dev"/"unknown" only for a
@@ -349,6 +351,7 @@ func main() {
 				allowed: mustParseOTLPAllowed(otlpAllowed), forwarders: mustParseOTLPAllowed(otlpForwarders),
 				tenants:      splitNonEmpty(otlpTenantsFlag),
 				maxResources: otlpMaxResources, maxPoints: otlpMaxPoints, maxPerSender: otlpMaxPerSender, maxRequest: otlpMaxRequest,
+				maxSeries: otlpMaxSeries,
 			},
 			clientCert: sensorClientCert, clientKey: sensorClientKey,
 			controller: sensorController,
@@ -737,7 +740,7 @@ func main() {
 		meshListen: meshListen, meshService: meshService,
 		otlpListen: otlpListen, otlpAllowed: mustParseOTLPAllowed(otlpAllowed), otlpForwarders: mustParseOTLPAllowed(otlpForwarders), otlpClientCA: otlpClientCA, otlpClientCASecret: otlpClientCASecret,
 		otlpMaxResources: otlpMaxResources, otlpMaxPoints: otlpMaxPoints,
-		otlpMaxPerSender: otlpMaxPerSender, otlpMaxRequest: otlpMaxRequest,
+		otlpMaxPerSender: otlpMaxPerSender, otlpMaxRequest: otlpMaxRequest, otlpMaxSeries: otlpMaxSeries,
 		otlpTenants:    joinedTenants(joinTenants, targetTenant),
 		otlpSensorRole: sensorOTLPRole,
 		// The scope the core sets per workspace; a nil pusher allows all.

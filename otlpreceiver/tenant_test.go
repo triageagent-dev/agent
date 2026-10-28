@@ -156,7 +156,7 @@ func TestTenant_CadvisorNamespaceLabelQualified(t *testing.T) {
 	for _, st := range r.res {
 		for name, s := range st.metrics {
 			for _, pt := range s.points {
-				dp := pt.(*metricspb.NumberDataPoint)
+				dp := pt.p.(*metricspb.NumberDataPoint)
 				got := attr(dp.GetAttributes(), "namespace")
 				checked++
 				switch name {

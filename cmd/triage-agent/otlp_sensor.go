@@ -36,6 +36,7 @@ type otlpSensorFlags struct {
 	insecure                 bool
 	maxResources, maxPoints  int
 	maxPerSender, maxRequest int
+	maxSeries                int
 	// flush is how often changed sources are handed on; zero takes the
 	// receiver's default. Tests shorten it.
 	flush time.Duration
@@ -58,7 +59,7 @@ func newOTLPSensorReceiver(f otlpSensorFlags, sink otlpreceiver.Sink) (*otlprece
 		return otlpreceiver.New(otlpreceiver.Options{
 			Addr: f.listen, Insecure: true, Sink: sink, Log: ctrl.Log, Flush: f.flush, Wanted: otlpreceiver.ReadByCollectors,
 			MaxResources: f.maxResources, MaxPointsPerResource: f.maxPoints,
-			MaxResourcesPerSender: f.maxPerSender, MaxRequestBytes: f.maxRequest,
+			MaxResourcesPerSender: f.maxPerSender, MaxRequestBytes: f.maxRequest, MaxSeries: f.maxSeries,
 		}), nil
 	}
 	if f.tlsCert == "" || f.tlsKey == "" {
@@ -100,6 +101,6 @@ func newOTLPSensorReceiver(f otlpSensorFlags, sink otlpreceiver.Sink) (*otlprece
 		TenantAllowed: func(tenant string) bool { return slices.Contains(f.tenants, tenant) },
 
 		MaxResources: f.maxResources, MaxPointsPerResource: f.maxPoints,
-		MaxResourcesPerSender: f.maxPerSender, MaxRequestBytes: f.maxRequest,
+		MaxResourcesPerSender: f.maxPerSender, MaxRequestBytes: f.maxRequest, MaxSeries: f.maxSeries,
 	}), nil
 }

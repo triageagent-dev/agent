@@ -125,6 +125,9 @@ spec:
             {{- with .maxRequestBytes }}
             - --otlp-max-request-bytes={{ . | int }}
             {{- end }}
+            {{- with .maxSeries }}
+            - --otlp-max-series={{ . | int }}
+            {{- end }}
             {{- end }}
             - --sensor-controller={{ include "triage-agent.fullname" . }}-sensors.{{ .Release.Namespace }}.svc:{{ include "triage-agent.sensorStreamPort" . }}
             {{- /* The pods present the controller's serving certificate, which

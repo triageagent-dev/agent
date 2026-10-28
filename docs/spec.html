@@ -747,7 +747,7 @@ message StreamResponse { Ack { uint64 seq } }</code></pre>
     <tr><td class="k">otlp.sensor.enabled</td><td>false</td><td>Runs the OTLP receiver and its transformers as <code>--mode=otlp</code> pods; senders dial <code>&lt;fullname&gt;-otlp</code>. Enabling it reissues the serving certificate once</td></tr>
     <tr><td class="k">otlp.sensor.replicas / tick</td><td>2 / 10s</td><td>Pods of the role, and how often each sends its changed sources to the controller</td></tr>
     <tr><td class="k">otlp.insecure.enabled / allowFrom</td><td>false / empty</td><td>Plain gRPC for in-cluster Collectors; <code>allowFrom</code> lists the namespaces the NetworkPolicy admits; empty renders no NetworkPolicy</td></tr>
-    <tr><td class="k">otlp.limits.*</td><td>2000 / 5000 / 500 / 4 MiB</td><td><code>maxResources</code>, <code>maxPointsPerResource</code>, <code>maxResourcesPerSender</code>, <code>maxRequestBytes</code></td></tr>
+    <tr><td class="k">otlp.limits.*</td><td>2000 / 5000 / 500 / 250000 / 4 MiB</td><td><code>maxResources</code>, <code>maxPointsPerResource</code>, <code>maxResourcesPerSender</code>, <code>maxSeries</code> (series held in all, what the memory is sized by), <code>maxRequestBytes</code>; a series no export updated for 10 minutes is dropped</td></tr>
     <tr><td class="k">otlp.allowedServiceAccounts</td><td>empty</td><td><code>namespace/name</code> or <code>namespace/*</code> allowed to send with a token</td></tr>
     <tr><td class="k">--sensor-tick</td><td>15s</td><td>Sensor send interval</td></tr>
     <tr><td class="k">--log-metrics-enabled</td><td>false</td><td>Log collector; needs push</td></tr>

@@ -57,6 +57,7 @@ type spanSeries struct {
 	counts []uint64
 	count  uint64
 	sum    float64
+	seen   time.Time // when a span last fell into it (Receiver.sweep)
 }
 
 // traceService serves the OTLP traces service on the receiver. It is a type
@@ -129,6 +130,7 @@ func (r *Receiver) acceptTraces(p Principal, rss []*tracepb.ResourceSpans) (int6
 		r.points += ns
 		offered += ns
 		n := func() int { return countSpans(rs) }
+		f.at(rs.GetResource())
 		resource, ok := r.admit(p, &metricspb.ResourceMetrics{Resource: rs.GetResource()}, n, reject)
 		if !ok {
 			continue
@@ -146,7 +148,7 @@ func (r *Receiver) acceptTraces(p Principal, rss []*tracepb.ResourceSpans) (int6
 		touched := map[string]bool{}
 		for _, ss := range rs.GetScopeSpans() {
 			for _, sp := range ss.GetSpans() {
-				if k, refused := r.foldSpan(st, sp); refused {
+				if k, refused := r.foldSpan(st, sp, now); refused {
 					reject(1, "series limit reached for a resource")
 				} else if k != "" {
 					touched[k] = true
@@ -160,7 +162,7 @@ func (r *Receiver) acceptTraces(p Principal, rss []*tracepb.ResourceSpans) (int6
 		m := spanMetricsOf(st, touched, now)
 		out, _ := translateSpanMetrics(m)
 		for _, mo := range out {
-			if cnt, why := r.mergeMetric(st, mo); why != "" {
+			if cnt, why := r.mergeMetric(st, mo, now); why != "" {
 				reject(cnt, why)
 			}
 		}
@@ -171,7 +173,7 @@ func (r *Receiver) acceptTraces(p Principal, rss []*tracepb.ResourceSpans) (int6
 // foldSpan adds sp to its series in st and returns the series' key. The key
 // is empty for a span no histogram stands for (an internal span); refused is
 // set when a new series would pass the resource's series limit.
-func (r *Receiver) foldSpan(st *resourceState, sp *tracepb.Span) (key string, refused bool) {
+func (r *Receiver) foldSpan(st *resourceState, sp *tracepb.Span, now time.Time) (key string, refused bool) {
 	switch sp.GetKind() {
 	case tracepb.Span_SPAN_KIND_SERVER, tracepb.Span_SPAN_KIND_CONSUMER,
 		tracepb.Span_SPAN_KIND_CLIENT, tracepb.Span_SPAN_KIND_PRODUCER:
@@ -201,6 +203,7 @@ func (r *Receiver) foldSpan(st *resourceState, sp *tracepb.Span) (key string, re
 		s = &spanSeries{attrs: attrs, start: sp.GetStartTimeUnixNano(), counts: make([]uint64, len(spanDurationBounds)+1)}
 		st.spans[k] = s
 	}
+	s.seen = now
 	d := float64(0)
 	if end, start := sp.GetEndTimeUnixNano(), sp.GetStartTimeUnixNano(); end > start {
 		d = float64(end-start) / float64(time.Second)
