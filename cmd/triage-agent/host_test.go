@@ -125,7 +125,7 @@ func TestHostSensorStatusLoopSendsAtStartThenEveryPeriod(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
-		hostSensorStatusLoop(ctx, local.Nodes, func(_ int64, s []push.SensorStatus, _ []push.OTLPSourceStatus) {
+		hostSensorStatusLoop(ctx, local.Nodes, func(_ int64, s []push.SensorStatus, _ []push.OTLPSourceStatus, _ []push.OTLPIntakeStatus) {
 			mu.Lock()
 			sent = append(sent, s)
 			mu.Unlock()

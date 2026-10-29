@@ -3,6 +3,8 @@ package push
 import (
 	"encoding/json"
 	"fmt"
+	"slices"
+	"sort"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -37,7 +39,7 @@ func TestFrameRoundTrip(t *testing.T) {
 		newSensorState("cluster-a", 1720000000, []SensorStatus{
 			{Node: "node-1", Pod: "sensor-node-1", Connected: true, LastSeen: 1720000000,
 				Roles: []SensorRoleStatus{{Role: "ebpf"}}},
-		}, nil),
+		}, nil, nil),
 		newHeartbeat("cluster-a"),
 	}
 
@@ -585,7 +587,7 @@ func TestSensorStateFrame(t *testing.T) {
 				{Role: "nodeexporter"},
 			},
 		},
-	}, nil)
+	}, nil, nil)
 	data, err := encode(f)
 	if err != nil {
 		t.Fatal(err)
@@ -637,6 +639,55 @@ func TestSensorStateFrame(t *testing.T) {
 	s := got.SensorState.Sensors[0]
 	if len(s.Roles) != 2 || s.Roles[1] != (SensorRoleStatus{Role: "nodeexporter"}) {
 		t.Errorf("role with no state should decode with only Role set: %+v", s.Roles)
+	}
+}
+
+// TestSensorStateFrame_CarriesIntake pins the intake keys of the sensor_state
+// frame, which the core and the UI read by name, and that a frame with no
+// intake has no such key.
+func TestSensorStateFrame_CarriesIntake(t *testing.T) {
+	keys := func(m map[string]any) []string {
+		out := make([]string, 0, len(m))
+		for k := range m {
+			out = append(out, k)
+		}
+		sort.Strings(out)
+		return out
+	}
+	f := newSensorState("cluster-a", 1720000000, nil, nil, []OTLPIntakeStatus{{
+		Sender: "obs/collector", Window: 60, Exports: 4, Points: 100, Unread: 80, Refused: 5, RefusedExports: 1,
+		Held: 20, Sources: 2, UnreadByName: []NameCount{{Name: "foo.a", Points: 60}},
+	}})
+	data, err := encode(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var frame struct {
+		SensorState map[string]any `json:"sensorState"`
+	}
+	if err := json.Unmarshal(data, &frame); err != nil {
+		t.Fatal(err)
+	}
+	list, _ := frame.SensorState["intake"].([]any)
+	if len(list) != 1 {
+		t.Fatalf("intake = %v, want one entry; frame %s", frame.SensorState["intake"], data)
+	}
+	entry := list[0].(map[string]any)
+	want := []string{"exports", "held", "points", "refused", "refusedExports", "sender", "sources", "unread", "unreadByName", "window"}
+	if got := keys(entry); !slices.Equal(got, want) {
+		t.Errorf("intake keys = %v, want %v", got, want)
+	}
+	names := entry["unreadByName"].([]any)
+	if got := keys(names[0].(map[string]any)); !slices.Equal(got, []string{"name", "points"}) {
+		t.Errorf("unreadByName keys = %v, want name and points", got)
+	}
+
+	data, err = encode(newSensorState("cluster-a", 1720000000, []SensorStatus{{Node: "n"}}, nil, nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), `"intake"`) {
+		t.Errorf("a frame with no intake carries the key: %s", data)
 	}
 }
 

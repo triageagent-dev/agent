@@ -48,9 +48,10 @@ func ReadByCollectors(name string) bool {
 }
 
 // dropUnwanted removes from rm every metric wanted rejects and returns how
-// many points that was. A scope left with no metrics is removed too, so a
-// resource whose metrics are all unread has nothing left to store.
-func dropUnwanted(rm *metricspb.ResourceMetrics, wanted func(name string) bool) int {
+// many points that was, telling count the points of each metric it dropped.
+// A scope left with no metrics is removed too, so a resource whose metrics are
+// all unread has nothing left to store.
+func dropUnwanted(rm *metricspb.ResourceMetrics, wanted func(name string) bool, count func(name string, n int)) int {
 	dropped := 0
 	scopes := rm.ScopeMetrics[:0]
 	for _, sm := range rm.GetScopeMetrics() {
@@ -60,7 +61,9 @@ func dropUnwanted(rm *metricspb.ResourceMetrics, wanted func(name string) bool) 
 				kept = append(kept, m)
 				continue
 			}
-			dropped += countMetricPoints(m)
+			n := countMetricPoints(m)
+			dropped += n
+			count(m.GetName(), n)
 		}
 		sm.Metrics = kept
 		if len(kept) > 0 {

@@ -27,7 +27,7 @@ func TestObserverSeesQueuedAndSessionFrames(t *testing.T) {
 	p.SetObserver(rec)
 
 	p.SendRedSummary(1, 60, []ServiceRedMetrics{{Namespace: "ns", Service: "s", RequestCount: 1}})
-	p.SendSensorState(1, []SensorStatus{{Node: "n"}}, nil)
+	p.SendSensorState(1, []SensorStatus{{Node: "n"}}, nil, nil)
 
 	rec.mu.Lock()
 	n := len(rec.seen)
@@ -37,7 +37,7 @@ func TestObserverSeesQueuedAndSessionFrames(t *testing.T) {
 	}
 
 	p.SetObserver(nil)
-	p.SendSensorState(2, []SensorStatus{{Node: "n"}}, nil)
+	p.SendSensorState(2, []SensorStatus{{Node: "n"}}, nil, nil)
 	rec.mu.Lock()
 	defer rec.mu.Unlock()
 	if len(rec.seen) != 2 {
@@ -58,7 +58,7 @@ func TestStandaloneObservesWithoutAConnection(t *testing.T) {
 	}
 	rec := &recordingObserver{}
 	p.SetObserver(rec)
-	p.SendSensorState(1, []SensorStatus{{Node: "n"}}, nil)
+	p.SendSensorState(1, []SensorStatus{{Node: "n"}}, nil, nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)

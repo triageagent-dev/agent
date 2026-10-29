@@ -736,7 +736,7 @@ func main() {
 
 	// Sensor stream (docs/adr/0015-sensor-stream-grpc.md): the hub every
 	// collector below reads from. Nil when --sensor-listen is empty.
-	hub, meshNet := startSensorHub(mgr, sensorHubOptions{
+	hub, meshNet, otlpRecv := startSensorHub(mgr, sensorHubOptions{
 		listen: sensorListen, tlsSecret: sensorTLSSecret, caConfigMap: sensorCAConfigMap,
 		service: sensorService, serviceAccount: sensorServiceAccount, stale: sensorStale,
 		extraNames: splitNonEmpty(sensorExtraNames),
@@ -790,7 +790,7 @@ func main() {
 	}
 	// Sensor status (ADR-0015 phase 1): reports every sensor's own health to
 	// the core every 60s, when both the sensor stream and push are enabled.
-	startSensorStatusLoop(mgr, hub, pusher)
+	startSensorStatusLoop(mgr, hub, pusher, otlpRecv)
 
 	// Pass an explicit untyped nil Sender (not the *push.Pusher variable, even
 	// though it may itself be nil) when push mode is disabled: a nil

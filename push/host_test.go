@@ -58,7 +58,7 @@ func TestNewHost_ScopeAndRouting(t *testing.T) {
 func TestNewHost_StartRunsTransportWithoutKubernetes(t *testing.T) {
 	hub, srv := newFakeHub(t)
 	p := newTestHostPusher(wsURL(srv))
-	p.SendSensorState(1720000000, []SensorStatus{{Node: "web-01", Connected: true}}, nil)
+	p.SendSensorState(1720000000, []SensorStatus{{Node: "web-01", Connected: true}}, nil, nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)

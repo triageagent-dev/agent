@@ -658,6 +658,49 @@ type SensorStatePayload struct {
 	// OTLP lists the sources the controller's OTLP receiver holds (ADR-0017),
 	// across every replica: one per pushed resource. Omitted when none.
 	OTLP []OTLPSourceStatus `json:"otlp,omitempty"`
+	// Intake is what each OTLP sender offered the receivers in their last
+	// window, summed over the otlp role's replicas and the controller's own
+	// receiver (ADR-0022). Omitted when there is none.
+	Intake []OTLPIntakeStatus `json:"intake,omitempty"`
+}
+
+// OTLPIntakeStatus is what one OTLP sender offered the receivers in their last
+// one-minute window, and what they hold for it now. It tells the operator what
+// share of a Collector's export is read and what to filter out at the
+// Collector. Refused is inside Points; RefusedExports is outside both, since
+// an export refused before it was read has no points to count.
+type OTLPIntakeStatus struct {
+	// Sender is the principal as the receiver's refusal log names it.
+	Sender string `json:"sender"`
+	// Window is the seconds the windowed counters below cover.
+	Window int64 `json:"window"`
+	// Exports is the exports the receivers took from the sender.
+	Exports int64 `json:"exports"`
+	// Points is the points (and spans, and log records) offered.
+	Points int64 `json:"points"`
+	// Unread is the points dropped at intake because no collector reads their
+	// metric.
+	Unread int64 `json:"unread"`
+	// Refused is the points refused (limits, no namespace, tenant checks); it
+	// is inside Points.
+	Refused int64 `json:"refused"`
+	// RefusedExports is the exports refused before they were read
+	// (backpressure); outside Exports and Points.
+	RefusedExports int64 `json:"refusedExports"`
+	// Held is the state entries held for the sender's sources now, and Sources
+	// the sources: neither is windowed.
+	Held    int64 `json:"held"`
+	Sources int32 `json:"sources"`
+	// UnreadByName is the unread points by metric name, the top 20 by points,
+	// most first. A last entry named "other" stands for the names the
+	// receiver did not count one by one; it is never ranked among the top.
+	UnreadByName []NameCount `json:"unreadByName,omitempty"`
+}
+
+// NameCount is the points of one metric name.
+type NameCount struct {
+	Name   string `json:"name"`
+	Points int64  `json:"points"`
 }
 
 // OTLPSourceStatus is one OTLP source: one resource an OpenTelemetry SDK or
@@ -949,11 +992,12 @@ func newHeartbeat(cluster string) *Frame {
 // newSensorState builds a sensor_state frame for one report. No capping: the
 // number of sensors is the size of the DaemonSet, never large enough to need
 // one.
-func newSensorState(cluster string, at int64, sensors []SensorStatus, otlp []OTLPSourceStatus) *Frame {
+func newSensorState(cluster string, at int64, sensors []SensorStatus, otlp []OTLPSourceStatus, intake []OTLPIntakeStatus) *Frame {
 	return &Frame{V: ProtocolVersion, Kind: KindSensorState, Cluster: cluster, SensorState: &SensorStatePayload{
 		At:      at,
 		Sensors: sensors,
 		OTLP:    otlp,
+		Intake:  intake,
 	}}
 }
 

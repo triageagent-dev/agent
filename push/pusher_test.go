@@ -720,16 +720,28 @@ func TestPusher_SendUseSummary_NilPusherIsNoop(t *testing.T) {
 // (ADR-0015 phase 1).
 func TestPusher_SendSensorState_NilPusherIsNoop(t *testing.T) {
 	var p *Pusher
-	p.SendSensorState(1720000000, []SensorStatus{{Node: "node-1", Connected: true}}, nil)
+	p.SendSensorState(1720000000, []SensorStatus{{Node: "node-1", Connected: true}}, nil, nil)
 }
 
 // TestPusher_SendSensorState_EmptyIsNoop mirrors the other Send* methods:
 // nothing to report is a no-op, not an empty frame stored for the wire.
 func TestPusher_SendSensorState_EmptyIsNoop(t *testing.T) {
 	p := newRoutingTestPusher()
-	p.SendSensorState(1720000000, nil, nil)
+	p.SendSensorState(1720000000, nil, nil, nil)
 	if f := p.sensorState.Load(); f != nil {
 		t.Fatalf("sensorState = %+v, want nil (empty call is a no-op)", f)
+	}
+}
+
+// The intake names senders, not tenants, and is worth sending alone: a sender
+// whose every export is refused has no source, yet is what the operator
+// needs to see.
+func TestPusher_SendSensorState_IntakeAloneIsSent(t *testing.T) {
+	p := newRoutingTestPusher()
+	p.SendSensorState(1720000000, nil, nil, []OTLPIntakeStatus{{Sender: "obs/collector", Window: 60, RefusedExports: 3}})
+	f := p.sensorState.Load()
+	if f == nil || len(f.SensorState.Intake) != 1 || f.SensorState.Intake[0].RefusedExports != 3 {
+		t.Fatalf("sensorState = %+v, want the intake stored", f)
 	}
 }
 
@@ -741,7 +753,7 @@ func TestPusher_SendSensorState_StampsOTLPTenant(t *testing.T) {
 	p.dynamicScope.add("shop", "tenant-a")
 	p.dynamicScope.add("ops", "tenant-b")
 	in := []OTLPSourceStatus{{Key: "a", Namespace: "shop"}, {Key: "b", Namespace: "ops"}, {Key: "c"}, {Key: "d", Namespace: "loose"}}
-	p.SendSensorState(1720000000, nil, in)
+	p.SendSensorState(1720000000, nil, in, nil)
 	got := p.sensorState.Load().SensorState.OTLP
 	want := []string{"tenant-a", "tenant-b", "", ""}
 	for i, o := range got {
@@ -760,7 +772,7 @@ func TestPusher_SendSensorState_StampsOTLPTenant(t *testing.T) {
 // heartbeat tick, rather than enqueued onto any per-tenant queue.
 func TestPusher_SendSensorState_StoresLatest(t *testing.T) {
 	p := newRoutingTestPusher()
-	p.SendSensorState(1720000000, []SensorStatus{{Node: "node-1", Connected: true}}, nil)
+	p.SendSensorState(1720000000, []SensorStatus{{Node: "node-1", Connected: true}}, nil, nil)
 	f := p.sensorState.Load()
 	if f == nil || f.SensorState == nil || len(f.SensorState.Sensors) != 1 {
 		t.Fatalf("sensorState = %+v, want the sensor stored", f)
@@ -774,7 +786,7 @@ func TestPusher_SendSensorState_StoresLatest(t *testing.T) {
 func TestPusher_SendSensorState_ReachesWireUnstampedOnHeartbeatTick(t *testing.T) {
 	hub, srv := newFakeHub(t)
 	p := newTestPusher(wsURL(srv), nil)
-	p.SendSensorState(1720000000, []SensorStatus{{Node: "node-1", Connected: true}}, nil)
+	p.SendSensorState(1720000000, []SensorStatus{{Node: "node-1", Connected: true}}, nil, nil)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()

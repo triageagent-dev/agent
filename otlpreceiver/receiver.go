@@ -101,7 +101,7 @@ type Authenticator interface {
 	Authenticate(ctx context.Context, token string) (Principal, error)
 }
 
-// maxSenders bounds the per-sender refusal counters.
+// maxSenders bounds the per-sender refusal counters and the intake ledger.
 const maxSenders = 1000
 
 // principalFromCert derives the sender of a verified client certificate. The
@@ -238,6 +238,9 @@ func (o *Options) setDefaults() {
 type source struct {
 	sender string
 	seen   time.Time
+	// held counts the state entries attributed to the source (its series,
+	// routes, counts and readings), for the intake ledger.
+	held int
 }
 
 // tick is what a cumulative series costs: the time of the last point
@@ -247,6 +250,7 @@ type source struct {
 type tick struct {
 	ts   uint64
 	seen int64 // unix seconds
+	src  *source
 }
 
 // running is a delta series' running total, what makes its points
@@ -265,6 +269,7 @@ type running struct {
 	sum    float64
 	hasSum bool
 	seen   time.Time
+	src    *source
 }
 
 // Receiver implements the OTLP metrics gRPC service.
@@ -297,8 +302,9 @@ type Receiver struct {
 	// psi: what MaxSeries bounds.
 	nheld     int
 	lastSweep time.Time
-	// Counted since the last summary line.
-	exports, points, rejected, expired int64
+	// Counted since the last summary line. refusedExports are the exports
+	// refused before they were read (admission.go), which are not in rejected.
+	exports, points, rejected, refusedExports, expired int64
 	// unread counts points dropped at intake because no collector reads their
 	// metric (Options.Wanted).
 	unread int64
@@ -307,6 +313,13 @@ type Receiver struct {
 	// refusalLog holds what each (sender, reason) refused since it was last
 	// logged, so a sender refused on every export is logged once a minute.
 	refusalLog map[string]*refusalWindow
+	// refusedByReason counts the points refused per reason since the last
+	// summary line, which carries it in place of the per-sender lines.
+	refusedByReason map[string]int64
+	// intake is the per-sender intake ledger (intake.go), at most maxSenders
+	// entries; intakeRolled is when its window was last closed.
+	intake       map[string]*intake
+	intakeRolled time.Time
 }
 
 // summaryEvery is how often the receiver logs what it took in, and how often
@@ -319,7 +332,8 @@ func New(opts Options) *Receiver {
 	return &Receiver{opts: opts, log: opts.Log.WithName("otlpreceiver"), adm: newAdmission(opts.MaxInFlight),
 		sources: map[string]*source{}, bySender: map[string]int{}, ticks: map[uint64]tick{}, deltas: map[uint64]*running{},
 		spans: map[string]*spanRoutes{}, logs: map[string]*logCounts{}, psi: map[string]psiPrev{},
-		refusals: map[string]int64{}, refusalLog: map[string]*refusalWindow{}}
+		refusals: map[string]int64{}, refusalLog: map[string]*refusalWindow{}, refusedByReason: map[string]int64{},
+		intake: map[string]*intake{}, intakeRolled: opts.now()}
 }
 
 // NeedLeaderElection is false: every replica accepts OTLP and gossips it.
@@ -521,14 +535,18 @@ func (r *Receiver) accept(p Principal, rms []*metricspb.ResourceMetrics) (int64,
 
 	r.mu.Lock()
 	r.exports++
+	in := r.intakeFor(sender)
+	f.in = in
+	in.cur.exports++
 	var offered int64
 	for _, rm := range rms {
 		np := int64(countPoints(rm))
 		r.points += np
+		in.cur.points += np
 		offered += np
-		unread := int64(dropCAdvisorNoise(rm))
+		unread := int64(dropCAdvisorNoise(rm, in.cur.unreadName))
 		if r.opts.Wanted != nil {
-			unread += int64(dropUnwanted(rm, r.opts.Wanted))
+			unread += int64(dropUnwanted(rm, r.opts.Wanted, in.cur.unreadName))
 		}
 		r.unread += unread
 		ledger.Default.Add("otlp", ledger.All, ledger.Unread, unread)
@@ -546,7 +564,8 @@ func (r *Receiver) accept(p Principal, rms []*metricspb.ResourceMetrics) (int64,
 			continue
 		}
 		key := resourceKey(resource)
-		if !r.touchSource(key, sender, now, n, reject) {
+		src, ok := r.touchSource(key, sender, now, n, reject)
+		if !ok {
 			continue
 		}
 		byRole := map[string][]*metricspb.Metric{}
@@ -558,7 +577,7 @@ func (r *Receiver) accept(p Principal, rms []*metricspb.ResourceMetrics) (int64,
 					ms = out
 				}
 				for _, m := range ms {
-					m, refused, why := r.prepare(key, m, now)
+					m, refused, why := r.prepare(key, src, m, now)
 					if why != "" {
 						reject(refused, why)
 					}
@@ -583,7 +602,7 @@ func (r *Receiver) accept(p Principal, rms []*metricspb.ResourceMetrics) (int64,
 		}
 		// cAdvisor series become per-pod use.* points under an empty resource:
 		// the scrape's own resource names the kubelet, not the pods.
-		if ms := r.translateCAdvisor(cadvisor, now); len(ms) > 0 {
+		if ms := r.translateCAdvisor(src, cadvisor, now); len(ms) > 0 {
 			outs = append(outs, forward{key: key, role: metricset.RoleNodeExporter, rms: []*metricspb.ResourceMetrics{{
 				Resource:     &resourcepb.Resource{},
 				ScopeMetrics: []*metricspb.ScopeMetrics{{Scope: &commonpb.InstrumentationScope{Name: "otlp/cadvisor"}, Metrics: ms}},
@@ -615,22 +634,23 @@ func (r *Receiver) send(outs []forward) {
 // touchSource records that key is forwarded by sender, within the source
 // limits, or reports n() refused through reject and returns false. A source
 // seen for the first time is announced. The caller holds r.mu.
-func (r *Receiver) touchSource(key, sender string, now time.Time, n func() int, reject func(int, string)) bool {
+func (r *Receiver) touchSource(key, sender string, now time.Time, n func() int, reject func(int, string)) (*source, bool) {
 	if s := r.sources[key]; s != nil {
 		s.seen = now
-		return true
+		return s, true
 	}
 	if r.bySender[sender] >= r.opts.MaxResourcesPerSender {
 		reject(n(), "sender resource quota reached")
-		return false
+		return nil, false
 	}
 	if len(r.sources) >= r.opts.MaxResources {
 		reject(n(), "resource limit reached")
-		return false
+		return nil, false
 	}
-	r.sources[key] = &source{sender: sender, seen: now}
+	s := &source{sender: sender, seen: now}
+	r.sources[key] = s
 	r.bySender[sender]++
-	return true
+	return s, true
 }
 
 // prepare makes m ready to forward: the current name and unit, its points'
@@ -638,7 +658,7 @@ func (r *Receiver) touchSource(key, sender string, now time.Time, n func() int, 
 // turned into the cumulative one the collectors read. It returns nil for a
 // metric nothing is left of, with how many points it refused and why. The
 // caller holds r.mu.
-func (r *Receiver) prepare(key string, m *metricspb.Metric, now time.Time) (*metricspb.Metric, int, string) {
+func (r *Receiver) prepare(key string, src *source, m *metricspb.Metric, now time.Time) (*metricspb.Metric, int, string) {
 	name, unit, scale := canonicalMetric(m)
 	m.Name, m.Unit = name, unit
 	refused, why := 0, ""
@@ -649,9 +669,9 @@ func (r *Receiver) prepare(key string, m *metricspb.Metric, now time.Time) (*met
 		for _, dp := range d.Sum.GetDataPoints() {
 			dp.Exemplars = nil
 			normalizePoint(dp, scale)
-			ok, reason := r.inOrder(key, name, dp, now)
+			ok, reason := r.inOrder(key, src, name, dp, now)
 			if delta {
-				ok, reason = r.addDelta(key, name, dp, now)
+				ok, reason = r.addDelta(key, src, name, dp, now)
 			}
 			if reason != "" {
 				refused++
@@ -674,7 +694,7 @@ func (r *Receiver) prepare(key string, m *metricspb.Metric, now time.Time) (*met
 		for _, dp := range d.Gauge.GetDataPoints() {
 			dp.Exemplars = nil
 			normalizePoint(dp, scale)
-			ok, reason := r.inOrder(key, name, dp, now)
+			ok, reason := r.inOrder(key, src, name, dp, now)
 			if reason != "" {
 				refused++
 				why = reason
@@ -694,9 +714,9 @@ func (r *Receiver) prepare(key string, m *metricspb.Metric, now time.Time) (*met
 		for _, dp := range d.Histogram.GetDataPoints() {
 			dp.Exemplars = nil
 			normalizePoint(dp, scale)
-			ok, reason := r.inOrder(key, name, dp, now)
+			ok, reason := r.inOrder(key, src, name, dp, now)
 			if delta {
-				ok, reason = r.addDelta(key, name, dp, now)
+				ok, reason = r.addDelta(key, src, name, dp, now)
 			}
 			if reason != "" {
 				refused++
@@ -738,7 +758,7 @@ func seriesID(key, name string, attrs []*commonpb.KeyValue) uint64 {
 // true, or false for a point older than the last one forwarded, which must
 // not take the newer value's place downstream, and for a new series past
 // MaxSeries, with the reason. The caller holds r.mu.
-func (r *Receiver) inOrder(key, name string, p proto.Message, now time.Time) (bool, string) {
+func (r *Receiver) inOrder(key string, src *source, name string, p proto.Message, now time.Time) (bool, string) {
 	id := seriesID(key, name, pointAttrs(p))
 	ts := pointTime(p)
 	cur, ok := r.ticks[id]
@@ -750,8 +770,11 @@ func (r *Receiver) inOrder(key, name string, p proto.Message, now time.Time) (bo
 	}
 	if !ok {
 		r.nheld++
+		src.held++
+	} else {
+		src = cur.src
 	}
-	r.ticks[id] = tick{ts: ts, seen: now.Unix()}
+	r.ticks[id] = tick{ts: ts, seen: now.Unix(), src: src}
 	return true, ""
 }
 
@@ -760,7 +783,7 @@ func (r *Receiver) inOrder(key, name string, p proto.Message, now time.Time) (bo
 // a point to drop: an interval that ends no later than the last one added is
 // a retry of it (or older) and would count twice; a point the total cannot
 // take comes with the reason. The caller holds r.mu.
-func (r *Receiver) addDelta(key, name string, p proto.Message, now time.Time) (bool, string) {
+func (r *Receiver) addDelta(key string, src *source, name string, p proto.Message, now time.Time) (bool, string) {
 	id := seriesID(key, name, pointAttrs(p))
 	cur := r.deltas[id]
 	if cur != nil && pointTime(p) <= cur.ts {
@@ -770,9 +793,10 @@ func (r *Receiver) addDelta(key, name string, p proto.Message, now time.Time) (b
 		if r.nheld >= r.opts.MaxSeries {
 			return false, "series limit reached"
 		}
-		cur = &running{}
+		cur = &running{src: src}
 		r.deltas[id] = cur
 		r.nheld++
+		src.held++
 	}
 	switch dp := p.(type) {
 	case *metricspb.NumberDataPoint:
@@ -835,6 +859,7 @@ type refusal struct {
 	resource string // namespace/service of the resource being judged
 	rejected int64
 	reasons  map[string]bool
+	in       *intake // the sender's intake entry, when the export has one
 }
 
 func (r *Receiver) newRefusal(sender, what string) *refusal {
@@ -862,8 +887,9 @@ const refusalLogEvery = time.Minute
 // maxRefusalKeys bounds refusalLog, which has one key per sender and reason.
 const maxRefusalKeys = 4 * maxSenders
 
-// reject counts n refused items against the sender. The log gets one line
-// per sender and reason a minute, with the count refused since the last.
+// reject counts n refused items against the sender, in the intake ledger and
+// per reason for the summary line. The log gets one debug line per sender and
+// reason a minute (logRefusal).
 func (f *refusal) reject(n int, why string) {
 	f.rejected += int64(n)
 	f.reasons[why] = true
@@ -871,7 +897,20 @@ func (f *refusal) reject(n int, why string) {
 	if _, ok := r.refusals[f.sender]; ok || len(r.refusals) < maxSenders {
 		r.refusals[f.sender] += int64(n)
 	}
-	key := f.sender + "\x00" + why
+	if f.in != nil {
+		f.in.cur.refused += int64(n)
+	}
+	r.refusedByReason[why] += int64(n)
+	r.logRefusal(f.sender, f.what, why, f.resource, n)
+}
+
+// logRefusal logs a refusal at most once a minute per sender and reason, with
+// the count refused since the last line. It is a debug line: a cluster whose
+// Collectors are all refused for the same reason would otherwise log one line
+// per Collector a minute, and the summary line carries the same facts
+// collapsed. The caller holds r.mu.
+func (r *Receiver) logRefusal(sender, what, why, resource string, n int) {
+	key := sender + "\x00" + why
 	w := r.refusalLog[key]
 	if w == nil {
 		if len(r.refusalLog) >= maxRefusalKeys {
@@ -882,13 +921,13 @@ func (f *refusal) reject(n int, why string) {
 	}
 	w.count += int64(n)
 	if w.resource == "" {
-		w.resource = f.resource
+		w.resource = resource
 	}
 	now := r.opts.now()
 	if !w.since.IsZero() && now.Sub(w.since) < refusalLogEvery {
 		return
 	}
-	r.log.Info("otlp "+f.what+" refused", "sender", f.sender, "reason", why, "resource", w.resource, "refused", w.count)
+	r.log.V(1).Info("otlp "+what+" refused", "sender", sender, "reason", why, "resource", w.resource, "refused", w.count)
 	w.since, w.count, w.resource = now, 0, ""
 }
 
@@ -1107,16 +1146,30 @@ func filterPoints[T any](pts []T, cadvisor bool, bad func([]*commonpb.KeyValue, 
 	return kept
 }
 
-// logSummary logs what arrived since the last summary, and what is held.
+// logSummary logs what arrived since the last summary, and what is held, and
+// closes the intake window. The refusals of the minute are collapsed here:
+// how many senders were refused, how many exports were refused before being
+// read and the points refused per reason.
 func (r *Receiver) logSummary() {
 	r.mu.Lock()
-	r.sweep(r.opts.now())
-	exports, points, rejected, unread, expired := r.exports, r.points, r.rejected, r.unread, r.expired
-	r.exports, r.points, r.rejected, r.unread, r.expired = 0, 0, 0, 0, 0
+	now := r.opts.now()
+	r.sweep(now)
+	exports, points, rejected, refusedExports, unread, expired := r.exports, r.points, r.rejected, r.refusedExports, r.unread, r.expired
+	r.exports, r.points, r.rejected, r.refusedExports, r.unread, r.expired = 0, 0, 0, 0, 0, 0
 	sources, held := len(r.sources), r.nheld
+	refusedBy := r.refusedByReason
+	r.refusedByReason = map[string]int64{}
+	sendersRefused := 0
+	for _, in := range r.intake {
+		if in.cur.refused > 0 || in.cur.refusedExports > 0 {
+			sendersRefused++
+		}
+	}
+	r.rollIntake(now)
 	r.mu.Unlock()
-	r.log.Info("otlp received", "exports", exports, "points", points, "rejected", rejected, "unread", unread,
-		"expired", expired, "sources", sources, "held", held, "window", summaryEvery.String())
+	r.log.Info("otlp received", "exports", exports, "points", points, "rejected", rejected, "refusedExports", refusedExports,
+		"unread", unread, "expired", expired, "sources", sources, "held", held, "sendersRefused", sendersRefused,
+		"refusedBy", refusedBy, "window", summaryEvery.String())
 }
 
 // sweep forgets every state entry no export refreshed for Expire, at most
@@ -1139,6 +1192,7 @@ func (r *Receiver) sweep(now time.Time) {
 		if stale(time.Unix(t.seen, 0)) {
 			delete(r.ticks, id)
 			r.nheld--
+			t.src.held--
 			r.expired++
 		}
 	}
@@ -1146,6 +1200,7 @@ func (r *Receiver) sweep(now time.Time) {
 		if stale(d.seen) {
 			delete(r.deltas, id)
 			r.nheld--
+			d.src.held--
 			r.expired++
 		}
 	}
@@ -1154,6 +1209,7 @@ func (r *Receiver) sweep(now time.Time) {
 			if stale(s.seen) {
 				delete(sr.routes, k)
 				r.nheld--
+				sr.src.held--
 				r.expired++
 			}
 		}
@@ -1165,6 +1221,7 @@ func (r *Receiver) sweep(now time.Time) {
 		if stale(c.seen) {
 			delete(r.logs, key)
 			r.nheld--
+			c.src.held--
 			r.expired++
 		}
 	}
@@ -1172,6 +1229,7 @@ func (r *Receiver) sweep(now time.Time) {
 		if stale(p.seen) {
 			delete(r.psi, key)
 			r.nheld--
+			p.src.held--
 			r.expired++
 		}
 	}

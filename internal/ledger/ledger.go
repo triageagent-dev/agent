@@ -28,6 +28,8 @@ const (
 	Refused      = "refused"      // points an OTLP sender sent that were not accepted
 	Unread       = "unread"       // points an OTLP sender sent that no collector reads
 	Capped       = "capped"       // services cut by a frame's size cap
+
+	RefusedExports = "refused_exports" // exports an OTLP sender sent that were refused before being read
 )
 
 // maxDrops bounds the drop records a ledger keeps; the oldest-seen go first.

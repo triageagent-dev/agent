@@ -56,8 +56,11 @@ type ClientOptions struct {
 	// Settings are this process's flags, secrets left out, sent in the Hello
 	// so the controller can show what each sensor runs.
 	Settings []*sensorpb.Setting
-	Tick     time.Duration
-	Log      logr.Logger
+	// Intake, when set, is the otlp role's intake per sender of its last
+	// window (ADR-0022), sent in every SensorState.
+	Intake func() []*sensorpb.OTLPIntake
+	Tick   time.Duration
+	Log    logr.Logger
 }
 
 // RoleSource produces one role's metrics as cumulative OTLP.
@@ -370,6 +373,12 @@ func (c *client) collect(ctx context.Context, role string) ([]*metricspb.Resourc
 func (c *client) state() *sensorpb.SensorState {
 	var ms runtime.MemStats
 	runtime.ReadMemStats(&ms)
+	// Read before taking c.mu: the receiver holds its own lock while it
+	// counts, and nothing here needs both.
+	var intake []*sensorpb.OTLPIntake
+	if c.opts.Intake != nil {
+		intake = c.opts.Intake()
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	s := &sensorpb.SensorState{
@@ -383,6 +392,7 @@ func (c *client) state() *sensorpb.SensorState {
 		AckRttMicros:  c.ackRTTMicros,
 		TickBytes:     c.tickBytes,
 		ConnectMicros: c.connectMicros,
+		Intake:        intake,
 	}
 	for _, r := range sortedKeys(c.roleStats) {
 		s.Roles = append(s.Roles, proto.Clone(c.roleStats[r]).(*sensorpb.RoleState))

@@ -375,6 +375,9 @@ type SensorState struct {
 	TickBytes uint64 `protobuf:"varint,10,opt,name=tick_bytes,json=tickBytes,proto3" json:"tick_bytes,omitempty"`
 	// Time from the stream opening until the first Ack on this stream.
 	ConnectMicros int64 `protobuf:"varint,11,opt,name=connect_micros,json=connectMicros,proto3" json:"connect_micros,omitempty"`
+	// Set by the otlp role (ADR-0022): what each sender offered its receiver in
+	// the last window, so the controller can report the intake per sender.
+	Intake        []*OTLPIntake `protobuf:"bytes,12,rep,name=intake,proto3" json:"intake,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -486,6 +489,191 @@ func (x *SensorState) GetConnectMicros() int64 {
 	return 0
 }
 
+func (x *SensorState) GetIntake() []*OTLPIntake {
+	if x != nil {
+		return x.Intake
+	}
+	return nil
+}
+
+// What one sender offered an otlp role's receiver in its last window, and
+// what the receiver holds for it now.
+type OTLPIntake struct {
+	state  protoimpl.MessageState `protogen:"open.v1"`
+	Sender string                 `protobuf:"bytes,1,opt,name=sender,proto3" json:"sender,omitempty"`
+	// Seconds the windowed counters below cover.
+	WindowSeconds int64 `protobuf:"varint,2,opt,name=window_seconds,json=windowSeconds,proto3" json:"window_seconds,omitempty"`
+	Exports       int64 `protobuf:"varint,3,opt,name=exports,proto3" json:"exports,omitempty"`
+	// Points, spans and log records offered.
+	Points int64 `protobuf:"varint,4,opt,name=points,proto3" json:"points,omitempty"`
+	// Points dropped at intake because no collector reads their metric.
+	Unread int64 `protobuf:"varint,5,opt,name=unread,proto3" json:"unread,omitempty"`
+	// Points refused (limits, no namespace, tenant checks); inside points.
+	Refused int64 `protobuf:"varint,6,opt,name=refused,proto3" json:"refused,omitempty"`
+	// Exports refused before they were read (backpressure); outside both.
+	RefusedExports int64 `protobuf:"varint,7,opt,name=refused_exports,json=refusedExports,proto3" json:"refused_exports,omitempty"`
+	// State entries held for the sender's sources now, not windowed.
+	Held int64 `protobuf:"varint,8,opt,name=held,proto3" json:"held,omitempty"`
+	// Sources held for the sender now.
+	Sources int32 `protobuf:"varint,9,opt,name=sources,proto3" json:"sources,omitempty"`
+	// The unread points of the window by metric name, most points first.
+	UnreadByName  []*NameCount `protobuf:"bytes,10,rep,name=unread_by_name,json=unreadByName,proto3" json:"unread_by_name,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *OTLPIntake) Reset() {
+	*x = OTLPIntake{}
+	mi := &file_triageagent_sensor_v1_sensor_proto_msgTypes[5]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *OTLPIntake) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*OTLPIntake) ProtoMessage() {}
+
+func (x *OTLPIntake) ProtoReflect() protoreflect.Message {
+	mi := &file_triageagent_sensor_v1_sensor_proto_msgTypes[5]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use OTLPIntake.ProtoReflect.Descriptor instead.
+func (*OTLPIntake) Descriptor() ([]byte, []int) {
+	return file_triageagent_sensor_v1_sensor_proto_rawDescGZIP(), []int{5}
+}
+
+func (x *OTLPIntake) GetSender() string {
+	if x != nil {
+		return x.Sender
+	}
+	return ""
+}
+
+func (x *OTLPIntake) GetWindowSeconds() int64 {
+	if x != nil {
+		return x.WindowSeconds
+	}
+	return 0
+}
+
+func (x *OTLPIntake) GetExports() int64 {
+	if x != nil {
+		return x.Exports
+	}
+	return 0
+}
+
+func (x *OTLPIntake) GetPoints() int64 {
+	if x != nil {
+		return x.Points
+	}
+	return 0
+}
+
+func (x *OTLPIntake) GetUnread() int64 {
+	if x != nil {
+		return x.Unread
+	}
+	return 0
+}
+
+func (x *OTLPIntake) GetRefused() int64 {
+	if x != nil {
+		return x.Refused
+	}
+	return 0
+}
+
+func (x *OTLPIntake) GetRefusedExports() int64 {
+	if x != nil {
+		return x.RefusedExports
+	}
+	return 0
+}
+
+func (x *OTLPIntake) GetHeld() int64 {
+	if x != nil {
+		return x.Held
+	}
+	return 0
+}
+
+func (x *OTLPIntake) GetSources() int32 {
+	if x != nil {
+		return x.Sources
+	}
+	return 0
+}
+
+func (x *OTLPIntake) GetUnreadByName() []*NameCount {
+	if x != nil {
+		return x.UnreadByName
+	}
+	return nil
+}
+
+type NameCount struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Name          string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
+	Points        int64                  `protobuf:"varint,2,opt,name=points,proto3" json:"points,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *NameCount) Reset() {
+	*x = NameCount{}
+	mi := &file_triageagent_sensor_v1_sensor_proto_msgTypes[6]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *NameCount) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*NameCount) ProtoMessage() {}
+
+func (x *NameCount) ProtoReflect() protoreflect.Message {
+	mi := &file_triageagent_sensor_v1_sensor_proto_msgTypes[6]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use NameCount.ProtoReflect.Descriptor instead.
+func (*NameCount) Descriptor() ([]byte, []int) {
+	return file_triageagent_sensor_v1_sensor_proto_rawDescGZIP(), []int{6}
+}
+
+func (x *NameCount) GetName() string {
+	if x != nil {
+		return x.Name
+	}
+	return ""
+}
+
+func (x *NameCount) GetPoints() int64 {
+	if x != nil {
+		return x.Points
+	}
+	return 0
+}
+
 type RoleState struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Role          string                 `protobuf:"bytes,1,opt,name=role,proto3" json:"role,omitempty"`
@@ -500,7 +688,7 @@ type RoleState struct {
 
 func (x *RoleState) Reset() {
 	*x = RoleState{}
-	mi := &file_triageagent_sensor_v1_sensor_proto_msgTypes[5]
+	mi := &file_triageagent_sensor_v1_sensor_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -512,7 +700,7 @@ func (x *RoleState) String() string {
 func (*RoleState) ProtoMessage() {}
 
 func (x *RoleState) ProtoReflect() protoreflect.Message {
-	mi := &file_triageagent_sensor_v1_sensor_proto_msgTypes[5]
+	mi := &file_triageagent_sensor_v1_sensor_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -525,7 +713,7 @@ func (x *RoleState) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RoleState.ProtoReflect.Descriptor instead.
 func (*RoleState) Descriptor() ([]byte, []int) {
-	return file_triageagent_sensor_v1_sensor_proto_rawDescGZIP(), []int{5}
+	return file_triageagent_sensor_v1_sensor_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *RoleState) GetRole() string {
@@ -582,7 +770,7 @@ type StreamResponse struct {
 
 func (x *StreamResponse) Reset() {
 	*x = StreamResponse{}
-	mi := &file_triageagent_sensor_v1_sensor_proto_msgTypes[6]
+	mi := &file_triageagent_sensor_v1_sensor_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -594,7 +782,7 @@ func (x *StreamResponse) String() string {
 func (*StreamResponse) ProtoMessage() {}
 
 func (x *StreamResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_triageagent_sensor_v1_sensor_proto_msgTypes[6]
+	mi := &file_triageagent_sensor_v1_sensor_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -607,7 +795,7 @@ func (x *StreamResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StreamResponse.ProtoReflect.Descriptor instead.
 func (*StreamResponse) Descriptor() ([]byte, []int) {
-	return file_triageagent_sensor_v1_sensor_proto_rawDescGZIP(), []int{6}
+	return file_triageagent_sensor_v1_sensor_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *StreamResponse) GetBody() isStreamResponse_Body {
@@ -645,7 +833,7 @@ type Ack struct {
 
 func (x *Ack) Reset() {
 	*x = Ack{}
-	mi := &file_triageagent_sensor_v1_sensor_proto_msgTypes[7]
+	mi := &file_triageagent_sensor_v1_sensor_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -657,7 +845,7 @@ func (x *Ack) String() string {
 func (*Ack) ProtoMessage() {}
 
 func (x *Ack) ProtoReflect() protoreflect.Message {
-	mi := &file_triageagent_sensor_v1_sensor_proto_msgTypes[7]
+	mi := &file_triageagent_sensor_v1_sensor_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -670,7 +858,7 @@ func (x *Ack) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Ack.ProtoReflect.Descriptor instead.
 func (*Ack) Descriptor() ([]byte, []int) {
-	return file_triageagent_sensor_v1_sensor_proto_rawDescGZIP(), []int{7}
+	return file_triageagent_sensor_v1_sensor_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *Ack) GetSeq() uint64 {
@@ -707,7 +895,7 @@ const file_triageagent_sensor_v1_sensor_proto_rawDesc = "" +
 	"\bSnapshot\x12\x12\n" +
 	"\x04role\x18\x01 \x01(\tR\x04role\x12Z\n" +
 	"\x10resource_metrics\x18\x02 \x03(\v2/.opentelemetry.proto.metrics.v1.ResourceMetricsR\x0fresourceMetrics\x12\x16\n" +
-	"\x06source\x18\x03 \x01(\tR\x06source\"\x90\x03\n" +
+	"\x06source\x18\x03 \x01(\tR\x06source\"\xcb\x03\n" +
 	"\vSensorState\x126\n" +
 	"\x05roles\x18\x01 \x03(\v2 .triageagent.sensor.v1.RoleStateR\x05roles\x12\x1e\n" +
 	"\n" +
@@ -729,7 +917,24 @@ const file_triageagent_sensor_v1_sensor_proto_rawDesc = "" +
 	"\n" +
 	"tick_bytes\x18\n" +
 	" \x01(\x04R\ttickBytes\x12%\n" +
-	"\x0econnect_micros\x18\v \x01(\x03R\rconnectMicros\"\xc3\x01\n" +
+	"\x0econnect_micros\x18\v \x01(\x03R\rconnectMicros\x129\n" +
+	"\x06intake\x18\f \x03(\v2!.triageagent.sensor.v1.OTLPIntakeR\x06intake\"\xce\x02\n" +
+	"\n" +
+	"OTLPIntake\x12\x16\n" +
+	"\x06sender\x18\x01 \x01(\tR\x06sender\x12%\n" +
+	"\x0ewindow_seconds\x18\x02 \x01(\x03R\rwindowSeconds\x12\x18\n" +
+	"\aexports\x18\x03 \x01(\x03R\aexports\x12\x16\n" +
+	"\x06points\x18\x04 \x01(\x03R\x06points\x12\x16\n" +
+	"\x06unread\x18\x05 \x01(\x03R\x06unread\x12\x18\n" +
+	"\arefused\x18\x06 \x01(\x03R\arefused\x12'\n" +
+	"\x0frefused_exports\x18\a \x01(\x03R\x0erefusedExports\x12\x12\n" +
+	"\x04held\x18\b \x01(\x03R\x04held\x12\x18\n" +
+	"\asources\x18\t \x01(\x05R\asources\x12F\n" +
+	"\x0eunread_by_name\x18\n" +
+	" \x03(\v2 .triageagent.sensor.v1.NameCountR\funreadByName\"7\n" +
+	"\tNameCount\x12\x12\n" +
+	"\x04name\x18\x01 \x01(\tR\x04name\x12\x16\n" +
+	"\x06points\x18\x02 \x01(\x03R\x06points\"\xc3\x01\n" +
 	"\tRoleState\x12\x12\n" +
 	"\x04role\x18\x01 \x01(\tR\x04role\x12#\n" +
 	"\rgather_micros\x18\x02 \x01(\x03R\fgatherMicros\x12\x18\n" +
@@ -759,35 +964,39 @@ func file_triageagent_sensor_v1_sensor_proto_rawDescGZIP() []byte {
 	return file_triageagent_sensor_v1_sensor_proto_rawDescData
 }
 
-var file_triageagent_sensor_v1_sensor_proto_msgTypes = make([]protoimpl.MessageInfo, 8)
+var file_triageagent_sensor_v1_sensor_proto_msgTypes = make([]protoimpl.MessageInfo, 10)
 var file_triageagent_sensor_v1_sensor_proto_goTypes = []any{
 	(*StreamRequest)(nil),         // 0: triageagent.sensor.v1.StreamRequest
 	(*Hello)(nil),                 // 1: triageagent.sensor.v1.Hello
 	(*Setting)(nil),               // 2: triageagent.sensor.v1.Setting
 	(*Snapshot)(nil),              // 3: triageagent.sensor.v1.Snapshot
 	(*SensorState)(nil),           // 4: triageagent.sensor.v1.SensorState
-	(*RoleState)(nil),             // 5: triageagent.sensor.v1.RoleState
-	(*StreamResponse)(nil),        // 6: triageagent.sensor.v1.StreamResponse
-	(*Ack)(nil),                   // 7: triageagent.sensor.v1.Ack
-	(*timestamppb.Timestamp)(nil), // 8: google.protobuf.Timestamp
-	(*v1.ResourceMetrics)(nil),    // 9: opentelemetry.proto.metrics.v1.ResourceMetrics
+	(*OTLPIntake)(nil),            // 5: triageagent.sensor.v1.OTLPIntake
+	(*NameCount)(nil),             // 6: triageagent.sensor.v1.NameCount
+	(*RoleState)(nil),             // 7: triageagent.sensor.v1.RoleState
+	(*StreamResponse)(nil),        // 8: triageagent.sensor.v1.StreamResponse
+	(*Ack)(nil),                   // 9: triageagent.sensor.v1.Ack
+	(*timestamppb.Timestamp)(nil), // 10: google.protobuf.Timestamp
+	(*v1.ResourceMetrics)(nil),    // 11: opentelemetry.proto.metrics.v1.ResourceMetrics
 }
 var file_triageagent_sensor_v1_sensor_proto_depIdxs = []int32{
-	8, // 0: triageagent.sensor.v1.StreamRequest.time:type_name -> google.protobuf.Timestamp
-	1, // 1: triageagent.sensor.v1.StreamRequest.hello:type_name -> triageagent.sensor.v1.Hello
-	3, // 2: triageagent.sensor.v1.StreamRequest.snapshot:type_name -> triageagent.sensor.v1.Snapshot
-	4, // 3: triageagent.sensor.v1.StreamRequest.state:type_name -> triageagent.sensor.v1.SensorState
-	2, // 4: triageagent.sensor.v1.Hello.settings:type_name -> triageagent.sensor.v1.Setting
-	9, // 5: triageagent.sensor.v1.Snapshot.resource_metrics:type_name -> opentelemetry.proto.metrics.v1.ResourceMetrics
-	5, // 6: triageagent.sensor.v1.SensorState.roles:type_name -> triageagent.sensor.v1.RoleState
-	7, // 7: triageagent.sensor.v1.StreamResponse.ack:type_name -> triageagent.sensor.v1.Ack
-	0, // 8: triageagent.sensor.v1.SensorService.Stream:input_type -> triageagent.sensor.v1.StreamRequest
-	6, // 9: triageagent.sensor.v1.SensorService.Stream:output_type -> triageagent.sensor.v1.StreamResponse
-	9, // [9:10] is the sub-list for method output_type
-	8, // [8:9] is the sub-list for method input_type
-	8, // [8:8] is the sub-list for extension type_name
-	8, // [8:8] is the sub-list for extension extendee
-	0, // [0:8] is the sub-list for field type_name
+	10, // 0: triageagent.sensor.v1.StreamRequest.time:type_name -> google.protobuf.Timestamp
+	1,  // 1: triageagent.sensor.v1.StreamRequest.hello:type_name -> triageagent.sensor.v1.Hello
+	3,  // 2: triageagent.sensor.v1.StreamRequest.snapshot:type_name -> triageagent.sensor.v1.Snapshot
+	4,  // 3: triageagent.sensor.v1.StreamRequest.state:type_name -> triageagent.sensor.v1.SensorState
+	2,  // 4: triageagent.sensor.v1.Hello.settings:type_name -> triageagent.sensor.v1.Setting
+	11, // 5: triageagent.sensor.v1.Snapshot.resource_metrics:type_name -> opentelemetry.proto.metrics.v1.ResourceMetrics
+	7,  // 6: triageagent.sensor.v1.SensorState.roles:type_name -> triageagent.sensor.v1.RoleState
+	5,  // 7: triageagent.sensor.v1.SensorState.intake:type_name -> triageagent.sensor.v1.OTLPIntake
+	6,  // 8: triageagent.sensor.v1.OTLPIntake.unread_by_name:type_name -> triageagent.sensor.v1.NameCount
+	9,  // 9: triageagent.sensor.v1.StreamResponse.ack:type_name -> triageagent.sensor.v1.Ack
+	0,  // 10: triageagent.sensor.v1.SensorService.Stream:input_type -> triageagent.sensor.v1.StreamRequest
+	8,  // 11: triageagent.sensor.v1.SensorService.Stream:output_type -> triageagent.sensor.v1.StreamResponse
+	11, // [11:12] is the sub-list for method output_type
+	10, // [10:11] is the sub-list for method input_type
+	10, // [10:10] is the sub-list for extension type_name
+	10, // [10:10] is the sub-list for extension extendee
+	0,  // [0:10] is the sub-list for field type_name
 }
 
 func init() { file_triageagent_sensor_v1_sensor_proto_init() }
@@ -800,7 +1009,7 @@ func file_triageagent_sensor_v1_sensor_proto_init() {
 		(*StreamRequest_Snapshot)(nil),
 		(*StreamRequest_State)(nil),
 	}
-	file_triageagent_sensor_v1_sensor_proto_msgTypes[6].OneofWrappers = []any{
+	file_triageagent_sensor_v1_sensor_proto_msgTypes[8].OneofWrappers = []any{
 		(*StreamResponse_Ack)(nil),
 	}
 	type x struct{}
@@ -809,7 +1018,7 @@ func file_triageagent_sensor_v1_sensor_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_triageagent_sensor_v1_sensor_proto_rawDesc), len(file_triageagent_sensor_v1_sensor_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   8,
+			NumMessages:   10,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

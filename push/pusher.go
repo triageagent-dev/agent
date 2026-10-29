@@ -874,16 +874,18 @@ func (p *Pusher) SendTopologySnapshot(capturedAt int64, windowSec int, nodes []T
 // session-level frame like heartbeat: connworker.go's writeLoop writes the
 // latest state unstamped on the connection at the next heartbeat tick,
 // rather than enqueuing it onto any per-tenant queue. A newer call replaces
-// an unsent one. A no-op when sensors is empty — nothing to report yet,
+// an unsent one. intake is what each OTLP sender offered the receivers in
+// their last window, sent as it is: it names senders, not tenants. A no-op
+// when there is no sensor, OTLP source or intake — nothing to report yet,
 // e.g. before the hub has heard from any sensor.
-func (p *Pusher) SendSensorState(at int64, sensors []SensorStatus, otlp []OTLPSourceStatus) {
-	if p == nil || (len(sensors) == 0 && len(otlp) == 0) {
+func (p *Pusher) SendSensorState(at int64, sensors []SensorStatus, otlp []OTLPSourceStatus, intake []OTLPIntakeStatus) {
+	if p == nil || (len(sensors) == 0 && len(otlp) == 0 && len(intake) == 0) {
 		return
 	}
 	if sensors == nil {
 		sensors = []SensorStatus{} // the field is required on the wire
 	}
-	f := newSensorState(p.opts.ClusterName, at, sensors, p.stampOTLPTenants(otlp))
+	f := newSensorState(p.opts.ClusterName, at, sensors, p.stampOTLPTenants(otlp), intake)
 	p.sensorState.Store(f)
 	p.observe("", f)
 }

@@ -141,11 +141,11 @@ func TestExemplarsDropped(t *testing.T) {
 }
 
 // A sender refused on every export is logged once a minute per reason, with
-// the resource and the count refused since the last line.
+// the resource and the count refused since the last line, at verbosity 1.
 func TestRefusalLog_OncePerMinute(t *testing.T) {
 	now := time.Unix(1_800_000_000, 0)
 	var lines []string
-	log := funcr.New(func(_, args string) { lines = append(lines, args) }, funcr.Options{})
+	log := funcr.New(func(_, args string) { lines = append(lines, args) }, funcr.Options{Verbosity: 1})
 	r := New(Options{Auth: okAuth{}, Log: log, now: func() time.Time { return now }})
 	res := resource("service.name", "checkout") // no namespace: refused every time
 	over := func() {
@@ -198,5 +198,38 @@ func TestCAdvisor_IntakeKeepsOnlyWhatIsRead(t *testing.T) {
 	m := outs[0].set.Get("use.cpu.usage.usec")
 	if m == nil || len(m.Points) != 1 || m.Points[0].Value != 3e6 {
 		t.Fatalf("use.cpu.usage.usec = %+v, want the pod cgroup's 3 s", m)
+	}
+}
+
+// Senders refused for the same reason are no longer a line each: the
+// per-sender line is a debug line, and the minute summary says how many
+// senders were refused and the points refused per reason.
+func TestRefusalLog_SummaryCollapsesSenders(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0)
+	var lines []string
+	log := funcr.New(func(_, args string) { lines = append(lines, args) }, funcr.Options{})
+	r := New(Options{Auth: okAuth{}, Log: log, now: func() time.Time { return now }})
+	res := resource("service.name", "checkout") // no namespace: refused
+	for _, name := range []string{"a", "b", "c"} {
+		p := Principal{Name: name, Forwarder: true}
+		rms := []*metricspb.ResourceMetrics{{
+			Resource:     res,
+			ScopeMetrics: []*metricspb.ScopeMetrics{{Metrics: []*metricspb.Metric{counter("app_requests_total", 10, 1)}}},
+		}}
+		if rejected, _ := r.accept(p, rms); rejected != 1 {
+			t.Fatalf("sender %s: rejected = %d, want 1", name, rejected)
+		}
+	}
+	if len(lines) != 0 {
+		t.Fatalf("refusals logged %d lines at verbosity 0, want none:\n%s", len(lines), strings.Join(lines, "\n"))
+	}
+	r.logSummary()
+	if len(lines) != 1 {
+		t.Fatalf("the summary logged %d lines, want 1:\n%s", len(lines), strings.Join(lines, "\n"))
+	}
+	l := lines[0]
+	if !strings.Contains(l, `"sendersRefused"=3`) || !strings.Contains(l, `"refusedBy"=`) ||
+		!strings.Contains(l, "no k8s.namespace.name") || !strings.Contains(l, `did not enrich it"=3`) {
+		t.Fatalf("summary line: %s", l)
 	}
 }
