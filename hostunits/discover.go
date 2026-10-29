@@ -70,6 +70,10 @@ type Options struct {
 	Poll time.Duration
 	// Log receives diagnostics.
 	Log logr.Logger
+	// Connect opens the bus Watch reads; nil connects to the system systemd
+	// instance. A test of what runs the Discoverer passes a bus of its own,
+	// so it does not open the host's.
+	Connect func(context.Context) (Bus, error)
 }
 
 // Discoverer turns systemd service units into push.AppEvents. It implements
@@ -100,9 +104,14 @@ func (d *Discoverer) Names() []string {
 
 var _ push.AppSource = (*Discoverer)(nil)
 
-// New returns a Discoverer that talks to the system bus.
+// New returns a Discoverer that talks to the system bus, or to what
+// opts.Connect opens.
 func New(opts Options) *Discoverer {
-	return newWithConnect(opts, NewBus)
+	connect := opts.Connect
+	if connect == nil {
+		connect = NewBus
+	}
+	return newWithConnect(opts, connect)
 }
 
 func newWithConnect(opts Options, connect func(context.Context) (Bus, error)) *Discoverer {

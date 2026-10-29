@@ -94,11 +94,15 @@ type hostOptions struct {
 	redOptions             func() redsource.Options
 	hostname               func() (string, error) // os.Hostname; injectable in tests
 	statusEvery            time.Duration          // sensor_state period; sensorStatusInterval by default
-	uiAdminKeyFile         string
-	uiMaxEvents            int
-	api                    agentui.APIOptions // the monitoring API (ADR-0020); Addr empty is off
-	uiAdminKey             string             // --ui-admin-key or TRIAGE_AGENT_UI_ADMIN_KEY; host mode only
-	uiListen               string             // --ui-listen: the local TUI's loopback address; empty is off
+	// unitsBus opens the systemd bus the units source reads; nil is the
+	// system bus. A test passes a bus of its own, so it never opens the
+	// machine's.
+	unitsBus       func(context.Context) (hostunits.Bus, error)
+	uiAdminKeyFile string
+	uiMaxEvents    int
+	api            agentui.APIOptions // the monitoring API (ADR-0020); Addr empty is off
+	uiAdminKey     string             // --ui-admin-key or TRIAGE_AGENT_UI_ADMIN_KEY; host mode only
+	uiListen       string             // --ui-listen: the local TUI's loopback address; empty is off
 }
 
 // hostClusterName returns the cluster name a host reports under: the flag
@@ -244,7 +248,7 @@ func buildHost(o hostOptions, log logr.Logger) (*hostRuntime, error) {
 	}
 	// Phase 2: systemd units are the host's virtual apps. Pusher.Start runs
 	// the source, and the sensor roles read the same selection from it.
-	units := hostunits.New(hostunits.Options{Globs: o.units, Log: log.WithName("hostunits")})
+	units := hostunits.New(hostunits.Options{Globs: o.units, Log: log.WithName("hostunits"), Connect: o.unitsBus})
 	if err := pusher.SetAppSource(units); err != nil {
 		return nil, err
 	}

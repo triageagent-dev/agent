@@ -18,6 +18,7 @@ import (
 	"github.com/go-logr/logr"
 	"github.com/gorilla/websocket"
 
+	"github.com/triageagent-dev/agent/hostunits"
 	"github.com/triageagent-dev/agent/logmetrics"
 	"github.com/triageagent-dev/agent/push"
 	"github.com/triageagent-dev/agent/redsource"
@@ -75,11 +76,22 @@ func TestHostClusterName(t *testing.T) {
 	}
 }
 
+// noUnits is a systemd bus with no units and no changes: the host tests here
+// run the units source, and must not open the machine's system bus (a
+// runner has one, with signals racing in the D-Bus library).
+type noUnits struct{}
+
+func (noUnits) Units(context.Context) ([]hostunits.Unit, error)  { return nil, nil }
+func (noUnits) Restarts(context.Context, string) (uint64, error) { return 0, nil }
+func (noUnits) Changes(context.Context) (<-chan struct{}, error) { return nil, nil }
+func (noUnits) Close()                                           {}
+
 func validHostOptions() hostOptions {
 	return hostOptions{
 		endpoint: "wss://core.example.internal/events/ws", tenant: "acme",
 		joinCAFingerprint: "SHA256:0000000000000000000000000000000000000000000000000000000000000000",
 		hostname:          func() (string, error) { return "web-01", nil },
+		unitsBus:          func(context.Context) (hostunits.Bus, error) { return noUnits{}, nil },
 	}
 }
 
