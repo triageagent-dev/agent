@@ -33,6 +33,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"go.uber.org/zap/zapcore"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	// +kubebuilder:scaffold:imports
@@ -55,6 +56,13 @@ func appVersion() string { return version }
 func init() {
 	_ = clientgoscheme.AddToScheme(scheme)
 	// +kubebuilder:scaffold:scheme
+}
+
+// logOptions are the logger's defaults before the flags: the console encoder
+// of development mode, at level info. Development mode alone would log at
+// debug, and a debug line in this agent is one per sender a minute.
+func logOptions() zap.Options {
+	return zap.Options{Development: true, Level: zapcore.InfoLevel}
 }
 
 func main() {
@@ -312,7 +320,7 @@ func main() {
 
 	// Bind the zap logging flags (--zap-log-level, --zap-devel, --zap-encoder, ...) so log
 	// verbosity is controllable at runtime.
-	opts := zap.Options{Development: true}
+	opts := logOptions()
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
 

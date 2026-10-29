@@ -177,6 +177,9 @@ spec:
             {{- with ($.Values.sensorStream | default dict).tick }}
             - --sensor-tick={{ . }}
             {{- end }}
+            {{- if $.Values.logLevel }}
+            - --zap-log-level={{ $.Values.logLevel }}
+            {{- end }}
             {{- end }}
             {{- if $logExporter.enabled }}
             {{- $siLogNs := $logExporter.includeNamespaces | default list }}

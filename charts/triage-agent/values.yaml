@@ -26,7 +26,8 @@ fullnameOverride: ""
 # Namespace the controller's cache is restricted to. Empty = cluster-wide.
 namespace: ""
 
-# Log verbosity (zap --zap-log-level): "info" (default), "debug", or a number.
+# Log verbosity (zap --zap-log-level) of the controller and every sensor pod:
+# "info" (default), "debug", or a number.
 # Set to "1" or "debug" to trace every pushed Application delta + Kubernetes event.
 logLevel: ""
 
