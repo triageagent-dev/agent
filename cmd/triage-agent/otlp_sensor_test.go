@@ -94,6 +94,33 @@ func TestNewOTLPSensorReceiver_Validates(t *testing.T) {
 	}
 }
 
+// Every otlp-role receiver drops at intake what no collector reads: the
+// mutual-TLS one as much as the insecure one.
+func TestOTLPSensor_AuthenticatedDropsUnread(t *testing.T) {
+	dir := t.TempDir()
+	cert, key := writeCert(t, dir)
+	ca := filepath.Join(dir, "ca.crt")
+	if err := os.WriteFile(ca, mustRead(t, cert), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sink := func(string, string, []*metricspb.ResourceMetrics) {}
+	for name, f := range map[string]otlpSensorFlags{
+		"mutual TLS": {listen: ":4317", tlsCert: cert, tlsKey: key, clientCA: ca},
+		"insecure":   {listen: ":4317", insecure: true},
+	} {
+		r, err := newOTLPSensorReceiver(f, sink)
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if r.Reads("k8s.pod.phase") {
+			t.Errorf("%s: a metric no collector reads would be stored", name)
+		}
+		if !r.Reads("log.errors") {
+			t.Errorf("%s: a metric the collectors read would be dropped", name)
+		}
+	}
+}
+
 func mustRead(t *testing.T, p string) []byte {
 	t.Helper()
 	b, err := os.ReadFile(p)

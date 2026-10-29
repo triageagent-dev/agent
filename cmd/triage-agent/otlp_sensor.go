@@ -96,6 +96,7 @@ func newOTLPSensorReceiver(f otlpSensorFlags, sink otlpreceiver.Sink) (*otlprece
 		Auth:          auth,
 		Sink:          sink,
 		Log:           ctrl.Log,
+		Wanted:        otlpreceiver.ReadByCollectors,
 		TenantAllowed: func(tenant string) bool { return slices.Contains(f.tenants, tenant) },
 
 		MaxResources: f.maxResources, MaxPointsPerResource: f.maxPoints,

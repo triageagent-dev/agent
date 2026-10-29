@@ -9,11 +9,11 @@ description: |
   REQUIRES an agent build carrying the corrected flag defaults (--red-metrics-
   service-name=triage-ebpf, --log-metrics-service-name=triage-log,
   --log-metrics-port=9466).
-  The eBPF DaemonSet's agent container runs the SAME agent binary and the
-  SAME image as the Deployment (image.repository:image.tag), with --mode
-  repeated per role (ebpf, node-exporter, log-exporter). The image is always
-  built with -tags obi, so --mode ebpf works without any separate image to
-  name.
+  The eBPF DaemonSet's agent container runs the same agent binary, with
+  --mode repeated per role (ebpf, node-exporter, log-exporter), from the
+  image built with -tags obi (image.ebpf.repository, default
+  <image.repository>-obi); the Deployment and the otlp role run the image
+  without it.
   ebpf.networkFlows.enabled turns on a SECOND topology-edge source (L4
   network flows, obi_network_flow_bytes_total) alongside the existing L7 RED
   scrape. Requires ebpf.enabled=true (the chart fails the render otherwise)
