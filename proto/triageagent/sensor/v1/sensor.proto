@@ -76,6 +76,37 @@ message SensorState {
   uint64 tick_bytes = 10;
   // Time from the stream opening until the first Ack on this stream.
   int64 connect_micros = 11;
+  // Set by the otlp role (ADR-0022): what each sender offered its receiver in
+  // the last window, so the controller can report the intake per sender.
+  repeated OTLPIntake intake = 12;
+}
+
+// What one sender offered an otlp role's receiver in its last window, and
+// what the receiver holds for it now.
+message OTLPIntake {
+  string sender = 1;
+  // Seconds the windowed counters below cover.
+  int64 window_seconds = 2;
+  int64 exports = 3;
+  // Points, spans and log records offered.
+  int64 points = 4;
+  // Points dropped at intake because no collector reads their metric.
+  int64 unread = 5;
+  // Points refused (limits, no namespace, tenant checks); inside points.
+  int64 refused = 6;
+  // Exports refused before they were read (backpressure); outside both.
+  int64 refused_exports = 7;
+  // State entries held for the sender's sources now, not windowed.
+  int64 held = 8;
+  // Sources held for the sender now.
+  int32 sources = 9;
+  // The unread points of the window by metric name, most points first.
+  repeated NameCount unread_by_name = 10;
+}
+
+message NameCount {
+  string name = 1;
+  int64 points = 2;
 }
 
 message RoleState {

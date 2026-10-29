@@ -33,6 +33,7 @@ type logCounts struct {
 	start                uint64
 	errors, warns, lines uint64
 	seen                 time.Time
+	src                  *source
 }
 
 // logService serves the OTLP logs service on the receiver.
@@ -103,10 +104,14 @@ func (r *Receiver) acceptLogs(p Principal, rls []*logspb.ResourceLogs) (int64, [
 
 	r.mu.Lock()
 	r.exports++
+	in := r.intakeFor(sender)
+	f.in = in
+	in.cur.exports++
 	var offered int64
 	for _, rl := range rls {
 		nr := int64(countRecords(rl))
 		r.points += nr
+		in.cur.points += nr
 		offered += nr
 		n := func() int { return countRecords(rl) }
 		f.at(rl.GetResource())
@@ -120,7 +125,8 @@ func (r *Receiver) acceptLogs(p Principal, rls []*logspb.ResourceLogs) (int64, [
 		}
 		resource.Attributes = append(resource.Attributes, kv(replicaAttr, replica))
 		key := resourceKey(resource)
-		if !r.touchSource(key, sender, now, n, reject) {
+		src, ok := r.touchSource(key, sender, now, n, reject)
+		if !ok {
 			continue
 		}
 		c := r.logs[key]
@@ -129,9 +135,10 @@ func (r *Receiver) acceptLogs(p Principal, rls []*logspb.ResourceLogs) (int64, [
 				reject(n(), "series limit reached")
 				continue
 			}
-			c = &logCounts{start: uint64(now.UnixNano())}
+			c = &logCounts{start: uint64(now.UnixNano()), src: src}
 			r.logs[key] = c
 			r.nheld++
+			src.held++
 		}
 		c.seen = now
 		before := *c

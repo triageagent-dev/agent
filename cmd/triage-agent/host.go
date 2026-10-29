@@ -301,11 +301,11 @@ func buildHost(o hostOptions, log logr.Logger) (*hostRuntime, error) {
 // once at start, then every period until ctx ends. A cluster controller waits
 // a period first because its hub has no sensor yet; the host's own are there.
 func hostSensorStatusLoop(ctx context.Context, nodes func() []sensorstream.NodeStatus,
-	send func(at int64, sensors []push.SensorStatus, otlp []push.OTLPSourceStatus), every time.Duration) {
+	send func(at int64, sensors []push.SensorStatus, otlp []push.OTLPSourceStatus, intake []push.OTLPIntakeStatus), every time.Duration) {
 	t := time.NewTicker(every)
 	defer t.Stop()
 	for {
-		send(time.Now().Unix(), sensorStatusesFromNodes(nodes()), nil)
+		send(time.Now().Unix(), sensorStatusesFromNodes(nodes()), nil, nil)
 		select {
 		case <-ctx.Done():
 			return

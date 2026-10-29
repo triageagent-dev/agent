@@ -81,8 +81,9 @@ func podCgroup(attrs []*commonpb.KeyValue) bool {
 // dropCAdvisorNoise removes from rm every container_* point that is not a
 // pod's own cgroup (a container's, the node's, a system slice's) and
 // returns how many that was: nothing reads them, and a node has several
-// such points for every pod one.
-func dropCAdvisorNoise(rm *metricspb.ResourceMetrics) int {
+// such points for every pod one. count is told, per metric, how many of its
+// points were dropped.
+func dropCAdvisorNoise(rm *metricspb.ResourceMetrics, count func(name string, n int)) int {
 	dropped := 0
 	for _, sm := range rm.GetScopeMetrics() {
 		for _, m := range sm.GetMetrics() {
@@ -90,6 +91,7 @@ func dropCAdvisorNoise(rm *metricspb.ResourceMetrics) int {
 				continue
 			}
 			bad := func(attrs []*commonpb.KeyValue, _ bool) bool { return !podCgroup(attrs) }
+			before := dropped
 			report := func(n int) { dropped += n }
 			switch d := m.GetData().(type) {
 			case *metricspb.Metric_Sum:
@@ -98,6 +100,9 @@ func dropCAdvisorNoise(rm *metricspb.ResourceMetrics) int {
 			case *metricspb.Metric_Gauge:
 				d.Gauge.DataPoints = filterPoints(d.Gauge.GetDataPoints(), true, bad, report,
 					func(dp *metricspb.NumberDataPoint) []*commonpb.KeyValue { return dp.GetAttributes() })
+			}
+			if dropped > before {
+				count(m.GetName(), dropped-before)
 			}
 		}
 	}
@@ -116,6 +121,7 @@ type psiPrev struct {
 	v    float64
 	ts   uint64
 	seen time.Time
+	src  *source
 }
 
 // translateCAdvisor builds the use.* metrics for every pod in the cAdvisor
@@ -124,7 +130,7 @@ type psiPrev struct {
 // as cgroup pressure's "some avg" the DaemonSet reads; the first reading of
 // a pod yields none. The previous readings are the only state kept. The
 // caller holds r.mu.
-func (r *Receiver) translateCAdvisor(ms []*metricspb.Metric, now time.Time) []*metricspb.Metric {
+func (r *Receiver) translateCAdvisor(src *source, ms []*metricspb.Metric, now time.Time) []*metricspb.Metric {
 	pods := map[podRef]*cadvisorPod{}
 	var nodeCores, nodeMem float64
 	for _, m := range ms {
@@ -242,13 +248,16 @@ func (r *Receiver) translateCAdvisor(ms []*metricspb.Metric, now time.Time) []*m
 			}
 			key := ref.namespace + "/" + ref.pod + "/" + res
 			prev, had := r.psi[key]
+			owner := prev.src
 			if !had {
 				if r.nheld >= r.opts.MaxSeries {
 					continue
 				}
 				r.nheld++
+				src.held++
+				owner = src
 			}
-			r.psi[key] = psiPrev{v: v, ts: ts, seen: now}
+			r.psi[key] = psiPrev{v: v, ts: ts, seen: now, src: owner}
 			if !had || ts <= prev.ts || v < prev.v {
 				continue
 			}

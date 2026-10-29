@@ -31,7 +31,10 @@ import (
 // before reading it, with RESOURCE_EXHAUSTED and a retry delay, which a
 // Collector's exporter queue honours by backing off and sending again.
 // The queue in front of the receiver is the Collector's own; the pod
-// sheds instead of growing until the kernel kills it.
+// sheds instead of growing until the kernel kills it. A refusal here is an
+// export, not a number of points (nothing of it was read): it is counted
+// apart, per sender in the intake ledger, in the summary line and in the
+// ledger's refused exports, and is never added to the refused points.
 
 const (
 	// memoryHighWater is the share of the Go memory limit the live heap
@@ -141,7 +144,10 @@ func (r *Receiver) tap(ctx context.Context, _ *tap.Info) (context.Context, error
 
 // refuseExport counts one refused export against its sender, named by
 // its certificate or its address (nothing else is known before the
-// request is read), in the receiver's refusal counters and log.
+// request is read), as a refused export in the intake ledger and the
+// summary line, and logs it like any refusal. It is not a refused point,
+// so it stays out of the per-sender refusal counters and the ledger's
+// refused points.
 func (r *Receiver) refuseExport(ctx context.Context, why string, memory bool) {
 	sender := "unknown"
 	if p, ok := peer.FromContext(ctx); ok {
@@ -153,16 +159,17 @@ func (r *Receiver) refuseExport(ctx context.Context, why string, memory bool) {
 		}
 	}
 	r.mu.Lock()
-	f := r.newRefusal(sender, "exports")
-	f.reject(1, why)
-	r.rejected++
+	in := r.intakeFor(sender)
+	in.cur.refusedExports++
+	r.refusedExports++
+	r.logRefusal(sender, "exports", why, "", 1)
 	if memory {
 		r.adm.refused.memory++
 	} else {
 		r.adm.refused.inFlight++
 	}
 	r.mu.Unlock()
-	ledger.Default.Add("otlp", ledger.All, ledger.Refused, 1)
+	ledger.Default.Add("otlp", ledger.All, ledger.RefusedExports, 1)
 }
 
 // InFlight is the number of exports being read or translated right now.

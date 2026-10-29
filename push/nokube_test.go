@@ -37,7 +37,7 @@ func newTestNoKubePusher(endpoint string) *Pusher {
 func TestNoKubernetes_StartRegistersNoInformers(t *testing.T) {
 	hub, srv := newFakeHub(t)
 	p := newTestNoKubePusher(wsURL(srv))
-	p.SendSensorState(1720000000, []SensorStatus{{Node: "otlp", Connected: true}}, nil)
+	p.SendSensorState(1720000000, []SensorStatus{{Node: "otlp", Connected: true}}, nil, nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)

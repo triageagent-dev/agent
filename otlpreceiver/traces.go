@@ -66,6 +66,7 @@ type spanSeries struct {
 // spanRoutes are the series derived from one resource's spans.
 type spanRoutes struct {
 	routes map[string]*spanSeries
+	src    *source
 }
 
 // traceService serves the OTLP traces service on the receiver. It is a type
@@ -126,10 +127,14 @@ func (r *Receiver) acceptTraces(p Principal, rss []*tracepb.ResourceSpans) (int6
 
 	r.mu.Lock()
 	r.exports++
+	in := r.intakeFor(sender)
+	f.in = in
+	in.cur.exports++
 	var offered int64
 	for _, rs := range rss {
 		ns := int64(countSpans(rs))
 		r.points += ns
+		in.cur.points += ns
 		offered += ns
 		n := func() int { return countSpans(rs) }
 		f.at(rs.GetResource())
@@ -143,12 +148,13 @@ func (r *Receiver) acceptTraces(p Principal, rss []*tracepb.ResourceSpans) (int6
 		}
 		resource.Attributes = append(resource.Attributes, kv(replicaAttr, replica))
 		key := resourceKey(resource)
-		if !r.touchSource(key, sender, now, n, reject) {
+		src, ok := r.touchSource(key, sender, now, n, reject)
+		if !ok {
 			continue
 		}
 		sr := r.spans[key]
 		if sr == nil {
-			sr = &spanRoutes{routes: map[string]*spanSeries{}}
+			sr = &spanRoutes{routes: map[string]*spanSeries{}, src: src}
 			r.spans[key] = sr
 		}
 		touched := map[string]bool{}
@@ -168,7 +174,7 @@ func (r *Receiver) acceptTraces(p Principal, rss []*tracepb.ResourceSpans) (int6
 		out, _ := translateSpanMetrics(spanMetricsOf(sr, touched, now))
 		var ms []*metricspb.Metric
 		for _, mo := range out {
-			if m, cnt, why := r.prepare(key, mo, now); why != "" {
+			if m, cnt, why := r.prepare(key, src, mo, now); why != "" {
 				reject(cnt, why)
 			} else if m != nil {
 				ms = append(ms, m)
@@ -226,6 +232,7 @@ func (r *Receiver) foldSpan(sr *spanRoutes, sp *tracepb.Span, now time.Time) (ke
 		s = &spanSeries{attrs: attrs, start: sp.GetStartTimeUnixNano(), counts: make([]uint64, len(spanDurationBounds)+1)}
 		sr.routes[k] = s
 		r.nheld++
+		sr.src.held++
 	}
 	s.seen = now
 	d := float64(0)

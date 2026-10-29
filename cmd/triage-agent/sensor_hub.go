@@ -66,8 +66,10 @@ type sensorHubOptions struct {
 // hub the collectors read. Nil when o.listen is empty; any other setup
 // failure exits, since the collectors that asked for it would read nothing.
 // With o.meshListen set it also runs the replica gossip (ADR-0015 phase 4)
-// over the same certificate, and with o.otlpListen set the OTLP receiver.
-func startSensorHub(mgr manager.Manager, o sensorHubOptions) (*sensorstream.Hub, *mesh.Mesh) {
+// over the same certificate, and with o.otlpListen set the OTLP receiver,
+// which it returns too (nil without one) for the sensor-status loop to read
+// the intake of.
+func startSensorHub(mgr manager.Manager, o sensorHubOptions) (*sensorstream.Hub, *mesh.Mesh, *otlpreceiver.Receiver) {
 	if o.listen == "" {
 		if o.meshListen != "" {
 			setupLog.Error(nil, "--mesh-listen gossips the sensor stream: set --sensor-listen")
@@ -77,7 +79,7 @@ func startSensorHub(mgr manager.Manager, o sensorHubOptions) (*sensorstream.Hub,
 			setupLog.Error(nil, "--otlp-listen feeds the sensor stream hub: set --sensor-listen")
 			os.Exit(1)
 		}
-		return nil, nil
+		return nil, nil, nil
 	}
 	ns := podNamespace()
 	if ns == "" || o.tlsSecret == "" || o.caConfigMap == "" || o.service == "" || o.serviceAccount == "" {
@@ -139,8 +141,9 @@ func startSensorHub(mgr manager.Manager, o sensorHubOptions) (*sensorstream.Hub,
 		}
 		setupLog.Info("replica gossip enabled", "listen", o.meshListen, "service", o.meshService)
 	}
+	var recv *otlpreceiver.Receiver
 	if o.otlpListen != "" {
-		startOTLPReceiver(mgr, client, cert, o, hub)
+		recv = startOTLPReceiver(mgr, client, cert, o, hub)
 	} else if o.otlpSensorRole && o.otlpClientCASecret != "" {
 		// The receiver runs in the otlp role's pods (ADR-0022), which only
 		// read the CA; the controller still creates and renews it, since it
@@ -157,14 +160,14 @@ func startSensorHub(mgr manager.Manager, o sensorHubOptions) (*sensorstream.Hub,
 	if o.otlpSensorRole {
 		setupLog.Info("otlp role enabled: a peer presenting the serving certificate may stream OTLP sources", "tenants", o.otlpTenants)
 	}
-	return hub, m
+	return hub, m, recv
 }
 
 // startOTLPReceiver serves OTLP metrics on the sensor stream's certificate
 // and hands them to hub (docs/adr/0017-otlp-receiver.md). Every replica
 // receives; the hub gossips what each one took, so the leader's collectors
-// see all of it. It exits on a setup error.
-func startOTLPReceiver(mgr manager.Manager, client kubernetes.Interface, cert tls.Certificate, o sensorHubOptions, hub *sensorstream.Hub) {
+// see all of it. It returns the receiver and exits on a setup error.
+func startOTLPReceiver(mgr manager.Manager, client kubernetes.Interface, cert tls.Certificate, o sensorHubOptions, hub *sensorstream.Hub) *otlpreceiver.Receiver {
 	if len(o.otlpAllowed) == 0 && o.otlpClientCA == "" && o.otlpClientCASecret == "" {
 		setupLog.Error(nil, "--otlp-listen needs --otlp-allowed-service-accounts, --otlp-client-ca-file or --otlp-client-ca-secret: nobody could send")
 		os.Exit(1)
@@ -231,6 +234,7 @@ func startOTLPReceiver(mgr manager.Manager, client kubernetes.Interface, cert tl
 		os.Exit(1)
 	}
 	setupLog.Info("otlp receiver enabled", "listen", o.otlpListen, "allowed", o.otlpAllowed, "audience", otlpreceiver.TokenAudience, "mtls", pool != nil)
+	return r
 }
 
 // newMesh builds the replica gossip on the sensor stream's certificate:
@@ -281,6 +285,9 @@ const sensorStatusInterval = 60 * time.Second
 type sensorStatusLoop struct {
 	hub    *sensorstream.Hub
 	pusher *push.Pusher
+	// intake is the intake of the controller's own OTLP receiver, nil when it
+	// runs none; the otlp role's replicas send theirs in their SensorState.
+	intake func() []otlpreceiver.IntakeStatus
 }
 
 // Start implements manager.Runnable.
@@ -292,7 +299,12 @@ func (l *sensorStatusLoop) Start(ctx context.Context) error {
 		case <-ctx.Done():
 			return nil
 		case <-ticker.C:
-			l.pusher.SendSensorState(time.Now().Unix(), sensorStatusesFromNodes(l.hub.Nodes()), otlpStatusesFromHub(l.hub.OTLPSources()))
+			nodes := l.hub.Nodes()
+			var local []otlpreceiver.IntakeStatus
+			if l.intake != nil {
+				local = l.intake()
+			}
+			l.pusher.SendSensorState(time.Now().Unix(), sensorStatusesFromNodes(nodes), otlpStatusesFromHub(l.hub.OTLPSources()), otlpIntakeFromNodes(nodes, local))
 		}
 	}
 }
@@ -305,12 +317,17 @@ func (l *sensorStatusLoop) NeedLeaderElection() bool { return true }
 // pusher is nil when push mode is disabled. Either nil means there is
 // nothing to read or nowhere to send it, so it is a no-op rather than an
 // error: unlike the log/use/red-metrics collectors, reporting sensor health
-// is not itself something an operator explicitly turns on.
-func startSensorStatusLoop(mgr manager.Manager, hub *sensorstream.Hub, pusher *push.Pusher) {
+// is not itself something an operator explicitly turns on. recv is the
+// controller's own OTLP receiver, nil when it runs none.
+func startSensorStatusLoop(mgr manager.Manager, hub *sensorstream.Hub, pusher *push.Pusher, recv *otlpreceiver.Receiver) {
 	if hub == nil || pusher == nil {
 		return
 	}
-	if err := mgr.Add(&sensorStatusLoop{hub: hub, pusher: pusher}); err != nil {
+	loop := &sensorStatusLoop{hub: hub, pusher: pusher}
+	if recv != nil {
+		loop.intake = recv.Intake
+	}
+	if err := mgr.Add(loop); err != nil {
 		setupLog.Error(err, "unable to add sensor-status loop runnable")
 		os.Exit(1)
 	}

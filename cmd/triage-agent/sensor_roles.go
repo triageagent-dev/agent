@@ -16,6 +16,7 @@ import (
 	"github.com/triageagent-dev/agent/nodeexporter"
 	"github.com/triageagent-dev/agent/push"
 	"github.com/triageagent-dev/agent/sensorstream"
+	"github.com/triageagent-dev/agent/sensorstream/sensorpb"
 )
 
 // sensorRoleOptions carries the flag values the sensor roles read.
@@ -49,6 +50,7 @@ func runSensorRoles(roles []string, o sensorRoleOptions) int {
 	// RoleSource and runs alone, since the controller accepts its account for
 	// that role only.
 	var feed sensorstream.SourceFeed
+	var intake func() []*sensorpb.OTLPIntake
 	if slices.Contains(roles, sensorstream.RoleOTLP) {
 		if len(roles) != 1 {
 			setupLog.Error(nil, "--mode=otlp runs alone: the otlp account may not run other roles")
@@ -61,6 +63,7 @@ func runSensorRoles(roles []string, o sensorRoleOptions) int {
 			return 1
 		}
 		feed = buf
+		intake = func() []*sensorpb.OTLPIntake { return intakeProto(recv.Intake()) }
 		// Pods of one Deployment can share a node: the pod is the hub's key.
 		if pod := os.Getenv("POD_NAME"); pod != "" {
 			node = pod
@@ -136,6 +139,7 @@ func runSensorRoles(roles []string, o sensorRoleOptions) int {
 				Version:        appVersion(),
 				Roles:          sources,
 				Feed:           feed,
+				Intake:         intake,
 				Settings:       sensorSettings(),
 				Tick:           o.tick,
 				Log:            ctrl.Log,

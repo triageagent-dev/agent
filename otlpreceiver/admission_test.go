@@ -58,7 +58,7 @@ func retryDelay(err error) (codes.Code, time.Duration) {
 
 // With one export allowed in flight, a second one is refused before it is
 // read, with RESOURCE_EXHAUSTED and a retry delay, and taken once the
-// first is done. The refusal is counted against the sender.
+// first is done. The refusal is counted as a refused export against the sender.
 func TestBackpressure_RefusesExportsPastTheInFlightBound(t *testing.T) {
 	release := make(chan struct{})
 	entered := make(chan struct{}, 1)
@@ -85,8 +85,18 @@ func TestBackpressure_RefusesExportsPastTheInFlightBound(t *testing.T) {
 	if _, err := client.Export(ctx, exportReq()); err != nil {
 		t.Fatalf("export after the first finished: %v", err)
 	}
-	if n := r.SenderRefusals()["anonymous@127.0.0.1"]; n != 1 {
-		t.Fatalf("refusals against the sender = %d, want 1", n)
+	// The refusal was an export, not points: no per-sender point count, and
+	// the intake ledger says so apart from the two exports that were taken.
+	if n, ok := r.SenderRefusals()["anonymous@127.0.0.1"]; ok {
+		t.Fatalf("refused points against the sender = %d, want none: a refused export is not points", n)
+	}
+	r.logSummary()
+	in := r.Intake()
+	if len(in) != 1 || in[0].Sender != "anonymous@127.0.0.1" {
+		t.Fatalf("intake = %+v, want one entry for the sender", in)
+	}
+	if in[0].RefusedExports != 1 || in[0].Refused != 0 || in[0].Exports != 2 {
+		t.Fatalf("intake = %+v, want 1 refused export, 0 refused points, 2 exports taken", in[0])
 	}
 	if in, mem := r.Refused(); in != 1 || mem != 0 {
 		t.Fatalf("refused = %d in flight, %d memory; want 1 and 0", in, mem)
