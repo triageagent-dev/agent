@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"slices"
+	"time"
 
 	"google.golang.org/grpc/credentials"
 	"k8s.io/client-go/kubernetes"
@@ -35,7 +36,8 @@ type otlpSensorFlags struct {
 	insecure                 bool
 	maxResources, maxPoints  int
 	maxPerSender, maxRequest int
-	maxSeries                int
+	maxSeries, maxInFlight   int
+	expire                   time.Duration
 }
 
 // newOTLPSensorReceiver builds the OTLP receiver an otlp-role pod serves and
@@ -56,6 +58,7 @@ func newOTLPSensorReceiver(f otlpSensorFlags, sink otlpreceiver.Sink) (*otlprece
 			Addr: f.listen, Insecure: true, Sink: sink, Log: ctrl.Log, Wanted: otlpreceiver.ReadByCollectors,
 			MaxResources: f.maxResources, MaxPointsPerResource: f.maxPoints,
 			MaxResourcesPerSender: f.maxPerSender, MaxRequestBytes: f.maxRequest, MaxSeries: f.maxSeries,
+			MaxInFlight: f.maxInFlight, Expire: f.expire,
 		}), nil
 	}
 	if f.tlsCert == "" || f.tlsKey == "" {
@@ -97,5 +100,6 @@ func newOTLPSensorReceiver(f otlpSensorFlags, sink otlpreceiver.Sink) (*otlprece
 
 		MaxResources: f.maxResources, MaxPointsPerResource: f.maxPoints,
 		MaxResourcesPerSender: f.maxPerSender, MaxRequestBytes: f.maxRequest, MaxSeries: f.maxSeries,
+		MaxInFlight: f.maxInFlight, Expire: f.expire,
 	}), nil
 }

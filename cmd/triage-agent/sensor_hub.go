@@ -47,6 +47,8 @@ type sensorHubOptions struct {
 	otlpTenants []string
 	// The receiver's limits (otlpreceiver.Options); zero takes its default.
 	otlpMaxResources, otlpMaxPoints, otlpMaxPerSender, otlpMaxRequest, otlpMaxSeries int
+	otlpMaxInFlight                                                                  int
+	otlpExpire                                                                       time.Duration
 	otlpClientCA                                                                     string
 	// otlpClientCASecret names the Secret that holds the agent's own client CA.
 	otlpClientCASecret string
@@ -222,6 +224,7 @@ func startOTLPReceiver(mgr manager.Manager, client kubernetes.Interface, cert tl
 
 		MaxResources: o.otlpMaxResources, MaxPointsPerResource: o.otlpMaxPoints,
 		MaxResourcesPerSender: o.otlpMaxPerSender, MaxRequestBytes: o.otlpMaxRequest, MaxSeries: o.otlpMaxSeries,
+		MaxInFlight: o.otlpMaxInFlight, Expire: o.otlpExpire,
 	})
 	if err := mgr.Add(r); err != nil {
 		setupLog.Error(err, "otlp receiver: add runnable")

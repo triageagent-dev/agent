@@ -57,6 +57,7 @@ const (
 	defaultMaxResourcesPerSender = 500
 	defaultMaxRequestBytes       = 4 << 20
 	defaultMaxSeries             = 2_000_000
+	defaultExpire                = 3 * time.Minute
 )
 
 // Sink receives one export's metrics of one role for the source under a
@@ -178,8 +179,13 @@ type Options struct {
 	Wanted func(name string) bool
 	// Expire is how long the state kept across exports (a delta series'
 	// running total, a span route's counts, a log source's counts, a pod's
-	// PSI reading, a source's name) lives without an export refreshing it.
+	// PSI reading, a source's name) lives without an export refreshing it:
+	// three export intervals of a minute by default.
 	Expire time.Duration
+	// MaxInFlight bounds the exports being read or translated at once;
+	// past it a sender is refused before its request is read, with a retry
+	// delay (admission.go). Zero takes twice GOMAXPROCS, at least 4.
+	MaxInFlight int
 	// The limits are sanity bounds on the state kept across exports; past
 	// one, points are refused and counted. MaxResources bounds the sources
 	// known (default 2000) and MaxResourcesPerSender the sources one sender
@@ -204,7 +210,7 @@ type Options struct {
 
 func (o *Options) setDefaults() {
 	if o.Expire <= 0 {
-		o.Expire = 10 * time.Minute
+		o.Expire = defaultExpire
 	}
 	if o.MaxResources <= 0 {
 		o.MaxResources = defaultMaxResources
@@ -267,6 +273,7 @@ type Receiver struct {
 
 	opts Options
 	log  logr.Logger
+	adm  *admission
 
 	mu sync.Mutex
 	// sources are the sources forwarded within Expire, by key.
@@ -309,7 +316,7 @@ const summaryEvery = time.Minute
 // New returns a Receiver; Start serves it.
 func New(opts Options) *Receiver {
 	opts.setDefaults()
-	return &Receiver{opts: opts, log: opts.Log.WithName("otlpreceiver"),
+	return &Receiver{opts: opts, log: opts.Log.WithName("otlpreceiver"), adm: newAdmission(opts.MaxInFlight),
 		sources: map[string]*source{}, bySender: map[string]int{}, ticks: map[uint64]tick{}, deltas: map[uint64]*running{},
 		spans: map[string]*spanRoutes{}, logs: map[string]*logCounts{}, psi: map[string]psiPrev{},
 		refusals: map[string]int64{}, refusalLog: map[string]*refusalWindow{}}
@@ -352,6 +359,8 @@ func (r *Receiver) Serve(ctx context.Context, lis net.Listener) error {
 	}
 	srv := grpc.NewServer(append(creds,
 		grpc.MaxRecvMsgSize(r.opts.MaxRequestBytes),
+		grpc.InTapHandle(r.tap),
+		grpc.StatsHandler(r.adm),
 		grpc.KeepaliveParams(keepalive.ServerParameters{Time: 30 * time.Second, Timeout: 10 * time.Second}),
 		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{MinTime: 10 * time.Second, PermitWithoutStream: true}),
 	)...)

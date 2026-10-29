@@ -252,6 +252,12 @@ spec:
             {{- with .maxSeries }}
             - --otlp-max-series={{ . | int }}
             {{- end }}
+            {{- with .maxInFlight }}
+            - --otlp-max-in-flight={{ . | int }}
+            {{- end }}
+            {{- end }}
+            {{- with .Values.otlp.expire }}
+            - --otlp-expire={{ . }}
             {{- end }}
             {{- if $otlpCA }}
             - --otlp-client-ca-file=/etc/triage-otlp/ca.crt

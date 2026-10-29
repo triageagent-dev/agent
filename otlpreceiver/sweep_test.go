@@ -59,9 +59,9 @@ func TestSweep_DropsSeriesSilentForExpire(t *testing.T) {
 	if r.Held() != 2 {
 		t.Fatalf("held: %d, want 2", r.Held())
 	}
-	*now = now.Add(5 * time.Minute)
+	*now = now.Add(time.Minute)
 	export(t, r, authed(), res, counter("use.cpu.usage.usec", 20, 3, strAttr("k8s.pod.name", "a")))
-	*now = now.Add(6 * time.Minute) // b silent for 11 minutes, a for 6
+	*now = now.Add(r.opts.Expire - 30*time.Second) // b silent past Expire, a not yet
 	r.flush()
 	if r.Held() != 1 || r.expired != 1 {
 		t.Fatalf("after the sweep: %d held, %d expired; want 1 and 1", r.Held(), r.expired)
@@ -73,9 +73,9 @@ func TestSweep_DropsSpanRoutesSilentForExpire(t *testing.T) {
 	r, _, now := newTest(t)
 	res := resource("service.name", "api", "k8s.namespace.name", "shop")
 	exportSpans(t, r, res, span("GET /old", tracepb.Span_SPAN_KIND_SERVER, tracepb.Status_STATUS_CODE_OK, 5_000_000))
-	*now = now.Add(5 * time.Minute)
+	*now = now.Add(time.Minute)
 	exportSpans(t, r, res, span("GET /live", tracepb.Span_SPAN_KIND_SERVER, tracepb.Status_STATUS_CODE_OK, 5_000_000))
-	*now = now.Add(6 * time.Minute)
+	*now = now.Add(r.opts.Expire - 30*time.Second)
 	r.flush()
 	var sr *spanRoutes
 	for _, s := range r.spans {

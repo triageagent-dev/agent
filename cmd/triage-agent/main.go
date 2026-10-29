@@ -119,7 +119,8 @@ func main() {
 	var sensorStale time.Duration
 	var meshListen, meshService string
 	var otlpListen, otlpAllowed, otlpForwarders, otlpClientCA, otlpClientCASecret, sensorExtraNames string
-	var otlpMaxResources, otlpMaxPoints, otlpMaxPerSender, otlpMaxRequest, otlpMaxSeries int
+	var otlpMaxResources, otlpMaxPoints, otlpMaxPerSender, otlpMaxRequest, otlpMaxSeries, otlpMaxInFlight int
+	var otlpExpire time.Duration
 	var otlpTLSCert, otlpTLSKey, otlpTenantsFlag, sensorClientCert, sensorClientKey string
 	var otlpInsecure, sensorOTLPRole bool
 	var sensorController, sensorCAFile, sensorTokenFile string
@@ -223,7 +224,9 @@ func main() {
 	flag.IntVar(&otlpMaxPoints, "otlp-max-points-per-resource", 5000, "controller: most series the receiver holds for one OTLP resource.")
 	flag.IntVar(&otlpMaxPerSender, "otlp-max-resources-per-sender", 500, "controller: most OTLP resources one authenticated sender may create.")
 	flag.IntVar(&otlpMaxRequest, "otlp-max-request-bytes", 4<<20, "controller: largest OTLP Export request, in bytes (the gRPC receive limit).")
-	flag.IntVar(&otlpMaxSeries, "otlp-max-series", 250_000, "controller: most series the receiver holds over every OTLP resource; new ones past it are refused. This is what its memory is sized by.")
+	flag.IntVar(&otlpMaxSeries, "otlp-max-series", 2_000_000, "controller: most series the OTLP receiver keeps state for (the last time of a cumulative series, a delta series' total, a span route); new ones past it are refused. Each entry is tens of bytes.")
+	flag.IntVar(&otlpMaxInFlight, "otlp-max-in-flight", 0, "controller: most OTLP exports read or translated at once; a sender past it is refused before its request is read, with RESOURCE_EXHAUSTED and a retry delay, as it is while the live heap is near the Go memory limit. 0 takes twice GOMAXPROCS, at least 4.")
+	flag.DurationVar(&otlpExpire, "otlp-expire", 3*time.Minute, "controller: how long the OTLP receiver keeps a series' state (its last time, a delta total, a span route) without an export refreshing it: three export intervals of a minute.")
 	flag.StringVar(&otlpClientCASecret, "otlp-client-ca-secret", "", "controller: Secret in the pod namespace for the agent's own client CA for the OTLP receiver. The controller creates the CA on first use and trusts it for mutual TLS; issue a sender's certificate with `triage-agent otlp-cert`.")
 	flag.StringVar(&otlpClientCA, "otlp-client-ca-file", "", "controller: PEM CA for mutual TLS on the OTLP receiver; a sender whose client certificate chains to it needs no token.")
 	// The otlp sensor role (docs/adr/0022-otlp-sensor-role.md): --mode=otlp
@@ -351,7 +354,7 @@ func main() {
 				allowed: mustParseOTLPAllowed(otlpAllowed), forwarders: mustParseOTLPAllowed(otlpForwarders),
 				tenants:      splitNonEmpty(otlpTenantsFlag),
 				maxResources: otlpMaxResources, maxPoints: otlpMaxPoints, maxPerSender: otlpMaxPerSender, maxRequest: otlpMaxRequest,
-				maxSeries: otlpMaxSeries,
+				maxSeries: otlpMaxSeries, maxInFlight: otlpMaxInFlight, expire: otlpExpire,
 			},
 			clientCert: sensorClientCert, clientKey: sensorClientKey,
 			controller: sensorController,
@@ -741,6 +744,7 @@ func main() {
 		otlpListen: otlpListen, otlpAllowed: mustParseOTLPAllowed(otlpAllowed), otlpForwarders: mustParseOTLPAllowed(otlpForwarders), otlpClientCA: otlpClientCA, otlpClientCASecret: otlpClientCASecret,
 		otlpMaxResources: otlpMaxResources, otlpMaxPoints: otlpMaxPoints,
 		otlpMaxPerSender: otlpMaxPerSender, otlpMaxRequest: otlpMaxRequest, otlpMaxSeries: otlpMaxSeries,
+		otlpMaxInFlight: otlpMaxInFlight, otlpExpire: otlpExpire,
 		otlpTenants:    joinedTenants(joinTenants, targetTenant),
 		otlpSensorRole: sensorOTLPRole,
 		// The scope the core sets per workspace; a nil pusher allows all.
