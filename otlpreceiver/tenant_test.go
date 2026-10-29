@@ -121,8 +121,8 @@ func TestTenant_SameNamespaceOfTwoTenantsStaysApart(t *testing.T) {
 		export(t, r, asToken(tok), resource("service.name", "cart", "k8s.namespace.name", "default"), counter("log.errors", 1, 1))
 	}
 	r.flush()
-	if len(r.res) != 2 {
-		t.Fatalf("resources = %d, want one per tenant", len(r.res))
+	if len(r.sources) != 2 {
+		t.Fatalf("sources = %d, want one per tenant", len(r.sources))
 	}
 	ns := sunkNamespaces(*got)
 	if !ns["acme~default"] || !ns["globex~default"] {
@@ -132,42 +132,42 @@ func TestTenant_SameNamespaceOfTwoTenantsStaysApart(t *testing.T) {
 
 func TestTenant_PointNamespacesAndMissingNamespace(t *testing.T) {
 	r, got := newTenantTest(t, "acme")
-	// A point names its own namespace; a resource names none.
+	// A point names its own namespace, so its resource is placed by it.
 	export(t, r, asToken("acme"), resource("service.name", "gw"), counter("log.errors", 1, 1, strAttr("k8s.namespace.name", "shop")))
-	export(t, r, asToken("acme"), resource("service.name", "node"), counter("log.warns", 1, 1))
+	// A resource that names none, with points that name none, is refused:
+	// qualified or not, the core could not place it.
+	resp := export(t, r, asToken("acme"), resource("service.name", "node"), counter("log.warns", 1, 1))
+	if ps := resp.GetPartialSuccess(); ps.GetRejectedDataPoints() != 1 || !strings.Contains(ps.GetErrorMessage(), "no k8s.namespace.name") {
+		t.Fatalf("partial success = %+v, want the namespace-less resource refused", ps)
+	}
 	r.flush()
 	ns := sunkNamespaces(*got)
-	if !ns["acme~shop"] || !ns["acme~"] {
-		t.Fatalf("namespaces = %v, want acme~shop and acme~", ns)
-	}
-	for k := range ns {
-		if !strings.HasPrefix(k, "acme~") {
-			t.Fatalf("unqualified namespace %q leaked", k)
-		}
+	if !ns["acme~shop"] || len(ns) != 1 {
+		t.Fatalf("namespaces = %v, want acme~shop alone", ns)
 	}
 }
 
 func TestTenant_CadvisorNamespaceLabelQualified(t *testing.T) {
-	r, _ := newTenantTest(t, "acme")
+	r, got := newTenantTest(t, "acme")
 	export(t, r, asToken("acme"), resource("service.name", "kubelet"),
 		counter("container_cpu_usage_seconds_total", 1, 1, strAttr("namespace", "shop"), strAttr("pod", "p1")),
 		counter("app_orders_total", 1, 1, strAttr("namespace", "emea")))
 	checked := 0
-	for _, st := range r.res {
-		for name, s := range st.metrics {
-			for _, pt := range s.points {
-				dp := pt.p.(*metricspb.NumberDataPoint)
-				got := attr(dp.GetAttributes(), "namespace")
+	for _, s := range *got {
+		for name, m := range s.set {
+			for _, p := range m.Points {
 				checked++
 				switch name {
-				case "container_cpu_usage_seconds_total":
-					if got != "acme~shop" {
+				case "use.cpu.usage.usec": // the cAdvisor series, translated
+					if got := p.Attr("k8s.namespace.name"); got != "acme~shop" {
 						t.Fatalf("cAdvisor namespace label = %q, want acme~shop", got)
 					}
 				case "app_orders_total":
-					if got != "emea" {
+					if got := p.Attr("namespace"); got != "emea" {
 						t.Fatalf("application dimension namespace = %q, was rewritten", got)
 					}
+				default:
+					t.Fatalf("unexpected metric %s reached the sink", name)
 				}
 			}
 		}
@@ -217,9 +217,13 @@ func TestTenant_ResourceChoosesAmongCertificateTenants(t *testing.T) {
 	if !ns["acme~default"] || !ns["globex~default"] {
 		t.Fatalf("namespaces = %v", ns)
 	}
-	for _, st := range r.res {
-		if attr(st.resource.GetAttributes(), remotens.TenantAttr) != "" {
-			t.Fatal("the tenant attribute was kept on the stored resource")
+	for _, s := range *got {
+		for _, m := range s.set {
+			for _, p := range m.Points {
+				if p.Attr(remotens.TenantAttr) != "" {
+					t.Fatal("the tenant attribute was kept on the forwarded resource")
+				}
+			}
 		}
 	}
 }

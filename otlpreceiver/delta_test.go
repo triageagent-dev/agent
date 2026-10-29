@@ -84,7 +84,7 @@ func TestDelta_ChangedBucketBoundsAreRefused(t *testing.T) {
 
 func TestDelta_SeriesLimitApplies(t *testing.T) {
 	r, _, _ := newTest(t)
-	r.opts.MaxPointsPerResource = 1
+	r.opts.MaxSeries = 1
 	res := resource("service.name", "cart", "k8s.namespace.name", "shop")
 	export(t, r, authed(), res, deltaCounter("log.errors", 100, 1, strAttr("k", "a")))
 	resp := export(t, r, authed(), res, deltaCounter("log.errors", 100, 1, strAttr("k", "b")))
@@ -99,10 +99,13 @@ func TestDelta_SeriesAreKeptApart(t *testing.T) {
 	export(t, r, authed(), res, deltaCounter("log.errors", 100, 1, strAttr("k", "a")), deltaCounter("log.errors", 100, 5, strAttr("k", "b")))
 	export(t, r, authed(), res, deltaCounter("log.errors", 200, 2, strAttr("k", "a")))
 	r.flush()
-	m := (*got)[len(*got)-1].set.Get("log.errors")
+	// Each export is forwarded as it arrives; the series' latest total is
+	// the last one forwarded for it.
 	totals := map[string]float64{}
-	for _, p := range m.Points {
-		totals[p.Attr("k")] = p.Value
+	for _, s := range *got {
+		for _, p := range s.set.Get("log.errors").Points {
+			totals[p.Attr("k")] = p.Value
+		}
 	}
 	if totals["a"] != 3 || totals["b"] != 5 {
 		t.Fatalf("totals = %v, want a:3 b:5", totals)

@@ -156,23 +156,30 @@ func TestExport_AccumulatesAndRoutesByRole(t *testing.T) {
 	}
 }
 
-func TestExport_KeepsNewestPointPerSeries(t *testing.T) {
+// A point older than the last one forwarded for its series is dropped, so
+// a retried export cannot put an older value in a newer one's place
+// downstream; the series costs the receiver its last timestamp, nothing
+// else.
+func TestExport_DropsAPointOlderThanTheLastForwarded(t *testing.T) {
 	r, got, _ := newTest(t)
-	res := resource("service.name", "cart")
+	res := resource("service.name", "cart", "k8s.namespace.name", "shop")
 	export(t, r, authed(), res, counter("log.errors", 20, 7))
 	export(t, r, authed(), res, counter("log.errors", 10, 3)) // out of order
 	r.flush()
 	if len(*got) != 1 || (*got)[0].role != metricset.RoleLogExporter {
-		t.Fatalf("flushed %+v", *got)
+		t.Fatalf("forwarded %+v, want the newer point alone", *got)
 	}
 	if v := (*got)[0].set.Get("log.errors").Points[0].Value; v != 7 {
 		t.Fatalf("log.errors = %v, want the newer 7", v)
+	}
+	if r.Held() != 1 {
+		t.Fatalf("held = %d, want the series' one timestamp", r.Held())
 	}
 }
 
 func TestExport_RejectsExponentialHistograms(t *testing.T) {
 	r, got, _ := newTest(t)
-	res := resource("service.name", "cart")
+	res := resource("service.name", "cart", "k8s.namespace.name", "shop")
 	exp := &metricspb.Metric{Name: "x", Data: &metricspb.Metric_ExponentialHistogram{ExponentialHistogram: &metricspb.ExponentialHistogram{
 		DataPoints: []*metricspb.ExponentialHistogramDataPoint{{}},
 	}}}
@@ -191,7 +198,7 @@ func TestExport_RejectsExponentialHistograms(t *testing.T) {
 // numeric gRPC status as its code name.
 func TestExport_NormalizesOlderConventions(t *testing.T) {
 	r, got, _ := newTest(t)
-	res := resource("service.name", "payment")
+	res := resource("service.name", "payment", "k8s.namespace.name", "shop")
 	export(t, r, authed(), res,
 		histogram("http.server.duration", "ms", cum, 10, 3, []float64{100, 250}, intAttr("http.status_code", 503), strAttr("http.method", "GET")),
 		histogram("rpc.server.duration", "ms", cum, 10, 2, []float64{50}, intAttr("rpc.grpc.status_code", 14)))
@@ -217,25 +224,26 @@ func TestExport_NormalizesOlderConventions(t *testing.T) {
 
 func TestExport_Limits(t *testing.T) {
 	r, _, _ := newTest(t)
-	r.opts.MaxResources, r.opts.MaxPointsPerResource = 1, 1
-	export(t, r, authed(), resource("service.name", "a"), counter("log.errors", 1, 1, strAttr("k", "1")))
-	resp := export(t, r, authed(), resource("service.name", "a"), counter("log.errors", 1, 1, strAttr("k", "2")))
+	r.opts.MaxResources, r.opts.MaxSeries = 1, 1
+	a := resource("service.name", "a", "k8s.namespace.name", "shop")
+	export(t, r, authed(), a, counter("log.errors", 1, 1, strAttr("k", "1")))
+	resp := export(t, r, authed(), a, counter("log.errors", 1, 1, strAttr("k", "2")))
 	if resp.GetPartialSuccess().GetRejectedDataPoints() != 1 {
 		t.Fatalf("series limit not applied: %+v", resp.GetPartialSuccess())
 	}
-	resp = export(t, r, authed(), resource("service.name", "b"), counter("log.errors", 1, 1))
+	resp = export(t, r, authed(), resource("service.name", "b", "k8s.namespace.name", "shop"), counter("log.errors", 1, 1))
 	if resp.GetPartialSuccess().GetRejectedDataPoints() != 1 {
 		t.Fatalf("resource limit not applied: %+v", resp.GetPartialSuccess())
 	}
 }
 
-func TestFlush_ExpiresSilentResources(t *testing.T) {
+func TestSweep_ForgetsSilentSources(t *testing.T) {
 	r, _, now := newTest(t)
-	export(t, r, authed(), resource("service.name", "a"), counter("log.errors", 1, 1))
+	export(t, r, authed(), resource("service.name", "a", "k8s.namespace.name", "shop"), counter("log.errors", 1, 1))
 	*now = now.Add(r.opts.Expire + time.Second)
 	r.flush()
-	if len(r.res) != 0 {
-		t.Fatalf("a silent resource was kept: %d", len(r.res))
+	if len(r.sources) != 0 || r.Held() != 0 {
+		t.Fatalf("a silent source was kept: %d sources, %d held", len(r.sources), r.Held())
 	}
 }
 
@@ -272,4 +280,14 @@ func TestRoleOf(t *testing.T) {
 			t.Errorf("RoleOf(%q) = %q, want %q", name, got, want)
 		}
 	}
+}
+
+// flush is what the receiver's tick once did: hand what it held to the
+// sink. It forwards on arrival now, so this only sweeps the state kept
+// across exports, at the test's clock. Kept so the tests read as before.
+func (r *Receiver) flush() {
+	r.mu.Lock()
+	r.lastSweep = time.Time{}
+	r.sweep(r.opts.now())
+	r.mu.Unlock()
 }

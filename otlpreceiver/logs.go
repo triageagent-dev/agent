@@ -9,12 +9,14 @@ import (
 	"time"
 
 	collectorlogs "go.opentelemetry.io/proto/otlp/collector/logs/v1"
+	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
 	logspb "go.opentelemetry.io/proto/otlp/logs/v1"
 	metricspb "go.opentelemetry.io/proto/otlp/metrics/v1"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
 	"github.com/triageagent-dev/agent/internal/ledger"
+	"github.com/triageagent-dev/agent/metricset"
 )
 
 // A Collector needs the count connector to turn log records into the
@@ -25,10 +27,12 @@ import (
 // above, WARN up to ERROR, and every record. Counts only; the error sample
 // needs the exemplar the log exporter adds.
 
-// logCounts is a resource's cumulative record counts.
+// logCounts is a resource's cumulative record counts: four numbers, the
+// only state a log source costs.
 type logCounts struct {
 	start                uint64
 	errors, warns, lines uint64
+	seen                 time.Time
 }
 
 // logService serves the OTLP logs service on the receiver.
@@ -87,24 +91,19 @@ func severityClass(rec *logspb.LogRecord) int {
 }
 
 // acceptLogs adds the records of rls, sent by p, to the counters of the
-// resources that sent them and returns how many records it refused and why.
+// resources that sent them, forwards the counters that changed and returns
+// how many records it refused and why.
 func (r *Receiver) acceptLogs(p Principal, rls []*logspb.ResourceLogs) (int64, []string) {
 	sender := p.String()
 	now := r.opts.now()
 	replica := r.replicaName()
-
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.exports++
 	f := r.newRefusal(sender, "log records")
 	reject := f.reject
+	var outs []forward
+
+	r.mu.Lock()
+	r.exports++
 	var offered int64
-	defer func() {
-		r.rejected += f.rejected
-		ledger.Default.Add("otlp", ledger.All, ledger.Ticks, 1)
-		ledger.Default.Add("otlp", ledger.All, ledger.Points, offered)
-		ledger.Default.Add("otlp", ledger.All, ledger.Refused, f.rejected)
-	}()
 	for _, rl := range rls {
 		nr := int64(countRecords(rl))
 		r.points += nr
@@ -115,37 +114,54 @@ func (r *Receiver) acceptLogs(p Principal, rls []*logspb.ResourceLogs) (int64, [
 		if !ok {
 			continue
 		}
-		resource.Attributes = append(resource.Attributes, kv(replicaAttr, replica))
-		key := resourceKey(resource)
-		st := r.stateFor(key, resource, sender, n, reject)
-		if st == nil {
+		if attr(resource.GetAttributes(), nsAttr) == "" {
+			reject(n(), noNamespaceReason)
 			continue
 		}
-		st.seen = now
-		if st.logs == nil {
-			st.logs = &logCounts{start: uint64(now.UnixNano())}
+		resource.Attributes = append(resource.Attributes, kv(replicaAttr, replica))
+		key := resourceKey(resource)
+		if !r.touchSource(key, sender, now, n, reject) {
+			continue
 		}
-		before := *st.logs
+		c := r.logs[key]
+		if c == nil {
+			if r.nheld >= r.opts.MaxSeries {
+				reject(n(), "series limit reached")
+				continue
+			}
+			c = &logCounts{start: uint64(now.UnixNano())}
+			r.logs[key] = c
+			r.nheld++
+		}
+		c.seen = now
+		before := *c
 		for _, sl := range rl.GetScopeLogs() {
 			for _, rec := range sl.GetLogRecords() {
-				st.logs.lines++
+				c.lines++
 				switch severityClass(rec) {
 				case 2:
-					st.logs.errors++
+					c.errors++
 				case 1:
-					st.logs.warns++
+					c.warns++
 				}
 			}
 		}
-		if *st.logs == before {
+		if c.lines == before.lines {
 			continue
 		}
-		for _, m := range logCounters(st.logs, now) {
-			if cnt, why := r.mergeMetric(st, m, now); why != "" {
-				reject(cnt, why)
-			}
-		}
+		outs = append(outs, forward{key: key, role: metricset.RoleLogExporter, rms: []*metricspb.ResourceMetrics{{
+			Resource:     resource,
+			ScopeMetrics: []*metricspb.ScopeMetrics{{Scope: &commonpb.InstrumentationScope{Name: "otlp"}, Metrics: logCounters(c, now)}},
+		}}})
 	}
+	r.rejected += f.rejected
+	ledger.Default.Add("otlp", ledger.All, ledger.Ticks, 1)
+	ledger.Default.Add("otlp", ledger.All, ledger.Points, offered)
+	ledger.Default.Add("otlp", ledger.All, ledger.Refused, f.rejected)
+	r.sweep(now)
+	r.mu.Unlock()
+
+	r.send(outs)
 	return f.rejected, f.sortedReasons()
 }
 

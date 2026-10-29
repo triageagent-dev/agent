@@ -50,14 +50,22 @@ var spanDimensions = []string{
 }
 
 // spanSeries is one derived series: the cumulative duration histogram of the
-// spans that share its attributes.
+// spans that share its attributes. The attributes are the one thing kept
+// beyond numbers, since the histogram is emitted under them; the routes of
+// a resource are bounded by MaxPointsPerResource and all of them by
+// MaxSeries.
 type spanSeries struct {
 	attrs  []*commonpb.KeyValue
 	start  uint64
 	counts []uint64
 	count  uint64
 	sum    float64
-	seen   time.Time // when a span last fell into it (Receiver.sweep)
+	seen   time.Time
+}
+
+// spanRoutes are the series derived from one resource's spans.
+type spanRoutes struct {
+	routes map[string]*spanSeries
 }
 
 // traceService serves the OTLP traces service on the receiver. It is a type
@@ -106,25 +114,19 @@ func (r *Receiver) replicaName() string {
 }
 
 // acceptTraces folds the spans of rss, sent by p, into the duration
-// histograms of the resources that sent them and returns how many spans it
-// refused and why.
+// histograms of the resources that sent them, forwards the histograms the
+// spans touched and returns how many spans it refused and why.
 func (r *Receiver) acceptTraces(p Principal, rss []*tracepb.ResourceSpans) (int64, []string) {
 	sender := p.String()
 	now := r.opts.now()
 	replica := r.replicaName()
-
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.exports++
 	f := r.newRefusal(sender, "spans")
 	reject := f.reject
+	var outs []forward
+
+	r.mu.Lock()
+	r.exports++
 	var offered int64
-	defer func() {
-		r.rejected += f.rejected
-		ledger.Default.Add("otlp", ledger.All, ledger.Ticks, 1)
-		ledger.Default.Add("otlp", ledger.All, ledger.Points, offered)
-		ledger.Default.Add("otlp", ledger.All, ledger.Refused, f.rejected)
-	}()
 	for _, rs := range rss {
 		ns := int64(countSpans(rs))
 		r.points += ns
@@ -135,20 +137,24 @@ func (r *Receiver) acceptTraces(p Principal, rss []*tracepb.ResourceSpans) (int6
 		if !ok {
 			continue
 		}
-		resource.Attributes = append(resource.Attributes, kv(replicaAttr, replica))
-		key := resourceKey(resource)
-		st := r.stateFor(key, resource, sender, n, reject)
-		if st == nil {
+		if attr(resource.GetAttributes(), nsAttr) == "" {
+			reject(n(), noNamespaceReason)
 			continue
 		}
-		st.seen = now
-		if st.spans == nil {
-			st.spans = map[string]*spanSeries{}
+		resource.Attributes = append(resource.Attributes, kv(replicaAttr, replica))
+		key := resourceKey(resource)
+		if !r.touchSource(key, sender, now, n, reject) {
+			continue
+		}
+		sr := r.spans[key]
+		if sr == nil {
+			sr = &spanRoutes{routes: map[string]*spanSeries{}}
+			r.spans[key] = sr
 		}
 		touched := map[string]bool{}
 		for _, ss := range rs.GetScopeSpans() {
 			for _, sp := range ss.GetSpans() {
-				if k, refused := r.foldSpan(st, sp, now); refused {
+				if k, refused := r.foldSpan(sr, sp, now); refused {
 					reject(1, "series limit reached for a resource")
 				} else if k != "" {
 					touched[k] = true
@@ -159,21 +165,38 @@ func (r *Receiver) acceptTraces(p Principal, rss []*tracepb.ResourceSpans) (int6
 			continue
 		}
 		// What the connector would have exported: every touched series, cumulative.
-		m := spanMetricsOf(st, touched, now)
-		out, _ := translateSpanMetrics(m)
+		out, _ := translateSpanMetrics(spanMetricsOf(sr, touched, now))
+		var ms []*metricspb.Metric
 		for _, mo := range out {
-			if cnt, why := r.mergeMetric(st, mo, now); why != "" {
+			if m, cnt, why := r.prepare(key, mo, now); why != "" {
 				reject(cnt, why)
+			} else if m != nil {
+				ms = append(ms, m)
 			}
 		}
+		if len(ms) > 0 {
+			outs = append(outs, forward{key: key, role: metricset.RoleEBPF, rms: []*metricspb.ResourceMetrics{{
+				Resource:     resource,
+				ScopeMetrics: []*metricspb.ScopeMetrics{{Scope: &commonpb.InstrumentationScope{Name: "otlp"}, Metrics: ms}},
+			}}})
+		}
 	}
+	r.rejected += f.rejected
+	ledger.Default.Add("otlp", ledger.All, ledger.Ticks, 1)
+	ledger.Default.Add("otlp", ledger.All, ledger.Points, offered)
+	ledger.Default.Add("otlp", ledger.All, ledger.Refused, f.rejected)
+	r.sweep(now)
+	r.mu.Unlock()
+
+	r.send(outs)
 	return f.rejected, f.sortedReasons()
 }
 
-// foldSpan adds sp to its series in st and returns the series' key. The key
+// foldSpan adds sp to its series in sr and returns the series' key. The key
 // is empty for a span no histogram stands for (an internal span); refused is
-// set when a new series would pass the resource's series limit.
-func (r *Receiver) foldSpan(st *resourceState, sp *tracepb.Span, now time.Time) (key string, refused bool) {
+// set when a new series would pass the resource's or the total limit. The
+// caller holds r.mu.
+func (r *Receiver) foldSpan(sr *spanRoutes, sp *tracepb.Span, now time.Time) (key string, refused bool) {
 	switch sp.GetKind() {
 	case tracepb.Span_SPAN_KIND_SERVER, tracepb.Span_SPAN_KIND_CONSUMER,
 		tracepb.Span_SPAN_KIND_CLIENT, tracepb.Span_SPAN_KIND_PRODUCER:
@@ -189,19 +212,20 @@ func (r *Receiver) foldSpan(st *resourceState, sp *tracepb.Span, now time.Time) 
 	for _, want := range spanDimensions {
 		for _, a := range sp.GetAttributes() {
 			if a.GetKey() == want {
-				attrs = append(attrs, a)
+				attrs = append(attrs, kv(a.GetKey(), anyString(a.GetValue())))
 				break
 			}
 		}
 	}
 	k := pointKey(attrs)
-	s := st.spans[k]
+	s := sr.routes[k]
 	if s == nil {
-		if len(st.spans) >= r.opts.MaxPointsPerResource {
+		if len(sr.routes) >= r.opts.MaxPointsPerResource || r.nheld >= r.opts.MaxSeries {
 			return "", true
 		}
 		s = &spanSeries{attrs: attrs, start: sp.GetStartTimeUnixNano(), counts: make([]uint64, len(spanDurationBounds)+1)}
-		st.spans[k] = s
+		sr.routes[k] = s
+		r.nheld++
 	}
 	s.seen = now
 	d := float64(0)
@@ -216,9 +240,9 @@ func (r *Receiver) foldSpan(st *resourceState, sp *tracepb.Span, now time.Time) 
 }
 
 // spanMetricsOf is the spanmetrics connector's traces.span.metrics.duration
-// for the touched series of st: one cumulative histogram point per series, in
+// for the touched series of sr: one cumulative histogram point per series, in
 // seconds.
-func spanMetricsOf(st *resourceState, touched map[string]bool, now time.Time) *metricspb.Metric {
+func spanMetricsOf(sr *spanRoutes, touched map[string]bool, now time.Time) *metricspb.Metric {
 	keys := make([]string, 0, len(touched))
 	for k := range touched {
 		keys = append(keys, k)
@@ -226,7 +250,7 @@ func spanMetricsOf(st *resourceState, touched map[string]bool, now time.Time) *m
 	sort.Strings(keys)
 	h := &metricspb.Histogram{AggregationTemporality: metricspb.AggregationTemporality_AGGREGATION_TEMPORALITY_CUMULATIVE}
 	for _, k := range keys {
-		s := st.spans[k]
+		s := sr.routes[k]
 		sum := s.sum
 		h.DataPoints = append(h.DataPoints, &metricspb.HistogramDataPoint{
 			Attributes:        s.attrs,

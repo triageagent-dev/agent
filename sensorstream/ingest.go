@@ -48,9 +48,9 @@ func (h *Hub) Ingest(node, role string, rms []*metricspb.ResourceMetrics) {
 		e = &nodeEntry{snapshots: map[string]snapshot{}}
 		h.nodes[node] = e
 	}
-	if cur, ok := e.snapshots[role]; !ok || (stamp{at: now, seq: seq}).newerThan(stamp{at: cur.at, seq: cur.seq}) {
-		e.snapshots[role] = snapshot{set: set, at: now, seq: seq, raw: raw}
-	}
+	merged := mergeOTLP(e.snapshots[role], set, now, otlpPointRetainFactor*h.opts.Stale)
+	merged.at, merged.seq, merged.raw = now, seq, raw
+	e.snapshots[role] = merged
 	e.lastSeen, e.ingestedAt = now, now
 	if now.Sub(h.lastPrune) >= time.Minute { // ingest is hot; prune at most once a minute here
 		h.pruneLocked(now)
@@ -74,7 +74,7 @@ type OTLPSource struct {
 	// resource describes ("deployment/ad"); empty for a service's own metrics.
 	Workload string
 	LastSeen time.Time
-	Families                          []OTLPFamily
+	Families []OTLPFamily
 }
 
 // otlpWorkloadName names the workload a Collector's k8s_cluster receiver

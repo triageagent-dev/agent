@@ -121,8 +121,7 @@ func TestInsecure_ServesAllThreeSignalsOverPlainGRPC(t *testing.T) {
 				roles[role][n] = m
 			}
 		},
-		Flush: 20 * time.Millisecond,
-		Log:   logr.Discard(),
+		Log: logr.Discard(),
 	})
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

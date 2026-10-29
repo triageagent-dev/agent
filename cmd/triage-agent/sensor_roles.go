@@ -54,7 +54,7 @@ func runSensorRoles(roles []string, o sensorRoleOptions) int {
 			setupLog.Error(nil, "--mode=otlp runs alone: the otlp account may not run other roles")
 			return 1
 		}
-		buf := sensorstream.NewSourceBuffer(otlpSourceRetain)
+		buf := sensorstream.NewSourceBuffer(otlpQueuePoints)
 		recv, err := newOTLPSensorReceiver(o.otlp, buf.Put)
 		if err != nil {
 			setupLog.Error(err, "unable to start the otlp role")

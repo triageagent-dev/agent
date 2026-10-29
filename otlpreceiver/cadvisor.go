@@ -6,10 +6,10 @@ package otlpreceiver
 import (
 	"sort"
 	"strings"
+	"time"
 
 	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
 	metricspb "go.opentelemetry.io/proto/otlp/metrics/v1"
-	"google.golang.org/protobuf/proto"
 
 	"github.com/triageagent-dev/agent/usemetrics"
 )
@@ -34,9 +34,75 @@ func isCAdvisor(name string) bool {
 	return false
 }
 
+// cadvisorRead are the cAdvisor series translateCAdvisor reads, by base
+// name: the only ones admitted. A scrape carries fifty more per cgroup.
+var cadvisorRead = map[string]bool{
+	"machine_cpu_cores":                         true,
+	"machine_memory_bytes":                      true,
+	"container_cpu_usage_seconds":               true,
+	"container_cpu_cfs_periods":                 true,
+	"container_cpu_cfs_throttled_periods":       true,
+	"container_oom_events":                      true,
+	"container_spec_cpu_quota":                  true,
+	"container_spec_cpu_period":                 true,
+	"container_memory_working_set_bytes":        true,
+	"container_memory_usage_bytes":              true,
+	"container_spec_memory_limit_bytes":         true,
+	"container_pressure_cpu_waiting_seconds":    true,
+	"container_pressure_memory_waiting_seconds": true,
+	"container_pressure_io_waiting_seconds":     true,
+}
+
+// readsCAdvisor reports whether name is one of the cAdvisor series read.
+func readsCAdvisor(name string) bool { return cadvisorRead[cadvisorName(name)] }
+
 // cadvisorName strips the "_total" a counter may or may not keep, depending
 // on the prometheus receiver's normalization.
 func cadvisorName(name string) string { return strings.TrimSuffix(name, "_total") }
+
+// hasCAdvisor reports whether rm carries a cAdvisor series.
+func hasCAdvisor(rm *metricspb.ResourceMetrics) bool {
+	for _, sm := range rm.GetScopeMetrics() {
+		for _, m := range sm.GetMetrics() {
+			if isCAdvisor(m.GetName()) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// podCgroup reports whether a container_* point is a pod's own cgroup: the
+// only kind translateCAdvisor reads.
+func podCgroup(attrs []*commonpb.KeyValue) bool {
+	return attr(attrs, "pod") != "" && attr(attrs, cadvisorNsAttr) != "" && attr(attrs, "container") == "" && attr(attrs, "image") == ""
+}
+
+// dropCAdvisorNoise removes from rm every container_* point that is not a
+// pod's own cgroup (a container's, the node's, a system slice's) and
+// returns how many that was: nothing reads them, and a node has several
+// such points for every pod one.
+func dropCAdvisorNoise(rm *metricspb.ResourceMetrics) int {
+	dropped := 0
+	for _, sm := range rm.GetScopeMetrics() {
+		for _, m := range sm.GetMetrics() {
+			if !strings.HasPrefix(m.GetName(), "container_") {
+				continue
+			}
+			bad := func(attrs []*commonpb.KeyValue, _ bool) bool { return !podCgroup(attrs) }
+			report := func(n int) { dropped += n }
+			switch d := m.GetData().(type) {
+			case *metricspb.Metric_Sum:
+				d.Sum.DataPoints = filterPoints(d.Sum.GetDataPoints(), true, bad, report,
+					func(dp *metricspb.NumberDataPoint) []*commonpb.KeyValue { return dp.GetAttributes() })
+			case *metricspb.Metric_Gauge:
+				d.Gauge.DataPoints = filterPoints(d.Gauge.GetDataPoints(), true, bad, report,
+					func(dp *metricspb.NumberDataPoint) []*commonpb.KeyValue { return dp.GetAttributes() })
+			}
+		}
+	}
+	return dropped
+}
 
 type podRef struct{ namespace, pod string }
 
@@ -47,32 +113,31 @@ type cadvisorPod struct {
 
 // psiPrev is one PSI counter's previous reading, for the rate.
 type psiPrev struct {
-	v  float64
-	ts uint64
+	v    float64
+	ts   uint64
+	seen time.Time
 }
 
-// translateCAdvisor builds the use.* metrics for every pod in st's cAdvisor
-// series. PSI is the rate of the "waiting" (some) counter between this and
-// the previous reading, as a percentage, the same meaning as cgroup
-// pressure's "some avg" the DaemonSet reads; the first reading of a pod
-// yields none.
-func translateCAdvisor(st *resourceState) []*metricspb.Metric {
+// translateCAdvisor builds the use.* metrics for every pod in the cAdvisor
+// series of one export. PSI is the rate of the "waiting" (some) counter
+// between this and the previous reading, as a percentage, the same meaning
+// as cgroup pressure's "some avg" the DaemonSet reads; the first reading of
+// a pod yields none. The previous readings are the only state kept. The
+// caller holds r.mu.
+func (r *Receiver) translateCAdvisor(ms []*metricspb.Metric, now time.Time) []*metricspb.Metric {
 	pods := map[podRef]*cadvisorPod{}
 	var nodeCores, nodeMem float64
-	for name, s := range st.metrics {
-		if !isCAdvisor(name) {
-			continue
+	for _, m := range ms {
+		base := cadvisorName(m.GetName())
+		var pts []*metricspb.NumberDataPoint
+		switch d := m.GetData().(type) {
+		case *metricspb.Metric_Sum:
+			pts = d.Sum.GetDataPoints()
+		case *metricspb.Metric_Gauge:
+			pts = d.Gauge.GetDataPoints()
 		}
-		base := cadvisorName(name)
-		for _, h := range s.points {
-			dp, ok := h.p.(*metricspb.NumberDataPoint)
-			if !ok {
-				continue
-			}
-			v := dp.GetAsDouble()
-			if iv, ok := dp.GetValue().(*metricspb.NumberDataPoint_AsInt); ok {
-				v = float64(iv.AsInt)
-			}
+		for _, dp := range pts {
+			v := numberValue(dp)
 			attrs := dp.GetAttributes()
 			switch base {
 			case "machine_cpu_cores":
@@ -82,11 +147,10 @@ func translateCAdvisor(st *resourceState) []*metricspb.Metric {
 				nodeMem = v
 				continue
 			}
-			pod, ns := attr(attrs, "pod"), attr(attrs, "namespace")
-			if pod == "" || ns == "" || attr(attrs, "container") != "" || attr(attrs, "image") != "" {
-				continue // not a pod's own cgroup
+			if !podCgroup(attrs) {
+				continue
 			}
-			ref := podRef{namespace: ns, pod: pod}
+			ref := podRef{namespace: attr(attrs, cadvisorNsAttr), pod: attr(attrs, "pod")}
 			cp := pods[ref]
 			if cp == nil {
 				cp = &cadvisorPod{values: map[string]float64{}}
@@ -100,9 +164,6 @@ func translateCAdvisor(st *resourceState) []*metricspb.Metric {
 	}
 	if len(pods) == 0 {
 		return nil
-	}
-	if st.psi == nil {
-		st.psi = map[string]psiPrev{}
 	}
 
 	out := map[string]*metricspb.Metric{}
@@ -127,7 +188,6 @@ func translateCAdvisor(st *resourceState) []*metricspb.Metric {
 		s.DataPoints = append(s.DataPoints, &metricspb.NumberDataPoint{Attributes: attrs, TimeUnixNano: ts, Value: &metricspb.NumberDataPoint_AsDouble{AsDouble: v}})
 	}
 
-	seen := map[string]bool{}
 	for ref, cp := range pods {
 		attrs := []*commonpb.KeyValue{kv(usemetrics.LabelNamespace, ref.namespace), kv(usemetrics.LabelPod, ref.pod)}
 		val := func(k string) (float64, bool) { v, ok := cp.values[k]; return v, ok }
@@ -181,9 +241,14 @@ func translateCAdvisor(st *resourceState) []*metricspb.Metric {
 				continue
 			}
 			key := ref.namespace + "/" + ref.pod + "/" + res
-			seen[key] = true
-			prev, had := st.psi[key]
-			st.psi[key] = psiPrev{v: v, ts: ts}
+			prev, had := r.psi[key]
+			if !had {
+				if r.nheld >= r.opts.MaxSeries {
+					continue
+				}
+				r.nheld++
+			}
+			r.psi[key] = psiPrev{v: v, ts: ts, seen: now}
 			if !had || ts <= prev.ts || v < prev.v {
 				continue
 			}
@@ -194,20 +259,15 @@ func translateCAdvisor(st *resourceState) []*metricspb.Metric {
 			gauge(metric, attrs, ts, pct)
 		}
 	}
-	for key := range st.psi {
-		if !seen[key] {
-			delete(st.psi, key)
-		}
-	}
 
 	names := make([]string, 0, len(out))
 	for n := range out {
 		names = append(names, n)
 	}
 	sort.Strings(names)
-	ms := make([]*metricspb.Metric, 0, len(names))
+	ms = make([]*metricspb.Metric, 0, len(names))
 	for _, n := range names {
-		ms = append(ms, proto.Clone(out[n]).(*metricspb.Metric))
+		ms = append(ms, out[n])
 	}
 	return ms
 }

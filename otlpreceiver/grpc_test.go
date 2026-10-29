@@ -72,8 +72,7 @@ func TestGRPC_MutualTLS(t *testing.T) {
 			Certificates: []tls.Certificate{srvTLS}, MinVersion: tls.VersionTLS13,
 			ClientCAs: clientCAs, ClientAuth: tls.VerifyClientCertIfGiven,
 		}),
-		Auth:  okAuth{},
-		Flush: 20 * time.Millisecond,
+		Auth: okAuth{},
 		Sink: func(_, role string, _ []*metricspb.ResourceMetrics) {
 			mu.Lock()
 			roles = append(roles, role)
@@ -103,7 +102,7 @@ func TestGRPC_MutualTLS(t *testing.T) {
 		return collectorpb.NewMetricsServiceClient(conn)
 	}
 	req := &collectorpb.ExportMetricsServiceRequest{ResourceMetrics: []*metricspb.ResourceMetrics{{
-		Resource:     resource("service.name", "checkout"),
+		Resource:     resource("service.name", "checkout", "k8s.namespace.name", "shop"),
 		ScopeMetrics: []*metricspb.ScopeMetrics{{Metrics: []*metricspb.Metric{counter("log.errors", 1, 1)}}},
 	}}}
 	cctx, ccancel := context.WithTimeout(context.Background(), 5*time.Second)

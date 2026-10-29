@@ -1,13 +1,18 @@
 // Copyright 2026 Denys Vasyliev.
 // SPDX-License-Identifier: Apache-2.0
 
-// Package otlpreceiver accepts OTLP metrics pushed over gRPC by OpenTelemetry
-// SDKs and Collectors, for clusters that run no eBPF DaemonSet
-// (docs/adr/0017-otlp-receiver.md). It keeps each resource's latest
-// cumulative points and hands them to the sensor stream hub under the role
-// whose collector reads them (RoleOf): RED, topology and L4 flows as the
-// ebpf role, use.* as node-exporter, log counters as log-exporter. The
-// collectors then read them exactly as they read the DaemonSet's.
+// Package otlpreceiver serves the OTLP/gRPC metrics, traces and logs
+// services and hands what arrives to the sensor stream
+// (docs/adr/0017-otlp-receiver.md, docs/adr/0022-otlp-sensor-role.md).
+//
+// The receiver is a sensor: it translates each export as it arrives,
+// forwards it and drops it. It holds no copy of what a sender sent. The
+// only state it keeps is the handful of numbers the translations need
+// across exports: the running total of a delta series, the counts of a
+// span route, the record counts of a log source and the previous PSI
+// reading of a pod — each expiring after Expire without an export. The
+// controller's hub merges the exports of a source per series, so a source
+// whose metrics arrive in several exports, or out of order, is whole there.
 package otlpreceiver
 
 import (
@@ -15,8 +20,6 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
-	"github.com/triageagent-dev/agent/internal/ledger"
-	"github.com/triageagent-dev/agent/internal/remotens"
 	"hash/fnv"
 	"net"
 	"slices"
@@ -42,6 +45,8 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 
+	"github.com/triageagent-dev/agent/internal/ledger"
+	"github.com/triageagent-dev/agent/internal/remotens"
 	"github.com/triageagent-dev/agent/metricset"
 )
 
@@ -51,11 +56,11 @@ const (
 	defaultMaxPointsPerResource  = 5000
 	defaultMaxResourcesPerSender = 500
 	defaultMaxRequestBytes       = 4 << 20
-	defaultMaxSeries             = 250_000
+	defaultMaxSeries             = 2_000_000
 )
 
-// Sink receives one resource's accumulated metrics of one role under a
-// stable key: sensorstream.Hub.Ingest.
+// Sink receives one export's metrics of one role for the source under a
+// stable key: sensorstream.Hub.Ingest, or the otlp role's send queue.
 type Sink func(key, role string, rms []*metricspb.ResourceMetrics)
 
 // Principal is the authenticated sender of an Export.
@@ -163,30 +168,27 @@ type Options struct {
 	// NamespaceInScope, when non-nil, says whether a plain namespace (the
 	// k8s.namespace.name a sender reported, before the "<tenant>~" prefix) is
 	// inside the workspace scope the core set for a tenant. A resource of a
-	// tenant-certificate sender outside it is refused before it is stored and
-	// counted like any refused point. Nil allows every namespace.
+	// tenant-certificate sender outside it is refused and counted like any
+	// refused point. Nil allows every namespace.
 	NamespaceInScope func(tenant, ns string) bool
 	// Wanted, when non-nil, says whether a metric name is read by any
-	// collector. A metric it rejects is dropped before its resource is stored
-	// or counted against a quota, so a sender that sends everything it has
-	// cannot crowd out what is read. Nil keeps every metric. ReadByCollectors
-	// is the production answer.
+	// collector. A metric it rejects is dropped at intake, before anything
+	// is allocated for it. Nil keeps every metric. ReadByCollectors is the
+	// production answer.
 	Wanted func(name string) bool
-	// Flush is how often changed resources are handed to Sink.
-	Flush time.Duration
-	// Expire drops a resource that sent nothing for this long, and a series
-	// of a live resource that no export updated for this long: a node's
-	// cAdvisor scrape is one resource that never goes silent while the pods
-	// under it come and go.
+	// Expire is how long the state kept across exports (a delta series'
+	// running total, a span route's counts, a log source's counts, a pod's
+	// PSI reading, a source's name) lives without an export refreshing it.
 	Expire time.Duration
-	// The limits bound memory; past one, points are refused and counted.
-	// MaxResources bounds the resources held (default 2000),
-	// MaxPointsPerResource the series of one resource (5000),
-	// MaxResourcesPerSender the resources one sender may hold (500) so that
-	// one allowed sender cannot fill every slot, MaxSeries the series held
-	// in all (250000: what the memory is sized by, since the resource and
-	// per-resource limits together allow 10 million), and MaxRequestBytes
-	// the size of one Export request (4 MiB, the gRPC receive limit).
+	// The limits are sanity bounds on the state kept across exports; past
+	// one, points are refused and counted. MaxResources bounds the sources
+	// known (default 2000) and MaxResourcesPerSender the sources one sender
+	// may bring (500) so that one sender cannot crowd out the rest;
+	// MaxPointsPerResource bounds the span routes of one resource (5000)
+	// and MaxSeries the state entries in all (2000000: a cumulative series
+	// costs its last timestamp, 40 bytes, a delta series its total, a span
+	// route its attributes); MaxRequestBytes is the size of one Export
+	// request (4 MiB, the gRPC receive limit).
 	MaxResources          int
 	MaxPointsPerResource  int
 	MaxResourcesPerSender int
@@ -201,9 +203,6 @@ type Options struct {
 }
 
 func (o *Options) setDefaults() {
-	if o.Flush <= 0 {
-		o.Flush = 5 * time.Second
-	}
 	if o.Expire <= 0 {
 		o.Expire = 10 * time.Minute
 	}
@@ -227,35 +226,39 @@ func (o *Options) setDefaults() {
 	}
 }
 
-// series is one metric's shape and its latest point per attribute set.
-type series struct {
-	shell  *metricspb.Metric // name, unit and data kind; no points
-	points map[string]held
-}
-
-// held is one stored point and when an export last set it, by the
-// receiver's clock: a sender's timestamps do not decide what is stale.
-type held struct {
-	p    proto.Message
-	seen time.Time
-}
-
-type resourceState struct {
-	resource *resourcepb.Resource
-	metrics  map[string]*series
-	npoints  int
-	// sender is the principal that created the resource, for its quota.
+// source is what the receiver remembers of a source it forwarded: who
+// brought it, for the sender quota, and when, for the announcement and the
+// expiry. Nothing of what it sent.
+type source struct {
 	sender string
 	seen   time.Time
-	dirty  bool
-	// announced is set once the source's first flush was logged.
-	announced bool
-	// psi holds the previous cAdvisor PSI readings (translateCAdvisor).
-	psi map[string]psiPrev
-	// spans holds the duration histograms derived from spans (traces.go).
-	spans map[string]*spanSeries
-	// logs holds the record counts derived from log records (logs.go).
-	logs *logCounts
+}
+
+// tick is what a cumulative series costs: the time of the last point
+// forwarded, so an older point arriving after it (a retried export) is
+// dropped instead of taking a newer value's place downstream, and when an
+// export last carried the series, for the expiry.
+type tick struct {
+	ts   uint64
+	seen int64 // unix seconds
+}
+
+// running is a delta series' running total, what makes its points
+// cumulative for the collectors: the last interval's end, so a re-sent
+// interval is not added twice, and the sum so far. A histogram keeps its
+// bucket totals too.
+type running struct {
+	ts     uint64
+	start  uint64
+	isInt  bool
+	i      int64
+	f      float64
+	bounds []float64
+	counts []uint64
+	count  uint64
+	sum    float64
+	hasSum bool
+	seen   time.Time
 }
 
 // Receiver implements the OTLP metrics gRPC service.
@@ -265,11 +268,27 @@ type Receiver struct {
 	opts Options
 	log  logr.Logger
 
-	mu  sync.Mutex
-	res map[string]*resourceState
-	// nseries is the series held over every resource (MaxSeries).
-	nseries int
-	// lastSweep is when series silent for Expire were last dropped.
+	mu sync.Mutex
+	// sources are the sources forwarded within Expire, by key.
+	sources map[string]*source
+	// bySender counts sources per sender, for MaxResourcesPerSender.
+	bySender map[string]int
+	// ticks holds the last time of every cumulative series forwarded, and
+	// deltas the running totals of delta series, both by the hash of
+	// source, metric and attributes.
+	ticks  map[uint64]tick
+	deltas map[uint64]*running
+	// spans holds the routes derived from spans, by resource key (traces.go).
+	spans map[string]*spanRoutes
+	// logs holds the record counts derived from log records, by resource
+	// key (logs.go).
+	logs map[string]*logCounts
+	// psi holds the previous cAdvisor PSI readings, by pod and resource
+	// (cadvisor.go).
+	psi map[string]psiPrev
+	// nheld is the entries in ticks, deltas, spans (their routes), logs and
+	// psi: what MaxSeries bounds.
+	nheld     int
 	lastSweep time.Time
 	// Counted since the last summary line.
 	exports, points, rejected, expired int64
@@ -283,20 +302,40 @@ type Receiver struct {
 	refusalLog map[string]*refusalWindow
 }
 
-// summaryEvery is how often the receiver logs what it took in.
+// summaryEvery is how often the receiver logs what it took in, and how often
+// the state kept across exports is swept for entries past Expire.
 const summaryEvery = time.Minute
 
 // New returns a Receiver; Start serves it.
 func New(opts Options) *Receiver {
 	opts.setDefaults()
-	return &Receiver{opts: opts, log: opts.Log.WithName("otlpreceiver"), res: map[string]*resourceState{},
+	return &Receiver{opts: opts, log: opts.Log.WithName("otlpreceiver"),
+		sources: map[string]*source{}, bySender: map[string]int{}, ticks: map[uint64]tick{}, deltas: map[uint64]*running{},
+		spans: map[string]*spanRoutes{}, logs: map[string]*logCounts{}, psi: map[string]psiPrev{},
 		refusals: map[string]int64{}, refusalLog: map[string]*refusalWindow{}}
 }
 
 // NeedLeaderElection is false: every replica accepts OTLP and gossips it.
 func (r *Receiver) NeedLeaderElection() bool { return false }
 
-// Start serves the listener and flushes to the sink until ctx ends.
+// Reads reports whether the receiver forwards a metric of this name, or
+// drops it at intake (Options.Wanted). Without Wanted every name is
+// forwarded.
+func (r *Receiver) Reads(name string) bool {
+	return r.opts.Wanted == nil || r.opts.Wanted(name)
+}
+
+// Held is the number of state entries kept across exports: the last time
+// of each cumulative series, delta running totals, span routes, log sources
+// and PSI readings. It grows with the series a cluster has, not with the
+// exports that carry them, and each entry is a few numbers.
+func (r *Receiver) Held() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.nheld
+}
+
+// Start serves the listener until ctx ends.
 func (r *Receiver) Start(ctx context.Context) error {
 	lis, err := net.Listen("tcp", r.opts.Addr)
 	if err != nil {
@@ -322,20 +361,15 @@ func (r *Receiver) Serve(ctx context.Context, lis net.Listener) error {
 	r.log.Info("otlp receiver listening", "addr", lis.Addr().String())
 	errCh := make(chan error, 1)
 	go func() { errCh <- srv.Serve(lis) }()
-	ticker := time.NewTicker(r.opts.Flush)
-	defer ticker.Stop()
 	summary := time.NewTicker(summaryEvery)
 	defer summary.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			srv.GracefulStop()
-			r.flush()
 			return nil
 		case err := <-errCh:
 			return err
-		case <-ticker.C:
-			r.flush()
 		case <-summary.C:
 			r.logSummary()
 		}
@@ -421,8 +455,7 @@ func anonymousPrincipal(ctx context.Context) Principal {
 	return Principal{Name: name, Forwarder: true}
 }
 
-// SenderRefusals returns how many points were refused per sender since
-// start.
+// SenderRefusals returns how many points each sender had refused.
 func (r *Receiver) SenderRefusals() map[string]int64 {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -433,37 +466,65 @@ func (r *Receiver) SenderRefusals() map[string]int64 {
 	return out
 }
 
-// accept merges rms, sent by p, into the stored resources and returns how
-// many points it refused and why (once per reason).
+// forward is one export's metrics of one role for one source, on its way
+// to the sink once the lock is released.
+type forward struct {
+	key, role string
+	rms       []*metricspb.ResourceMetrics
+}
+
+// noNamespaceReason is why a resource with no k8s.namespace.name is refused:
+// the core cannot place it, so nothing of it would be used downstream. A
+// resource whose points name a namespace themselves is placed by them, and
+// a cAdvisor scrape's points name their pods' namespaces.
+const noNamespaceReason = "resource has no k8s.namespace.name: the sender did not enrich it"
+
+// placeable reports whether the core can place what rm carries: its
+// resource names a namespace, or its points do.
+func placeable(resource *resourcepb.Resource, rm *metricspb.ResourceMetrics) bool {
+	if ns := attr(resource.GetAttributes(), nsAttr); ns != "" && !strings.HasSuffix(ns, remotens.Sep) {
+		return true
+	}
+	if hasCAdvisor(rm) {
+		return true
+	}
+	found := false
+	for _, sm := range rm.GetScopeMetrics() {
+		for _, m := range sm.GetMetrics() {
+			forEachPointAttrs(m, func(attrs []*commonpb.KeyValue) {
+				if ns := attr(attrs, nsAttr); ns != "" && !strings.HasSuffix(ns, remotens.Sep) {
+					found = true
+				}
+			})
+		}
+	}
+	return found
+}
+
+// accept translates the metrics of rms, sent by p, forwards them and
+// returns how many points it refused and why (once per reason).
 func (r *Receiver) accept(p Principal, rms []*metricspb.ResourceMetrics) (int64, []string) {
 	sender := p.String()
 	f := r.newRefusal(sender, "points")
 	reject := f.reject
 	now := r.opts.now()
+	var outs []forward
 
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	r.exports++
 	var offered int64
-	defer func() {
-		r.rejected += f.rejected
-		// Totals only: a per-sender key would grow with every sender that ever
-		// authenticated (SenderRefusals keeps those, bounded).
-		ledger.Default.Add("otlp", ledger.All, ledger.Ticks, 1)
-		ledger.Default.Add("otlp", ledger.All, ledger.Points, offered)
-		ledger.Default.Add("otlp", ledger.All, ledger.Refused, f.rejected)
-	}()
 	for _, rm := range rms {
 		np := int64(countPoints(rm))
 		r.points += np
 		offered += np
+		unread := int64(dropCAdvisorNoise(rm))
 		if r.opts.Wanted != nil {
-			unread := int64(dropUnwanted(rm, r.opts.Wanted))
-			r.unread += unread
-			ledger.Default.Add("otlp", ledger.All, ledger.Unread, unread)
-			if len(rm.GetScopeMetrics()) == 0 {
-				continue
-			}
+			unread += int64(dropUnwanted(rm, r.opts.Wanted))
+		}
+		r.unread += unread
+		ledger.Default.Add("otlp", ledger.All, ledger.Unread, unread)
+		if len(rm.GetScopeMetrics()) == 0 {
+			continue
 		}
 		n := func() int { return countPoints(rm) }
 		f.at(rm.GetResource())
@@ -471,12 +532,16 @@ func (r *Receiver) accept(p Principal, rms []*metricspb.ResourceMetrics) (int64,
 		if !ok {
 			continue
 		}
-		key := resourceKey(resource)
-		st := r.stateFor(key, resource, sender, n, reject)
-		if st == nil {
+		if !placeable(resource, rm) {
+			reject(n(), noNamespaceReason)
 			continue
 		}
-		st.seen = now
+		key := resourceKey(resource)
+		if !r.touchSource(key, sender, now, n, reject) {
+			continue
+		}
+		byRole := map[string][]*metricspb.Metric{}
+		var cadvisor []*metricspb.Metric
 		for _, sm := range rm.GetScopeMetrics() {
 			for _, m := range sm.GetMetrics() {
 				ms := []*metricspb.Metric{m}
@@ -484,15 +549,273 @@ func (r *Receiver) accept(p Principal, rms []*metricspb.ResourceMetrics) (int64,
 					ms = out
 				}
 				for _, m := range ms {
-					n, why := r.mergeMetric(st, m, now)
+					m, refused, why := r.prepare(key, m, now)
 					if why != "" {
-						reject(n, why)
+						reject(refused, why)
+					}
+					if m == nil {
+						continue
+					}
+					if isCAdvisor(m.GetName()) {
+						cadvisor = append(cadvisor, m)
+						continue
+					}
+					if role := RoleOf(m.GetName()); role != "" {
+						byRole[role] = append(byRole[role], m)
 					}
 				}
 			}
 		}
+		for role, ms := range byRole {
+			outs = append(outs, forward{key: key, role: role, rms: []*metricspb.ResourceMetrics{{
+				Resource:     resource,
+				ScopeMetrics: []*metricspb.ScopeMetrics{{Scope: &commonpb.InstrumentationScope{Name: "otlp"}, Metrics: ms}},
+			}}})
+		}
+		// cAdvisor series become per-pod use.* points under an empty resource:
+		// the scrape's own resource names the kubelet, not the pods.
+		if ms := r.translateCAdvisor(cadvisor, now); len(ms) > 0 {
+			outs = append(outs, forward{key: key, role: metricset.RoleNodeExporter, rms: []*metricspb.ResourceMetrics{{
+				Resource:     &resourcepb.Resource{},
+				ScopeMetrics: []*metricspb.ScopeMetrics{{Scope: &commonpb.InstrumentationScope{Name: "otlp/cadvisor"}, Metrics: ms}},
+			}}})
+		}
 	}
+	r.rejected += f.rejected
+	ledger.Default.Add("otlp", ledger.All, ledger.Ticks, 1)
+	ledger.Default.Add("otlp", ledger.All, ledger.Points, offered)
+	ledger.Default.Add("otlp", ledger.All, ledger.Refused, f.rejected)
+	r.sweep(now)
+	r.mu.Unlock()
+
+	r.send(outs)
 	return f.rejected, f.sortedReasons()
+}
+
+// send hands the forwards to the sink, outside the lock: the sink may wait
+// on the stream.
+func (r *Receiver) send(outs []forward) {
+	if r.opts.Sink == nil {
+		return
+	}
+	for _, o := range outs {
+		r.opts.Sink(o.key, o.role, o.rms)
+	}
+}
+
+// touchSource records that key is forwarded by sender, within the source
+// limits, or reports n() refused through reject and returns false. A source
+// seen for the first time is announced. The caller holds r.mu.
+func (r *Receiver) touchSource(key, sender string, now time.Time, n func() int, reject func(int, string)) bool {
+	if s := r.sources[key]; s != nil {
+		s.seen = now
+		return true
+	}
+	if r.bySender[sender] >= r.opts.MaxResourcesPerSender {
+		reject(n(), "sender resource quota reached")
+		return false
+	}
+	if len(r.sources) >= r.opts.MaxResources {
+		reject(n(), "resource limit reached")
+		return false
+	}
+	r.sources[key] = &source{sender: sender, seen: now}
+	r.bySender[sender]++
+	return true
+}
+
+// prepare makes m ready to forward: the current name and unit, its points'
+// attributes normalized and their exemplars dropped, and a delta series
+// turned into the cumulative one the collectors read. It returns nil for a
+// metric nothing is left of, with how many points it refused and why. The
+// caller holds r.mu.
+func (r *Receiver) prepare(key string, m *metricspb.Metric, now time.Time) (*metricspb.Metric, int, string) {
+	name, unit, scale := canonicalMetric(m)
+	m.Name, m.Unit = name, unit
+	refused, why := 0, ""
+	switch d := m.GetData().(type) {
+	case *metricspb.Metric_Sum:
+		delta := d.Sum.GetAggregationTemporality() == metricspb.AggregationTemporality_AGGREGATION_TEMPORALITY_DELTA
+		kept := d.Sum.DataPoints[:0]
+		for _, dp := range d.Sum.GetDataPoints() {
+			dp.Exemplars = nil
+			normalizePoint(dp, scale)
+			ok, reason := r.inOrder(key, name, dp, now)
+			if delta {
+				ok, reason = r.addDelta(key, name, dp, now)
+			}
+			if reason != "" {
+				refused++
+				why = reason
+			}
+			if !ok {
+				continue
+			}
+			kept = append(kept, dp)
+		}
+		d.Sum.DataPoints = kept
+		if delta {
+			d.Sum.AggregationTemporality = metricspb.AggregationTemporality_AGGREGATION_TEMPORALITY_CUMULATIVE
+		}
+		if len(kept) == 0 {
+			return nil, refused, why
+		}
+	case *metricspb.Metric_Gauge:
+		kept := d.Gauge.DataPoints[:0]
+		for _, dp := range d.Gauge.GetDataPoints() {
+			dp.Exemplars = nil
+			normalizePoint(dp, scale)
+			ok, reason := r.inOrder(key, name, dp, now)
+			if reason != "" {
+				refused++
+				why = reason
+			}
+			if !ok {
+				continue
+			}
+			kept = append(kept, dp)
+		}
+		d.Gauge.DataPoints = kept
+		if len(kept) == 0 {
+			return nil, refused, why
+		}
+	case *metricspb.Metric_Histogram:
+		delta := d.Histogram.GetAggregationTemporality() == metricspb.AggregationTemporality_AGGREGATION_TEMPORALITY_DELTA
+		kept := d.Histogram.DataPoints[:0]
+		for _, dp := range d.Histogram.GetDataPoints() {
+			dp.Exemplars = nil
+			normalizePoint(dp, scale)
+			ok, reason := r.inOrder(key, name, dp, now)
+			if delta {
+				ok, reason = r.addDelta(key, name, dp, now)
+			}
+			if reason != "" {
+				refused++
+				why = reason
+			}
+			if !ok {
+				continue
+			}
+			kept = append(kept, dp)
+		}
+		d.Histogram.DataPoints = kept
+		if delta {
+			d.Histogram.AggregationTemporality = metricspb.AggregationTemporality_AGGREGATION_TEMPORALITY_CUMULATIVE
+		}
+		if len(kept) == 0 {
+			return nil, refused, why
+		}
+	case *metricspb.Metric_ExponentialHistogram:
+		return nil, len(d.ExponentialHistogram.GetDataPoints()), "exponential histograms are not supported; use explicit buckets"
+	default:
+		return nil, 0, ""
+	}
+	return m, refused, why
+}
+
+// seriesID identifies one series across exports: the source, the metric and
+// the point's attributes, hashed. Only a delta series is looked up by it.
+func seriesID(key, name string, attrs []*commonpb.KeyValue) uint64 {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(key))
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write([]byte(name))
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write([]byte(pointKey(attrs)))
+	return h.Sum64()
+}
+
+// inOrder records the cumulative point p as its series' latest and returns
+// true, or false for a point older than the last one forwarded, which must
+// not take the newer value's place downstream, and for a new series past
+// MaxSeries, with the reason. The caller holds r.mu.
+func (r *Receiver) inOrder(key, name string, p proto.Message, now time.Time) (bool, string) {
+	id := seriesID(key, name, pointAttrs(p))
+	ts := pointTime(p)
+	cur, ok := r.ticks[id]
+	if ok && ts < cur.ts {
+		return false, ""
+	}
+	if !ok && r.nheld >= r.opts.MaxSeries {
+		return false, "series limit reached"
+	}
+	if !ok {
+		r.nheld++
+	}
+	r.ticks[id] = tick{ts: ts, seen: now.Unix()}
+	return true, ""
+}
+
+// addDelta adds the delta point p to its series' running total and rewrites
+// p as the total, so what is forwarded is cumulative. It returns false for
+// a point to drop: an interval that ends no later than the last one added is
+// a retry of it (or older) and would count twice; a point the total cannot
+// take comes with the reason. The caller holds r.mu.
+func (r *Receiver) addDelta(key, name string, p proto.Message, now time.Time) (bool, string) {
+	id := seriesID(key, name, pointAttrs(p))
+	cur := r.deltas[id]
+	if cur != nil && pointTime(p) <= cur.ts {
+		return false, ""
+	}
+	if cur == nil {
+		if r.nheld >= r.opts.MaxSeries {
+			return false, "series limit reached"
+		}
+		cur = &running{}
+		r.deltas[id] = cur
+		r.nheld++
+	}
+	switch dp := p.(type) {
+	case *metricspb.NumberDataPoint:
+		_, isInt := dp.GetValue().(*metricspb.NumberDataPoint_AsInt)
+		if cur.ts == 0 {
+			cur.isInt, cur.start = isInt, dp.GetStartTimeUnixNano()
+		}
+		if cur.isInt && isInt {
+			cur.i += dp.GetAsInt()
+			dp.Value = &metricspb.NumberDataPoint_AsInt{AsInt: cur.i}
+		} else {
+			if cur.isInt {
+				cur.f, cur.isInt = float64(cur.i), false
+			}
+			cur.f += numberValue(dp)
+			dp.Value = &metricspb.NumberDataPoint_AsDouble{AsDouble: cur.f}
+		}
+		dp.StartTimeUnixNano = cur.start
+	case *metricspb.HistogramDataPoint:
+		if cur.ts == 0 {
+			cur.bounds = append([]float64(nil), dp.GetExplicitBounds()...)
+			cur.counts = make([]uint64, len(dp.GetBucketCounts()))
+			cur.hasSum, cur.start = dp.Sum != nil, dp.GetStartTimeUnixNano()
+		} else if !slices.Equal(cur.bounds, dp.GetExplicitBounds()) || len(cur.counts) != len(dp.GetBucketCounts()) {
+			return false, "histogram bucket bounds changed"
+		}
+		for i, c := range dp.GetBucketCounts() {
+			cur.counts[i] += c
+		}
+		cur.count += dp.GetCount()
+		dp.Count, dp.BucketCounts = cur.count, append([]uint64(nil), cur.counts...)
+		if cur.hasSum && dp.Sum != nil {
+			cur.sum += dp.GetSum()
+			sum := cur.sum
+			dp.Sum = &sum
+		} else {
+			cur.hasSum, dp.Sum = false, nil
+		}
+		dp.Min, dp.Max = nil, nil // the extremes of one interval say nothing of the total
+		dp.StartTimeUnixNano = cur.start
+	default:
+		return false, "a series changed its kind"
+	}
+	cur.ts, cur.seen = pointTime(p), now
+	return true, ""
+}
+
+func numberValue(dp *metricspb.NumberDataPoint) float64 {
+	if _, ok := dp.GetValue().(*metricspb.NumberDataPoint_AsInt); ok {
+		return float64(dp.GetAsInt())
+	}
+	return dp.GetAsDouble()
 }
 
 // refusal counts what one Export refused and why. The caller holds r.mu.
@@ -511,7 +834,7 @@ func (r *Receiver) newRefusal(sender, what string) *refusal {
 
 // at names the resource the refusals that follow are about.
 func (f *refusal) at(res *resourcepb.Resource) {
-	f.resource = attr(res.GetAttributes(), "k8s.namespace.name") + "/" + attr(res.GetAttributes(), "service.name")
+	f.resource = attr(res.GetAttributes(), nsAttr) + "/" + attr(res.GetAttributes(), "service.name")
 }
 
 // refusalWindow is what one (sender, reason) refused since it was last
@@ -571,11 +894,11 @@ func (f *refusal) sortedReasons() []string {
 
 // admit applies to one resource the checks every signal faces: the namespace
 // it names, the tenant its sender may publish for and the workspace scope.
-// It returns the resource as it is stored (normalized, its namespace set from
-// the sender's own when it names none, tenant-qualified for a tenant sender),
-// or false after reporting n() refused through reject. The points of rm are
-// judged too; a signal with no metric points passes an rm with its resource
-// alone. The caller holds r.mu.
+// It returns the resource as it is forwarded (normalized, its namespace set
+// from the sender's own when it names none, tenant-qualified for a tenant
+// sender), or false after reporting n() refused through reject. The points
+// of rm are judged too; a signal with no metric points passes an rm with
+// its resource alone. The caller holds r.mu.
 func (r *Receiver) admit(p Principal, rm *metricspb.ResourceMetrics, n func() int, reject func(int, string)) (*resourcepb.Resource, bool) {
 	// One namespace per resource, judged by every check below and read by
 	// every collector alike: the first and the last of a repeated key
@@ -627,31 +950,10 @@ func (r *Receiver) admit(p Principal, rm *metricspb.ResourceMetrics, n func() in
 		})
 	}
 	resource := normalizeResource(rm.GetResource())
-	if !p.Forwarder && p.Namespace != "" && attr(resource.GetAttributes(), "k8s.namespace.name") == "" {
-		resource.Attributes = append(resource.Attributes, kv("k8s.namespace.name", p.Namespace))
+	if !p.Forwarder && p.Namespace != "" && attr(resource.GetAttributes(), nsAttr) == "" {
+		resource.Attributes = append(resource.Attributes, kv(nsAttr, p.Namespace))
 	}
 	return resource, true
-}
-
-// stateFor returns the state of the resource stored under key, creating it
-// within the quotas, or nil after reporting n() refused through reject. The
-// caller holds r.mu.
-func (r *Receiver) stateFor(key string, resource *resourcepb.Resource, sender string, n func() int, reject func(int, string)) *resourceState {
-	st := r.res[key]
-	if st != nil {
-		return st
-	}
-	if r.heldBy(sender) >= r.opts.MaxResourcesPerSender {
-		reject(n(), "sender resource quota reached")
-		return nil
-	}
-	if len(r.res) >= r.opts.MaxResources {
-		reject(n(), "resource limit reached")
-		return nil
-	}
-	st = &resourceState{resource: resource, metrics: map[string]*series{}, sender: sender}
-	r.res[key] = st
-	return st
 }
 
 // foreignNamespace returns the first k8s.namespace.name value in kvs that is
@@ -662,7 +964,7 @@ func (r *Receiver) stateFor(key string, resource *resourcepb.Resource, sender st
 // point with an empty one would still override the resource's).
 func foreignNamespace(kvs []*commonpb.KeyValue, ns string, emptyIsForeign bool) string {
 	for _, a := range kvs {
-		if a.GetKey() != "k8s.namespace.name" {
+		if a.GetKey() != nsAttr {
 			continue
 		}
 		switch a.GetValue().GetValue().(type) {
@@ -733,7 +1035,7 @@ const outOfScopeReason = "namespace outside the workspace scope"
 
 // dropForeignPoints removes from rm every data point of any kind that
 // claims a namespace other than ns, reporting each drop. It runs before
-// translateSpanMetrics and mergeMetric, which read the points it leaves.
+// translateSpanMetrics and prepare, which read the points it leaves.
 func dropForeignPoints(rm *metricspb.ResourceMetrics, ns string, report func(n int, claimed string)) {
 	var claimed string
 	dropPointsWhere(rm, func(attrs []*commonpb.KeyValue, _ bool) bool {
@@ -796,334 +1098,74 @@ func filterPoints[T any](pts []T, cadvisor bool, bad func([]*commonpb.KeyValue, 
 	return kept
 }
 
-// heldBy counts the resources sender created that are still held. The
-// caller holds r.mu.
-func (r *Receiver) heldBy(sender string) int {
-	n := 0
-	for _, st := range r.res {
-		if st.sender == sender {
-			n++
-		}
-	}
-	return n
-}
-
-// mergeMetric stores m's points in st, the newest per attribute set. A delta
-// point is added to the cumulative point held for its series, so the
-// collectors only ever see cumulative data (docs/adr/0022-otlp-sensor-role.md).
-// It returns the points refused and why.
-func (r *Receiver) mergeMetric(st *resourceState, m *metricspb.Metric, now time.Time) (int, string) {
-	name, unit, scale := canonicalMetric(m)
-	var shell *metricspb.Metric
-	var pts []proto.Message
-	delta := false
-	switch d := m.GetData().(type) {
-	case *metricspb.Metric_Sum:
-		delta = d.Sum.GetAggregationTemporality() == metricspb.AggregationTemporality_AGGREGATION_TEMPORALITY_DELTA
-		shell = &metricspb.Metric{Name: name, Unit: unit, Data: &metricspb.Metric_Sum{Sum: &metricspb.Sum{
-			AggregationTemporality: cumulativeOf(d.Sum.GetAggregationTemporality()), IsMonotonic: d.Sum.GetIsMonotonic(),
-		}}}
-		for _, dp := range d.Sum.GetDataPoints() {
-			pts = append(pts, dp)
-		}
-	case *metricspb.Metric_Gauge:
-		shell = &metricspb.Metric{Name: name, Unit: unit, Data: &metricspb.Metric_Gauge{Gauge: &metricspb.Gauge{}}}
-		for _, dp := range d.Gauge.GetDataPoints() {
-			pts = append(pts, dp)
-		}
-	case *metricspb.Metric_Histogram:
-		delta = d.Histogram.GetAggregationTemporality() == metricspb.AggregationTemporality_AGGREGATION_TEMPORALITY_DELTA
-		shell = &metricspb.Metric{Name: name, Unit: unit, Data: &metricspb.Metric_Histogram{Histogram: &metricspb.Histogram{
-			AggregationTemporality: cumulativeOf(d.Histogram.GetAggregationTemporality()),
-		}}}
-		for _, dp := range d.Histogram.GetDataPoints() {
-			pts = append(pts, dp)
-		}
-	case *metricspb.Metric_ExponentialHistogram:
-		return len(d.ExponentialHistogram.GetDataPoints()), "exponential histograms are not supported; use explicit buckets"
-	default:
-		return 0, ""
-	}
-
-	s := st.metrics[name]
-	if s == nil || kindOf(s.shell) != kindOf(shell) {
-		if s != nil {
-			st.npoints -= len(s.points)
-			r.nseries -= len(s.points)
-		}
-		s = &series{shell: shell, points: map[string]held{}}
-		st.metrics[name] = s
-	}
-	refused, why := 0, ""
-	for _, p := range pts {
-		dropExemplars(p)
-		p = proto.Clone(p)
-		normalizePoint(p, scale)
-		k := pointKey(pointAttrs(p))
-		cur, ok := s.points[k]
-		if delta {
-			// An interval that ends no later than the last one added is a
-			// retry of it (or older): adding it again would count it twice.
-			if ok && pointTime(p) <= pointTime(cur.p) {
-				continue
-			}
-			merged, reason := addDelta(cur.p, p)
-			if reason != "" {
-				refused++
-				why = reason
-				continue
-			}
-			p = merged
-		}
-		if !ok {
-			if st.npoints >= r.opts.MaxPointsPerResource {
-				refused++
-				why = "series limit reached for a resource"
-				continue
-			}
-			if r.nseries >= r.opts.MaxSeries {
-				refused++
-				why = "series limit reached"
-				continue
-			}
-			st.npoints++
-			r.nseries++
-		} else if !delta && pointTime(p) < pointTime(cur.p) {
-			continue // an older point than the one held: out of order
-		}
-		s.points[k] = held{p: p, seen: now}
-		st.dirty = true
-	}
-	return refused, why
-}
-
-// dropExemplars removes a point's exemplars before it is stored: no
-// collector reads them, and a histogram scraped from an instrumented server
-// carries one per bucket, each with a trace id and attributes of its own.
-func dropExemplars(p proto.Message) {
-	switch dp := p.(type) {
-	case *metricspb.NumberDataPoint:
-		dp.Exemplars = nil
-	case *metricspb.HistogramDataPoint:
-		dp.Exemplars = nil
-	}
-}
-
-// cumulativeOf is the temporality a stored series has: a delta one is held
-// as the running total, so it is cumulative.
-func cumulativeOf(t metricspb.AggregationTemporality) metricspb.AggregationTemporality {
-	if t == metricspb.AggregationTemporality_AGGREGATION_TEMPORALITY_DELTA {
-		return metricspb.AggregationTemporality_AGGREGATION_TEMPORALITY_CUMULATIVE
-	}
-	return t
-}
-
-// addDelta returns the running total after adding the delta point p to cur,
-// the total held so far (nil for the first point of a series). It returns a
-// reason instead when the two cannot be added.
-func addDelta(cur, p proto.Message) (proto.Message, string) {
-	if cur == nil {
-		return p, ""
-	}
-	switch c := cur.(type) {
-	case *metricspb.NumberDataPoint:
-		d, ok := p.(*metricspb.NumberDataPoint)
-		if !ok {
-			return nil, "a series changed its kind"
-		}
-		out := proto.Clone(c).(*metricspb.NumberDataPoint)
-		out.TimeUnixNano = d.GetTimeUnixNano()
-		_, cInt := c.GetValue().(*metricspb.NumberDataPoint_AsInt)
-		_, dInt := d.GetValue().(*metricspb.NumberDataPoint_AsInt)
-		if cInt && dInt {
-			out.Value = &metricspb.NumberDataPoint_AsInt{AsInt: c.GetAsInt() + d.GetAsInt()}
-		} else {
-			out.Value = &metricspb.NumberDataPoint_AsDouble{AsDouble: numberValue(c) + numberValue(d)}
-		}
-		return out, ""
-	case *metricspb.HistogramDataPoint:
-		d, ok := p.(*metricspb.HistogramDataPoint)
-		if !ok {
-			return nil, "a series changed its kind"
-		}
-		if !slices.Equal(c.GetExplicitBounds(), d.GetExplicitBounds()) || len(c.GetBucketCounts()) != len(d.GetBucketCounts()) {
-			return nil, "histogram bucket bounds changed"
-		}
-		out := proto.Clone(c).(*metricspb.HistogramDataPoint)
-		out.TimeUnixNano = d.GetTimeUnixNano()
-		out.Min, out.Max = nil, nil // the extremes of the first interval say nothing of the total
-		out.Count = c.GetCount() + d.GetCount()
-		for i := range out.BucketCounts {
-			out.BucketCounts[i] += d.BucketCounts[i]
-		}
-		if c.Sum != nil && d.Sum != nil {
-			sum := c.GetSum() + d.GetSum()
-			out.Sum = &sum
-		} else {
-			out.Sum = nil
-		}
-		return out, ""
-	}
-	return nil, "a series changed its kind"
-}
-
-func numberValue(dp *metricspb.NumberDataPoint) float64 {
-	if _, ok := dp.GetValue().(*metricspb.NumberDataPoint_AsInt); ok {
-		return float64(dp.GetAsInt())
-	}
-	return dp.GetAsDouble()
-}
-
-// logSummary logs what arrived since the last summary, and the sources held.
+// logSummary logs what arrived since the last summary, and what is held.
 func (r *Receiver) logSummary() {
 	r.mu.Lock()
+	r.sweep(r.opts.now())
 	exports, points, rejected, unread, expired := r.exports, r.points, r.rejected, r.unread, r.expired
 	r.exports, r.points, r.rejected, r.unread, r.expired = 0, 0, 0, 0, 0
-	resources, series := len(r.res), r.nseries
+	sources, held := len(r.sources), r.nheld
 	r.mu.Unlock()
 	r.log.Info("otlp received", "exports", exports, "points", points, "rejected", rejected, "unread", unread,
-		"expired", expired, "resources", resources, "series", series, "window", summaryEvery.String())
+		"expired", expired, "sources", sources, "held", held, "window", summaryEvery.String())
 }
 
-// sweepEvery is how often the series silent for Expire are looked for.
-const sweepEvery = time.Minute
-
-// sweep drops every series that no export updated for Expire: a metric's
-// point and a span histogram alike. A resource expires as a whole only when
-// it goes silent, and a node-level scrape never does while the pods under
-// it come and go; without this it kept every series of what was gone until
-// it hit MaxPointsPerResource and refused what was live. A resource left
-// with nothing is kept until it expires itself. The caller holds r.mu.
+// sweep forgets every state entry no export refreshed for Expire, at most
+// once a minute. The caller holds r.mu.
 func (r *Receiver) sweep(now time.Time) {
-	if now.Sub(r.lastSweep) < sweepEvery {
+	if now.Sub(r.lastSweep) < summaryEvery {
 		return
 	}
 	r.lastSweep = now
-	for _, st := range r.res {
-		for name, s := range st.metrics {
-			for k, h := range s.points {
-				if now.Sub(h.seen) <= r.opts.Expire {
-					continue
-				}
-				delete(s.points, k)
-				st.npoints--
-				r.nseries--
+	stale := func(seen time.Time) bool { return now.Sub(seen) > r.opts.Expire }
+	for key, s := range r.sources {
+		if stale(s.seen) {
+			delete(r.sources, key)
+			if r.bySender[s.sender]--; r.bySender[s.sender] <= 0 {
+				delete(r.bySender, s.sender)
+			}
+		}
+	}
+	for id, t := range r.ticks {
+		if stale(time.Unix(t.seen, 0)) {
+			delete(r.ticks, id)
+			r.nheld--
+			r.expired++
+		}
+	}
+	for id, d := range r.deltas {
+		if stale(d.seen) {
+			delete(r.deltas, id)
+			r.nheld--
+			r.expired++
+		}
+	}
+	for key, sr := range r.spans {
+		for k, s := range sr.routes {
+			if stale(s.seen) {
+				delete(sr.routes, k)
+				r.nheld--
 				r.expired++
-				st.dirty = true
-			}
-			if len(s.points) == 0 {
-				delete(st.metrics, name)
 			}
 		}
-		for k, s := range st.spans {
-			if now.Sub(s.seen) > r.opts.Expire {
-				delete(st.spans, k)
-			}
+		if len(sr.routes) == 0 {
+			delete(r.spans, key)
 		}
 	}
-}
-
-// flush hands every changed resource to the sink and drops expired ones.
-func (r *Receiver) flush() {
-	now := r.opts.now()
-	type out struct {
-		key, role string
-		rms       []*metricspb.ResourceMetrics
-	}
-	var outs []out
-	r.mu.Lock()
-	r.sweep(now)
-	for key, st := range r.res {
-		if now.Sub(st.seen) > r.opts.Expire {
-			delete(r.res, key)
-			r.nseries -= st.npoints
-			continue
-		}
-		if !st.dirty {
-			continue
-		}
-		st.dirty = false
-		if !st.announced {
-			st.announced = true
-			names := make([]string, 0, len(st.metrics))
-			for n := range st.metrics {
-				names = append(names, n)
-			}
-			sort.Strings(names)
-			r.log.V(1).Info("otlp source", "key", key,
-				"service", attr(st.resource.GetAttributes(), "service.name"),
-				"namespace", attr(st.resource.GetAttributes(), "k8s.namespace.name"),
-				"owner", attr(st.resource.GetAttributes(), "k8s.owner.name"),
-				"derived", attr(st.resource.GetAttributes(), replicaAttr) != "",
-				"metrics", names)
-			if attr(st.resource.GetAttributes(), "k8s.namespace.name") == "" {
-				r.log.Info("otlp source has no k8s.namespace.name: the sender did not enrich it, so the core cannot place it and it is held back",
-					"service", attr(st.resource.GetAttributes(), "service.name"),
-					"attributeKeys", attributeKeys(st.resource.GetAttributes()),
-					"podIP", attr(st.resource.GetAttributes(), "k8s.pod.ip"),
-					"containerID", attr(st.resource.GetAttributes(), "container.id"),
-					"podUID", attr(st.resource.GetAttributes(), "k8s.pod.uid"))
-			}
-		}
-		for role, rms := range st.build() {
-			outs = append(outs, out{key: key, role: role, rms: rms})
+	for key, c := range r.logs {
+		if stale(c.seen) {
+			delete(r.logs, key)
+			r.nheld--
+			r.expired++
 		}
 	}
-	r.mu.Unlock()
-	if r.opts.Sink == nil {
-		return
-	}
-	for _, o := range outs {
-		r.opts.Sink(o.key, o.role, o.rms)
-	}
-}
-
-// build returns the resource's points as one ResourceMetrics per role.
-func (st *resourceState) build() map[string][]*metricspb.ResourceMetrics {
-	names := make([]string, 0, len(st.metrics))
-	for n := range st.metrics {
-		names = append(names, n)
-	}
-	sort.Strings(names)
-	byRole := map[string][]*metricspb.Metric{}
-	for _, n := range names {
-		s := st.metrics[n]
-		m := proto.Clone(s.shell).(*metricspb.Metric)
-		keys := make([]string, 0, len(s.points))
-		for k := range s.points {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
-		for _, k := range keys {
-			switch d := m.GetData().(type) {
-			case *metricspb.Metric_Sum:
-				d.Sum.DataPoints = append(d.Sum.DataPoints, s.points[k].p.(*metricspb.NumberDataPoint))
-			case *metricspb.Metric_Gauge:
-				d.Gauge.DataPoints = append(d.Gauge.DataPoints, s.points[k].p.(*metricspb.NumberDataPoint))
-			case *metricspb.Metric_Histogram:
-				d.Histogram.DataPoints = append(d.Histogram.DataPoints, s.points[k].p.(*metricspb.HistogramDataPoint))
-			}
-		}
-		if role := RoleOf(n); role != "" {
-			byRole[role] = append(byRole[role], m)
+	for key, p := range r.psi {
+		if stale(p.seen) {
+			delete(r.psi, key)
+			r.nheld--
+			r.expired++
 		}
 	}
-	out := make(map[string][]*metricspb.ResourceMetrics, len(byRole)+1)
-	for role, ms := range byRole {
-		out[role] = []*metricspb.ResourceMetrics{{
-			Resource:     st.resource,
-			ScopeMetrics: []*metricspb.ScopeMetrics{{Scope: &commonpb.InstrumentationScope{Name: "otlp"}, Metrics: ms}},
-		}}
-	}
-	// cAdvisor series become per-pod use.* points under an empty resource:
-	// the scrape's own resource names the kubelet, not the pods.
-	if ms := translateCAdvisor(st); len(ms) > 0 {
-		out[metricset.RoleNodeExporter] = append(out[metricset.RoleNodeExporter], &metricspb.ResourceMetrics{
-			Resource:     &resourcepb.Resource{},
-			ScopeMetrics: []*metricspb.ScopeMetrics{{Scope: &commonpb.InstrumentationScope{Name: "otlp/cadvisor"}, Metrics: ms}},
-		})
-	}
-	return out
 }
 
 // RoleOf names the sensor role whose collector reads metric name: use.* is
@@ -1141,18 +1183,6 @@ func RoleOf(name string) string {
 		return metricset.RoleLogExporter
 	}
 	return metricset.RoleEBPF
-}
-
-func kindOf(m *metricspb.Metric) string {
-	switch d := m.GetData().(type) {
-	case *metricspb.Metric_Sum:
-		return "sum/" + strconv.FormatBool(d.Sum.GetIsMonotonic())
-	case *metricspb.Metric_Gauge:
-		return "gauge"
-	case *metricspb.Metric_Histogram:
-		return "histogram"
-	}
-	return ""
 }
 
 func countPoints(rm *metricspb.ResourceMetrics) int {
@@ -1230,15 +1260,4 @@ func anyString(v *commonpb.AnyValue) string {
 		return strconv.FormatBool(x.BoolValue)
 	}
 	return ""
-}
-
-// attributeKeys returns the keys of kvs, sorted: what a sender gave a source,
-// without the values.
-func attributeKeys(kvs []*commonpb.KeyValue) []string {
-	keys := make([]string, 0, len(kvs))
-	for _, a := range kvs {
-		keys = append(keys, a.GetKey())
-	}
-	sort.Strings(keys)
-	return keys
 }

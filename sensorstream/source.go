@@ -4,21 +4,20 @@
 package sensorstream
 
 import (
-	"sort"
 	"sync"
-	"time"
 
 	metricspb "go.opentelemetry.io/proto/otlp/metrics/v1"
 )
 
 // RoleOTLP is the role of a process that receives OTLP from senders and
 // streams each source to the controller (docs/adr/0022-otlp-sensor-role.md).
-// Unlike the data roles it has no RoleSource: what it sends are the OTLP
-// sources its receiver holds, one Snapshot per (source, data role), each
+// Unlike the data roles it has no RoleSource: what it sends are the exports
+// its receiver translated, one Snapshot per (source, data role), each
 // naming its source.
 const RoleOTLP = "otlp"
 
-// SourceSnapshot is one OTLP source's latest metrics of one data role.
+// SourceSnapshot is one export's metrics of one data role for one OTLP
+// source.
 type SourceSnapshot struct {
 	Key, Role       string
 	ResourceMetrics []*metricspb.ResourceMetrics
@@ -26,72 +25,91 @@ type SourceSnapshot struct {
 
 // SourceFeed is what the otlp role hands the stream client.
 type SourceFeed interface {
-	// Pending returns the sources that changed since the previous call, or
-	// every source still held when full is set (a new stream starts with the
-	// controller knowing none of them).
+	// Pending returns what was queued since the previous call, in arrival
+	// order, and forgets it. full is accepted for the client's first tick
+	// of a stream and changes nothing: nothing is held to replay, a source
+	// exports again within its own interval.
 	Pending(full bool) []SourceSnapshot
+	// Ready is signalled when something is queued, so the client sends
+	// without waiting for its tick.
+	Ready() <-chan struct{}
 }
 
-// SourceBuffer is a SourceFeed fed by the OTLP receiver's Sink. It keeps the
-// newest snapshot of each (source, role) until it has been silent for
-// retain, so a reconnect can replay all of them.
+// SourceBuffer is a SourceFeed fed by the OTLP receiver's Sink: a queue of
+// what arrived and was not yet sent. It holds nothing else, and no longer
+// than the stream takes to send it; while the stream is down it keeps the
+// newest maxPoints points and drops the oldest exports past that, counted
+// in Dropped.
 type SourceBuffer struct {
-	retain time.Duration
-	now    func() time.Time
+	maxPoints int
 
 	mu      sync.Mutex
-	entries map[sourceRole]*sourceEntry
+	queue   []SourceSnapshot
+	points  int
+	dropped uint64
+	ready   chan struct{}
 }
 
-type sourceRole struct{ key, role string }
-
-type sourceEntry struct {
-	rms   []*metricspb.ResourceMetrics
-	at    time.Time
-	dirty bool
+// NewSourceBuffer returns a queue that holds at most maxPoints points.
+func NewSourceBuffer(maxPoints int) *SourceBuffer {
+	return &SourceBuffer{maxPoints: maxPoints, ready: make(chan struct{}, 1)}
 }
 
-// NewSourceBuffer returns a buffer that forgets a source silent for retain.
-func NewSourceBuffer(retain time.Duration) *SourceBuffer {
-	return &SourceBuffer{retain: retain, now: time.Now, entries: map[sourceRole]*sourceEntry{}}
-}
-
-// Put stores rms as role's latest snapshot of source key. It has the shape of
+// Put queues rms as role's export for source key. It has the shape of
 // otlpreceiver.Sink.
 func (b *SourceBuffer) Put(key, role string, rms []*metricspb.ResourceMetrics) {
+	n := countPoints(rms)
 	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.entries[sourceRole{key, role}] = &sourceEntry{rms: rms, at: b.now(), dirty: true}
+	b.queue = append(b.queue, SourceSnapshot{Key: key, Role: role, ResourceMetrics: rms})
+	b.points += n
+	for len(b.queue) > 1 && b.points > b.maxPoints {
+		b.points -= countPoints(b.queue[0].ResourceMetrics)
+		b.queue[0] = SourceSnapshot{}
+		b.queue = b.queue[1:]
+		b.dropped++
+	}
+	b.mu.Unlock()
+	select {
+	case b.ready <- struct{}{}:
+	default:
+	}
 }
 
-// Pending implements SourceFeed. Entries come out sorted by key and role.
-func (b *SourceBuffer) Pending(full bool) []SourceSnapshot {
+// Pending implements SourceFeed.
+func (b *SourceBuffer) Pending(bool) []SourceSnapshot {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	now := b.now()
-	var out []SourceSnapshot
-	for k, e := range b.entries {
-		if now.Sub(e.at) > b.retain {
-			delete(b.entries, k)
-			continue
-		}
-		if full || e.dirty {
-			e.dirty = false
-			out = append(out, SourceSnapshot{Key: k.key, Role: k.role, ResourceMetrics: e.rms})
-		}
-	}
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].Key != out[j].Key {
-			return out[i].Key < out[j].Key
-		}
-		return out[i].Role < out[j].Role
-	})
+	out := b.queue
+	b.queue, b.points = nil, 0
 	return out
 }
 
-// Len is the number of (source, role) entries held.
+// Ready implements SourceFeed.
+func (b *SourceBuffer) Ready() <-chan struct{} { return b.ready }
+
+// Len is the number of exports queued.
 func (b *SourceBuffer) Len() int {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return len(b.entries)
+	return len(b.queue)
+}
+
+// Dropped is how many queued exports were dropped unsent because the
+// queue was full while the stream was down.
+func (b *SourceBuffer) Dropped() uint64 {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.dropped
+}
+
+func countPoints(rms []*metricspb.ResourceMetrics) int {
+	n := 0
+	for _, rm := range rms {
+		for _, sm := range rm.GetScopeMetrics() {
+			for _, m := range sm.GetMetrics() {
+				n += int(dataPoints(m))
+			}
+		}
+	}
+	return n
 }

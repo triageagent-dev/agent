@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"os"
 	"slices"
-	"time"
 
 	"google.golang.org/grpc/credentials"
 	"k8s.io/client-go/kubernetes"
@@ -19,10 +18,10 @@ import (
 	"github.com/triageagent-dev/agent/otlpreceiver"
 )
 
-// otlpSourceRetain is how long the otlp role keeps a source it has heard
-// nothing from for a reconnect to replay. The receiver drops a silent
-// resource after its own 10 minutes; this adds a margin.
-const otlpSourceRetain = 15 * time.Minute
+// otlpQueuePoints is the most points the otlp role queues for the stream
+// while it is down; past that the oldest exports are dropped unsent. The
+// senders export again within their own interval, so nothing is replayed.
+const otlpQueuePoints = 200_000
 
 // otlpSensorFlags are the flags the otlp role (docs/adr/0022-otlp-sensor-role.md)
 // reads: the controller's receiver flags, plus where its serving certificate
@@ -37,9 +36,6 @@ type otlpSensorFlags struct {
 	maxResources, maxPoints  int
 	maxPerSender, maxRequest int
 	maxSeries                int
-	// flush is how often changed sources are handed on; zero takes the
-	// receiver's default. Tests shorten it.
-	flush time.Duration
 }
 
 // newOTLPSensorReceiver builds the OTLP receiver an otlp-role pod serves and
@@ -57,7 +53,7 @@ func newOTLPSensorReceiver(f otlpSensorFlags, sink otlpreceiver.Sink) (*otlprece
 			return nil, errors.New("--otlp-insecure serves plain gRPC to anonymous senders: it excludes the certificate, client CA, token and tenant flags")
 		}
 		return otlpreceiver.New(otlpreceiver.Options{
-			Addr: f.listen, Insecure: true, Sink: sink, Log: ctrl.Log, Flush: f.flush, Wanted: otlpreceiver.ReadByCollectors,
+			Addr: f.listen, Insecure: true, Sink: sink, Log: ctrl.Log, Wanted: otlpreceiver.ReadByCollectors,
 			MaxResources: f.maxResources, MaxPointsPerResource: f.maxPoints,
 			MaxResourcesPerSender: f.maxPerSender, MaxRequestBytes: f.maxRequest, MaxSeries: f.maxSeries,
 		}), nil
@@ -93,7 +89,6 @@ func newOTLPSensorReceiver(f otlpSensorFlags, sink otlpreceiver.Sink) (*otlprece
 	}
 	return otlpreceiver.New(otlpreceiver.Options{
 		Addr:          f.listen,
-		Flush:         f.flush,
 		TLS:           credentials.NewTLS(otlpreceiver.ServerTLS(cert, pool, len(f.allowed) > 0)),
 		Auth:          auth,
 		Sink:          sink,
