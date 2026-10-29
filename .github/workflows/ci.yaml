@@ -162,12 +162,27 @@ jobs:
       - name: Test
         run: go test -race ./...
 
+  # The one check a pull request must pass. A required check is a fixed job
+  # name, so a job skipped above for paths a pull request never touched would
+  # still be listed as required; this job waits for every test job instead
+  # and fails if one that ran failed, and main asks for this job alone.
+  ci:
+    needs: [changes, test, gcpevents, promevents]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Every job that ran passed
+        env:
+          RESULTS: ${{ toJSON(needs.*.result) }}
+        run: |
+          echo "$RESULTS"
+          ! echo "$RESULTS" | grep -Eq '"(failure|cancelled)"'
+
   # Decides what a push or pull request can change: the image (anything but
   # the chart, the docs and Markdown), and the two modules of their own,
   # gcpevents and promevents, which only their directories touch. A tag, or
-  # a push whose previous commit is unknown, changes everything. A required
-  # check whose job is skipped here counts as passed, so a pull request that
-  # touches none of a module still merges.
+  # a push whose previous commit is unknown, changes everything. A job
+  # skipped here is not run and not required: the ci job above passes.
   changes:
     runs-on: ubuntu-latest
     outputs:
