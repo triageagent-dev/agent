@@ -142,6 +142,9 @@ spec:
             - --sensor-client-cert-file=/etc/triage-otlp-tls/tls.crt
             - --sensor-client-key-file=/etc/triage-otlp-tls/tls.key
             - --sensor-tick={{ $s.tick | default "10s" }}
+            {{- if .Values.logLevel }}
+            - --zap-log-level={{ .Values.logLevel }}
+            {{- end }}
           env:
             - name: POD_NAME
               valueFrom:
