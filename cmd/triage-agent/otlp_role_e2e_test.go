@@ -60,8 +60,8 @@ func TestOTLPRole_RawOTLPReachesTheHubAsREDAndLogSignals(t *testing.T) {
 	go func() { _ = hub.Serve(ctx, hubLis) }()
 
 	// The role: an insecure receiver feeding the stream client.
-	buf := sensorstream.NewSourceBuffer(otlpSourceRetain)
-	recv, err := newOTLPSensorReceiver(otlpSensorFlags{listen: "127.0.0.1:0", insecure: true, flush: 20 * time.Millisecond}, buf.Put)
+	buf := sensorstream.NewSourceBuffer(otlpQueuePoints)
+	recv, err := newOTLPSensorReceiver(otlpSensorFlags{listen: "127.0.0.1:0", insecure: true}, buf.Put)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -128,6 +128,12 @@ spec:
             {{- with .maxSeries }}
             - --otlp-max-series={{ . | int }}
             {{- end }}
+            {{- with .maxInFlight }}
+            - --otlp-max-in-flight={{ . | int }}
+            {{- end }}
+            {{- end }}
+            {{- with $o.expire }}
+            - --otlp-expire={{ . }}
             {{- end }}
             - --sensor-controller={{ include "triage-agent.fullname" . }}-sensors.{{ .Release.Namespace }}.svc:{{ include "triage-agent.sensorStreamPort" . }}
             {{- /* The pods present the controller's serving certificate, which

@@ -435,7 +435,7 @@ image.ebpf.repository / tag| empty / `image.tag`| Image of the eBPF DaemonSet, b
 otlp.sensor.enabled| false| Runs the OTLP receiver and its transformers as `--mode=otlp` pods; senders dial `<fullname>-otlp`. Enabling it reissues the serving certificate once  
 otlp.sensor.replicas / tick| 2 / 10s| Pods of the role, and how often each sends its changed sources to the controller  
 otlp.insecure.enabled / allowFrom| false / empty| Plain gRPC for in-cluster Collectors; `allowFrom` lists the namespaces the NetworkPolicy admits; empty renders no NetworkPolicy  
-otlp.limits.*| 2000 / 5000 / 500 / 250000 / 4 MiB| `maxResources`, `maxPointsPerResource`, `maxResourcesPerSender`, `maxSeries` (series held in all, what the memory is sized by), `maxRequestBytes`; a series no export updated for 10 minutes is dropped  
+otlp.limits.* / otlp.expire| 2000 / 5000 / 500 / 2000000 / 4 MiB / 0 / 3m| `maxResources`, `maxPointsPerResource`, `maxResourcesPerSender`, `maxSeries` (series the receiver keeps state for), `maxRequestBytes`, `maxInFlight` (exports read at once; past it, or with the live heap near the memory limit, a sender is refused before its request is read with RESOURCE_EXHAUSTED and a retry delay); `expire` is how long a series' state lives without an export  
 otlp.allowedServiceAccounts| empty| `namespace/name` or `namespace/*` allowed to send with a token  
 --sensor-tick| 15s| Sensor send interval  
 --log-metrics-enabled| false| Log collector; needs push  

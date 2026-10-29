@@ -103,7 +103,7 @@ func sourceKeys(h *Hub) map[string]bool {
 func TestOTLPRole_SourcesReachTheHubAsSources(t *testing.T) {
 	h := startPinned(t)
 	hub := h.hub
-	buf := NewSourceBuffer(time.Minute)
+	buf := NewSourceBuffer(1 << 20)
 	runOTLPSensor(t, h, h.certFile, h.keyFile, "otlp-pod-a", buf, nil)
 
 	buf.Put("src-1", metricset.RoleEBPF, []*metricspb.ResourceMetrics{counter("http.server.request.duration", 7, map[string]string{"k8s.namespace.name": "ns-a", "service.name": "svc"})})
@@ -124,43 +124,55 @@ func TestOTLPRole_SourcesReachTheHubAsSources(t *testing.T) {
 	}
 }
 
-func TestOTLPRole_ReplaysEverySourceAfterAReconnect(t *testing.T) {
-	buf := NewSourceBuffer(time.Minute)
-	buf.Put("a", metricset.RoleEBPF, nil)
+// The queue hands out what arrived, in order, once; nothing is held for a
+// reconnect to replay, since a source exports again within its interval.
+func TestOTLPRole_QueueDrainsInArrivalOrderAndReplaysNothing(t *testing.T) {
+	buf := NewSourceBuffer(1 << 20)
 	buf.Put("b", metricset.RoleNodeExporter, nil)
-	if got := buf.Pending(false); len(got) != 2 {
-		t.Fatalf("first pending = %d, want 2", len(got))
+	buf.Put("a", metricset.RoleEBPF, nil)
+	select {
+	case <-buf.Ready():
+	default:
+		t.Fatal("a put did not signal the stream")
+	}
+	if got := buf.Pending(false); len(got) != 2 || got[0].Key != "b" || got[1].Key != "a" {
+		t.Fatalf("first pending = %+v, want both in arrival order", got)
 	}
 	if got := buf.Pending(false); len(got) != 0 {
-		t.Fatalf("second pending = %d, want 0: nothing changed", len(got))
+		t.Fatalf("second pending = %d, want 0: nothing is held", len(got))
 	}
-	if got := buf.Pending(true); len(got) != 2 || got[0].Key != "a" || got[1].Key != "b" {
-		t.Fatalf("full pending = %+v, want both in key order", got)
+	if got := buf.Pending(true); len(got) != 0 {
+		t.Fatalf("full pending = %+v, want nothing: nothing is replayed", got)
 	}
 	buf.Put("a", metricset.RoleEBPF, nil)
 	if got := buf.Pending(false); len(got) != 1 || got[0].Key != "a" {
-		t.Fatalf("pending after a change = %+v, want only a", got)
+		t.Fatalf("pending after a put = %+v, want only a", got)
 	}
 }
 
-func TestOTLPRole_BufferForgetsSilentSources(t *testing.T) {
-	buf := NewSourceBuffer(time.Minute)
-	now := time.Now()
-	buf.now = func() time.Time { return now }
-	buf.Put("a", metricset.RoleEBPF, nil)
-	now = now.Add(2 * time.Minute)
-	buf.Put("b", metricset.RoleEBPF, nil)
-	if got := buf.Pending(true); len(got) != 1 || got[0].Key != "b" {
-		t.Fatalf("pending = %+v, want only b", got)
+// While the stream is down the queue keeps the newest points up to its
+// bound and drops the oldest exports past it, so a sender's burst cannot
+// grow the pod.
+func TestOTLPRole_QueueDropsTheOldestPastItsBound(t *testing.T) {
+	buf := NewSourceBuffer(3)
+	two := []*metricspb.ResourceMetrics{counter("a", 1, nil), counter("b", 1, nil)}
+	buf.Put("first", metricset.RoleEBPF, two)
+	buf.Put("second", metricset.RoleEBPF, two)
+	buf.Put("third", metricset.RoleEBPF, two)
+	if buf.Len() != 1 || buf.Dropped() != 2 {
+		t.Fatalf("len = %d, dropped = %d; want 1 and 2", buf.Len(), buf.Dropped())
 	}
-	if buf.Len() != 1 {
-		t.Fatalf("len = %d, want 1", buf.Len())
+	if got := buf.Pending(false); len(got) != 1 || got[0].Key != "third" {
+		t.Fatalf("pending = %+v, want only the newest", got)
+	}
+	if buf.Len() != 0 {
+		t.Fatalf("len after the drain = %d, want 0", buf.Len())
 	}
 }
 
 func TestOTLPRole_ATokenSensorCannotSendSources(t *testing.T) {
 	h := startPinned(t)
-	buf := NewSourceBuffer(time.Minute)
+	buf := NewSourceBuffer(1 << 20)
 	buf.Put("forged", metricset.RoleEBPF, []*metricspb.ResourceMetrics{counter("requests", 1, nil)})
 	// An eBPF sensor (token, no certificate) announcing the otlp role is refused at the hello.
 	tokenFile := filepath.Join(t.TempDir(), "token")
@@ -186,7 +198,7 @@ func TestOTLPRole_ATokenSensorStillWorksOnThePinnedListener(t *testing.T) {
 
 func TestOTLPRole_AnotherCertificateIsRefusedAtTheHandshake(t *testing.T) {
 	h := startPinned(t)
-	buf := NewSourceBuffer(time.Minute)
+	buf := NewSourceBuffer(1 << 20)
 	buf.Put("forged", metricset.RoleEBPF, []*metricspb.ResourceMetrics{counter("requests", 1, nil)})
 	runOTLPSensor(t, h, h.otherCert, h.otherKey, "intruder", buf, nil)
 	time.Sleep(500 * time.Millisecond)
@@ -219,7 +231,7 @@ func TestOTLPRole_FilterDropsRefusedResources(t *testing.T) {
 		}
 		return out
 	}
-	buf := NewSourceBuffer(time.Minute)
+	buf := NewSourceBuffer(1 << 20)
 	runOTLPSensor(t, h, h.certFile, h.keyFile, "otlp-pod-a", buf, nil)
 	buf.Put("refused", metricset.RoleEBPF, []*metricspb.ResourceMetrics{counter("requests", 1, map[string]string{"k8s.namespace.name": "other~ns"})})
 	buf.Put("kept", metricset.RoleEBPF, []*metricspb.ResourceMetrics{counter("requests", 1, map[string]string{"k8s.namespace.name": "ns-a"})})
@@ -232,7 +244,7 @@ func TestOTLPRole_FilterDropsRefusedResources(t *testing.T) {
 func TestOTLPRole_NotADataRoleIsDropped(t *testing.T) {
 	h := startPinned(t)
 	hub := h.hub
-	buf := NewSourceBuffer(time.Minute)
+	buf := NewSourceBuffer(1 << 20)
 	runOTLPSensor(t, h, h.certFile, h.keyFile, "otlp-pod-a", buf, nil)
 	buf.Put("odd", "made-up-role", []*metricspb.ResourceMetrics{counter("requests", 1, nil)})
 	buf.Put("ok", metricset.RoleEBPF, []*metricspb.ResourceMetrics{counter("requests", 1, nil)})

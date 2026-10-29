@@ -44,7 +44,7 @@ func ReadByCollectors(name string) bool {
 	if _, ok := renamed[name]; ok {
 		return true
 	}
-	return isCAdvisor(name) || strings.HasPrefix(name, "use.")
+	return readsCAdvisor(name) || strings.HasPrefix(name, "use.")
 }
 
 // dropUnwanted removes from rm every metric wanted rejects and returns how

@@ -258,13 +258,28 @@ func (c *client) session(ctx context.Context) error {
 		c.sendMicros, c.tickBytes = time.Since(start).Microseconds(), bytesSent
 		c.mu.Unlock()
 
-		select {
-		case <-ctx.Done():
-			_ = stream.CloseSend()
-			return nil
-		case err := <-recvErr:
-			return err
-		case <-ticker.C:
+		// Between ticks, what the otlp role's feed queues goes out as it
+		// arrives: the feed holds nothing longer than this takes.
+		var ready <-chan struct{}
+		if c.opts.Feed != nil {
+			ready = c.opts.Feed.Ready()
+		}
+	wait:
+		for {
+			select {
+			case <-ctx.Done():
+				_ = stream.CloseSend()
+				return nil
+			case err := <-recvErr:
+				return err
+			case <-ready:
+				if _, err := c.sendSources(send, false); err != nil {
+					c.countSendError()
+					return err
+				}
+			case <-ticker.C:
+				break wait
+			}
 		}
 	}
 }

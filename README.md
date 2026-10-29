@@ -160,7 +160,7 @@ make ko-push KO_DOCKER_REPO=...       # build and push the image `agent` (no OBI
 make packages                         # host binaries (-tags obi) and deb/rpm in dist/ (needs nfpm)
 ```
 
-The image is always built with `-tags obi`, so `--mode ebpf` works on both the controller and the eBPF DaemonSet without a separate image to build or name.
+Two images come off the same binary: `agent` (no OBI) runs the controller and the otlp role; `agent-obi` (`-tags obi`) runs the eBPF DaemonSet, which the chart names as `image.ebpf.repository` (default `<image.repository>-obi`).
 See `docs/` for ADRs and todos, and `docs/spec.html` for the agent specification.
 
 ## License

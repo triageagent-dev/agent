@@ -126,8 +126,12 @@ type snapshot struct {
 	at  time.Time
 	seq uint64
 	// raw is the message as received, kept for replay to a peer only when
-	// gossip is on.
+	// gossip is on. For an OTLP source it is the last export merged in,
+	// not the merged set.
 	raw []byte
+	// index locates the points of an OTLP source's merged set (mergeOTLP);
+	// nil for a sensor's snapshot, which arrives whole.
+	index map[string]*metricIndex
 }
 
 type nodeEntry struct {
@@ -495,7 +499,16 @@ func (h *Hub) Merge(recs []mesh.NodeSnapshot) {
 		case *sensorpb.StreamRequest_Snapshot:
 			role := b.Snapshot.GetRole()
 			cur, ok := e.snapshots[role]
-			if !ok || at.newerThan(stamp{at: cur.at, seq: cur.seq}) {
+			switch {
+			case strings.HasPrefix(node, OTLPNodePrefix):
+				// A peer's export of an OTLP source merges in like one
+				// received here: the source is whole only across them.
+				if !ok || at.newerThan(stamp{at: cur.at, seq: cur.seq}) {
+					merged := mergeOTLP(cur, d.set, d.rec.At, otlpPointRetainFactor*h.opts.Stale)
+					merged.at, merged.seq, merged.raw = d.rec.At, d.rec.Seq, d.rec.Snapshot
+					e.snapshots[role] = merged
+				}
+			case !ok || at.newerThan(stamp{at: cur.at, seq: cur.seq}):
 				e.snapshots[role] = snapshot{set: d.set, at: d.rec.At, seq: d.rec.Seq, raw: d.rec.Snapshot}
 			}
 		case *sensorpb.StreamRequest_State:

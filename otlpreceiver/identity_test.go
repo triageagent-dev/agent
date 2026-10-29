@@ -52,24 +52,24 @@ func TestIdentity_ForwarderMayClaimAnyNamespace(t *testing.T) {
 }
 
 func TestIdentity_MissingNamespaceIsStamped(t *testing.T) {
-	r, _, _ := newTest(t)
+	r, got, _ := newTest(t)
 	export(t, r, asDemo(), resource("service.name", "cart"), counter("log.errors", 1, 1))
-	for _, st := range r.res {
-		if ns := attr(st.resource.GetAttributes(), "k8s.namespace.name"); ns != "demo" {
-			t.Fatalf("namespace = %q, want demo", ns)
-		}
-		return
+	if ns := sunkNamespaces(*got); !ns["demo"] || len(ns) != 1 {
+		t.Fatalf("namespaces = %v, want the sender's own, demo", ns)
 	}
-	t.Fatal("no resource stored")
 }
 
-func TestIdentity_ForwarderMissingNamespaceNotStamped(t *testing.T) {
-	r, _, _ := newTest(t)
-	export(t, r, authed(), resource("service.name", "cart"), counter("log.errors", 1, 1))
-	for _, st := range r.res {
-		if ns := attr(st.resource.GetAttributes(), "k8s.namespace.name"); ns != "" {
-			t.Fatalf("a forwarder's resource was stamped with %q", ns)
-		}
+// A forwarder's resource is not stamped with a namespace, and one that
+// names none is refused: the core could not place it.
+func TestIdentity_ForwarderMissingNamespaceIsRefused(t *testing.T) {
+	r, got, _ := newTest(t)
+	resp := export(t, r, authed(), resource("service.name", "cart"), counter("log.errors", 1, 1))
+	ps := resp.GetPartialSuccess()
+	if ps.GetRejectedDataPoints() != 1 || !strings.Contains(ps.GetErrorMessage(), "no k8s.namespace.name") {
+		t.Fatalf("partial success = %+v, want the point refused for the missing namespace", ps)
+	}
+	if len(*got) != 0 {
+		t.Fatalf("an unplaceable resource reached the sink: %+v", *got)
 	}
 }
 
@@ -118,7 +118,7 @@ func TestSenderQuota(t *testing.T) {
 	if resp := export(t, r, asDemo(), resource("service.name", "a"), counter("log.errors", 2, 2)); resp.GetPartialSuccess() != nil {
 		t.Fatalf("update of a held resource refused: %+v", resp.GetPartialSuccess())
 	}
-	if resp := export(t, r, authed(), resource("service.name", "c"), counter("log.errors", 1, 1)); resp.GetPartialSuccess() != nil {
+	if resp := export(t, r, authed(), resource("service.name", "c", "k8s.namespace.name", "obs"), counter("log.errors", 1, 1)); resp.GetPartialSuccess() != nil {
 		t.Fatalf("another sender refused: %+v", resp.GetPartialSuccess())
 	}
 	if n := r.SenderRefusals()["demo/app"]; n != 1 {
