@@ -107,31 +107,54 @@ func TestIntake_CountsPerSender(t *testing.T) {
 	}
 }
 
-// A sender can invent metric names without end; the ledger counts 64 of them
-// and the rest together.
+// A sender can invent metric names without end; the ledger counts a bound of
+// them and the rest together, last whatever its count.
 func TestIntake_BoundsNamesPerSender(t *testing.T) {
 	r, now := intakeReceiver()
 	var ms []*metricspb.Metric
-	for i := range 70 {
-		ms = append(ms, gauge(fmt.Sprintf("foo.%02d", i), 10, 1))
+	n := maxIntakeNames + 6
+	for i := range n {
+		ms = append(ms, gauge(fmt.Sprintf("foo.%04d", i), 10, 1))
 	}
 	export(t, r, authed(), resource("service.name", "cart", "k8s.namespace.name", "shop"), ms...)
 	*now = now.Add(time.Minute)
 	r.logSummary()
 	in, ok := intakeOf(t, r, Principal{Namespace: "obs", Name: "otel-collector"}.String())
-	if !ok || in.Unread != 70 {
-		t.Fatalf("intake = %+v (found %v), want 70 unread", in, ok)
+	if !ok || in.Unread != int64(n) {
+		t.Fatalf("intake = %+v (found %v), want %d unread", in, ok, n)
 	}
 	if len(in.UnreadByName) != maxIntakeNames+1 {
 		t.Fatalf("%d names, want %d and the rest as one", len(in.UnreadByName), maxIntakeNames)
 	}
-	if other := in.UnreadByName[0]; other.Name != intakeOther || other.Points != 6 {
-		t.Errorf("first entry = %+v, want the 6 points past the bound as %q", other, intakeOther)
+	if other := in.UnreadByName[maxIntakeNames]; other.Name != intakeOther || other.Points != 6 {
+		t.Errorf("last entry = %+v, want the 6 points past the bound as %q", other, intakeOther)
 	}
-	for _, nc := range in.UnreadByName[1:] {
+	for _, nc := range in.UnreadByName[:maxIntakeNames] {
 		if nc.Points != 1 || nc.Name == intakeOther {
 			t.Errorf("named entry %+v, want 1 point", nc)
 		}
+	}
+}
+
+// The top of the list is the window's real top by count: a name that
+// arrives after a hundred others, with the most points, is first.
+func TestIntake_LateBigNameIsFirst(t *testing.T) {
+	r, now := intakeReceiver()
+	res := resource("service.name", "cart", "k8s.namespace.name", "shop")
+	var ms []*metricspb.Metric
+	for i := range 100 {
+		ms = append(ms, gauge(fmt.Sprintf("foo.%03d", i), 10, 1))
+	}
+	export(t, r, authed(), res, ms...)
+	export(t, r, authed(), res, gauge("zz.big", 11, 50))
+	*now = now.Add(time.Minute)
+	r.logSummary()
+	in, ok := intakeOf(t, r, Principal{Namespace: "obs", Name: "otel-collector"}.String())
+	if !ok || len(in.UnreadByName) != 101 {
+		t.Fatalf("intake = %+v (found %v), want 101 names", in, ok)
+	}
+	if first := in.UnreadByName[0]; first.Name != "zz.big" || first.Points != 50 {
+		t.Fatalf("first = %+v, want zz.big with 50 points", first)
 	}
 }
 

@@ -692,8 +692,8 @@ type OTLPIntakeStatus struct {
 	Held    int64 `json:"held"`
 	Sources int32 `json:"sources"`
 	// UnreadByName is the unread points by metric name, the top 20 by points,
-	// most first. A name "other" stands for names the receiver did not count
-	// one by one.
+	// most first. A last entry named "other" stands for the names the
+	// receiver did not count one by one; it is never ranked among the top.
 	UnreadByName []NameCount `json:"unreadByName,omitempty"`
 }
 

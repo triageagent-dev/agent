@@ -19,8 +19,11 @@ import (
 const (
 	// maxIntakeNames bounds the metric names counted per sender in a window:
 	// a sender can invent names without end, and the ledger must not grow
-	// with them. The rest is counted under intakeOther.
-	maxIntakeNames = 64
+	// with them. The rest is counted under intakeOther. A Collector that
+	// sends everything it has sends a few hundred names, and the slots go
+	// to the first names of the window, so the bound is well above that:
+	// a name folded into intakeOther is one the operator cannot act on.
+	maxIntakeNames = 1024
 	// intakeOther is the name the unread points past maxIntakeNames are
 	// counted under.
 	intakeOther = "other"
@@ -51,7 +54,8 @@ type IntakeStatus struct {
 
 	// UnreadByName counts the unread points of the window by metric name,
 	// descending by points then by name. Past maxIntakeNames names the rest is
-	// one entry named intakeOther.
+	// one entry named intakeOther, last whatever its count: it names nothing
+	// the operator can filter.
 	UnreadByName []NameCount
 }
 
@@ -148,6 +152,9 @@ func (r *Receiver) Intake() []IntakeStatus {
 		}
 		sort.Slice(st.UnreadByName, func(i, j int) bool {
 			a, b := st.UnreadByName[i], st.UnreadByName[j]
+			if (a.Name == intakeOther) != (b.Name == intakeOther) {
+				return b.Name == intakeOther
+			}
 			if a.Points != b.Points {
 				return a.Points > b.Points
 			}

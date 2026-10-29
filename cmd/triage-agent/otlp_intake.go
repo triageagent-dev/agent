@@ -13,9 +13,14 @@ import (
 )
 
 // intakeTopNames is how many unread metric names per sender the sensor_state
-// frame carries: the receivers count 64 each, and the operator acts on the
-// few that carry the points.
+// frame carries: the receivers count every name of a window, and the operator
+// acts on the few that carry the points.
 const intakeTopNames = 20
+
+// intakeOther is the name a receiver counts the unread points past its bound
+// under. It is not a name the operator can filter, so it is never ranked
+// among the top names: it follows them, whatever its count.
+const intakeOther = "other"
 
 // intakeProto maps a receiver's intake onto the sensor stream's message. It
 // lives here because otlpreceiver does not import sensorpb.
@@ -94,7 +99,9 @@ func otlpIntakeFromNodes(nodes []sensorstream.NodeStatus, local []otlpreceiver.I
 	out := make([]push.OTLPIntakeStatus, 0, len(bySender))
 	for _, s := range bySender {
 		for name, points := range s.names {
-			s.UnreadByName = append(s.UnreadByName, push.NameCount{Name: name, Points: points})
+			if name != intakeOther {
+				s.UnreadByName = append(s.UnreadByName, push.NameCount{Name: name, Points: points})
+			}
 		}
 		sort.Slice(s.UnreadByName, func(i, j int) bool {
 			a, b := s.UnreadByName[i], s.UnreadByName[j]
@@ -105,6 +112,9 @@ func otlpIntakeFromNodes(nodes []sensorstream.NodeStatus, local []otlpreceiver.I
 		})
 		if len(s.UnreadByName) > intakeTopNames {
 			s.UnreadByName = s.UnreadByName[:intakeTopNames]
+		}
+		if other := s.names[intakeOther]; other > 0 {
+			s.UnreadByName = append(s.UnreadByName, push.NameCount{Name: intakeOther, Points: other})
 		}
 		out = append(out, s.OTLPIntakeStatus)
 	}

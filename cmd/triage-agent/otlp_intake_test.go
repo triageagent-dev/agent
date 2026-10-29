@@ -30,6 +30,9 @@ func TestOTLPIntakeFromNodes_SumsASenderOverTheReplicas(t *testing.T) {
 	for i := 10; i < 25; i++ {
 		second = append(second, &sensorpb.NameCount{Name: fmt.Sprintf("n%02d", i), Points: int64(i + 1)})
 	}
+	// What a receiver did not count by name outweighs every name, and is
+	// still last: it is nothing the operator can filter.
+	second = append(second, &sensorpb.NameCount{Name: intakeOther, Points: 10_000})
 	nodes := []sensorstream.NodeStatus{
 		nodeWith(
 			&sensorpb.OTLPIntake{Sender: "obs/collector", WindowSeconds: 60, Exports: 10, Points: 100, Unread: 80, Refused: 5, RefusedExports: 1, Held: 40, Sources: 3, UnreadByName: first},
@@ -62,10 +65,16 @@ func TestOTLPIntakeFromNodes_SumsASenderOverTheReplicas(t *testing.T) {
 	for _, nc := range append(append([]*sensorpb.NameCount{}, first...), second...) {
 		want[nc.Name] += nc.Points
 	}
-	if len(c.UnreadByName) != intakeTopNames {
-		t.Fatalf("%d names, want the top %d", len(c.UnreadByName), intakeTopNames)
+	if len(c.UnreadByName) != intakeTopNames+1 {
+		t.Fatalf("%d names, want the top %d and %q last", len(c.UnreadByName), intakeTopNames, intakeOther)
 	}
-	for i, nc := range c.UnreadByName {
+	if last := c.UnreadByName[intakeTopNames]; last.Name != intakeOther || last.Points != 10_000 {
+		t.Errorf("last = %+v, want %q with its points", last, intakeOther)
+	}
+	for i, nc := range c.UnreadByName[:intakeTopNames] {
+		if nc.Name == intakeOther {
+			t.Errorf("%q ranked among the top names at %d", intakeOther, i)
+		}
 		if nc.Points != want[nc.Name] {
 			t.Errorf("%s = %d points, want %d", nc.Name, nc.Points, want[nc.Name])
 		}
