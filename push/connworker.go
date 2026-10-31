@@ -188,6 +188,20 @@ func (w *connWorker) runOnce(ctx context.Context) (connected bool, err error) {
 	connCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
+	// The certificate is renewed only on a connect, so a session that outlives
+	// it is ended when the renewal comes due and the reconnect renews it; left
+	// alone, the certificate would expire under a long session and the next
+	// reconnect would have nothing to renew.
+	if id, err := p.joinIdentity(); err == nil {
+		if due := id.renewDue(nowFn(), p.opts.ClusterName, p.joinTenants()); !due.IsZero() {
+			renewTimer := time.AfterFunc(due.Sub(nowFn()), func() {
+				w.log.Info("agent certificate renewal is due; reconnecting to renew it", "cluster", p.opts.ClusterName)
+				cancel()
+			})
+			defer renewTimer.Stop()
+		}
+	}
+
 	// Any cancellation of connCtx must unblock readLoop's blocked
 	// conn.ReadMessage() immediately, rather than leaving it to wait out the
 	// ~3*Heartbeat read deadline primed above — see the identical reasoning
@@ -493,7 +507,12 @@ func (w *connWorker) joinHandshake(conn *websocket.Conn, tenant string, now time
 	req := &Frame{V: ProtocolVersion, Kind: KindJoin, Cluster: cluster, Join: &JoinPayload{
 		CSR: csr, Proof: id.sign(joinProofMessage("join", nonce, joinCSRHash(csr))),
 	}}
-	if usable {
+	// A certificate to renew is a usable one near its expiry, or one that
+	// expired within the grace while the agent stayed connected on it: the
+	// core renews either, and the one-time key, spent at the first join, is
+	// offered only when there is no certificate to renew.
+	renewal := len(cert) > 0
+	if renewal {
 		req.Kind = KindRenew
 		req.Join.Cert = cert
 		req.Join.Proof = id.sign(joinProofMessage("renew", nonce, joinCSRHash(csr)))
@@ -529,15 +548,16 @@ func (w *connWorker) joinHandshake(conn *websocket.Conn, tenant string, now time
 			w.log.Info("agent certificate issued for its one-time key", "cluster", cluster, "tenants", tenants, "bindings", res.JoinResult.Bindings)
 			return nil, errJoinIssued
 		}
-		w.log.Info("agent certificate issued", "cluster", cluster, "tenants", tenants, "renewal", usable)
+		w.log.Info("agent certificate issued", "cluster", cluster, "tenants", tenants, "renewal", renewal)
 		return nil, errJoinIssued
 	case JoinPending:
 		w.log.Info("join pending: approve this fingerprint in the core (sources panel, or POST /v2/agents/approve)",
 			"cluster", cluster, "fingerprint", id.fingerprint(), "tenants", tenants)
 		return nil, errJoinPending
 	default:
-		if usable {
-			// A refused renewal (revoked, or tenants changed): join afresh.
+		if renewal {
+			// A refused renewal (revoked, past the grace, or tenants changed):
+			// join afresh.
 			id.dropCert()
 		} else {
 			w.rejected.Store(true)

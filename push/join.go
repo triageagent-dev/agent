@@ -229,29 +229,66 @@ func (j *joinIdentity) dropCert() {
 	j.cert = nil
 }
 
+// renewGrace is how long after its expiry the saved certificate is still
+// offered for renewal rather than replaced by a join with the one-time key,
+// which is spent. The core accepts a renewal within the same grace.
+const renewGrace = 7 * 24 * time.Hour
+
 // certState reports whether the saved certificate can open a session for
-// cluster and tenants, and whether it is due for renewal (less than a third
-// of its lifetime left).
+// cluster and tenants (usable), and whether it is to be renewed (renew): a
+// usable one with less than a third of its lifetime left, or one for this key,
+// cluster and tenants that expired less than renewGrace ago, which is not
+// usable for a session but is renewed instead of joining afresh.
 func (j *joinIdentity) certState(now time.Time, cluster string, tenants []string) (cert []byte, usable, renew bool) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
-	if len(j.cert) == 0 {
+	c := j.matchingCert(cluster, tenants)
+	if c == nil || !now.Before(c.NotAfter.Add(renewGrace)) {
 		return nil, false, false
 	}
-	c, err := x509.ParseCertificate(j.cert)
-	if err != nil || !now.Before(c.NotAfter) {
-		return nil, false, false
-	}
-	pub, ok := c.PublicKey.(ed25519.PublicKey)
-	if !ok || !pub.Equal(j.key.Public()) {
-		return nil, false, false
-	}
-	gotCluster, gotTenants := certNames(c.URIs)
-	if gotCluster != cluster || !slices.Equal(gotTenants, sortedUnique(tenants)) {
-		return nil, false, false
+	if !now.Before(c.NotAfter) {
+		return j.cert, false, true
 	}
 	life := c.NotAfter.Sub(c.NotBefore)
 	return j.cert, true, c.NotAfter.Sub(now) < life/3
+}
+
+// renewDue is when a usable saved certificate for cluster and tenants comes
+// due for renewal (a third of its lifetime before it expires); zero when there
+// is none or it is due already.
+func (j *joinIdentity) renewDue(now time.Time, cluster string, tenants []string) time.Time {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	c := j.matchingCert(cluster, tenants)
+	if c == nil {
+		return time.Time{}
+	}
+	due := c.NotAfter.Add(-c.NotAfter.Sub(c.NotBefore) / 3)
+	if !due.After(now) {
+		return time.Time{}
+	}
+	return due
+}
+
+// matchingCert parses the saved certificate when it is for this key, cluster
+// and tenants, whatever its dates. The caller holds the lock.
+func (j *joinIdentity) matchingCert(cluster string, tenants []string) *x509.Certificate {
+	if len(j.cert) == 0 {
+		return nil
+	}
+	c, err := x509.ParseCertificate(j.cert)
+	if err != nil {
+		return nil
+	}
+	pub, ok := c.PublicKey.(ed25519.PublicKey)
+	if !ok || !pub.Equal(j.key.Public()) {
+		return nil
+	}
+	gotCluster, gotTenants := certNames(c.URIs)
+	if gotCluster != cluster || !slices.Equal(gotTenants, sortedUnique(tenants)) {
+		return nil
+	}
+	return c
 }
 
 func (j *joinIdentity) sign(msg []byte) []byte { return ed25519.Sign(j.key, msg) }
