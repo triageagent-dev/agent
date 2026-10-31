@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Security
+
+- **Every listener is plain TCP: `godebug multipathtcp=0` in the main module (CVE-2026-98432).** Go 1.24 and later ask the Linux kernel for a Multipath TCP socket on every `net.Listen`, and the kernel use-after-free in IPv4 TCP connection setup (CVE-2026-98432, CVSS 9.8, fixed in 5.10.272, 5.15.223, 6.1.190, 6.6.159, 6.12.113, 6.18.56) is reachable, as far as the published exploit goes, only through an MPTCP listener. No client of ours negotiates multipath, so the default is off at build time for every binary; a patched kernel stays the fix. The build is verified with `go version -m <binary>` showing `DefaultGODEBUG=multipathtcp=0`.
+
 ### Fixed
 
 - **A certificate that expires under a running session is renewed, not replaced by a spent key.** The agent renewed its certificate only when it (re)connected, and only with less than a third of the 24 hours left, while the core keeps a connected session past the certificate's end: an agent connected for a day held an expired certificate, and at the next reconnect (a core roll) it saw no usable certificate, joined with its one-time key, which was spent at the first join, and was refused until someone minted a new key. A session now sets a timer at a third of the lifetime before the end and reconnects to renew (`agent certificate renewal is due; reconnecting to renew it`), and a certificate that expired less than seven days ago is sent as a renewal instead of being dropped; the core accepts the expired one in that grace from 3.6.0 (`agentjoin.Service.RenewGrace`). A certificate past the grace, or one for another core or tenant set, still falls back to the key. (`TestJoin_ExpiredCertificateIsRenewedNotReplacedByAKey`, `TestJoin_SessionReconnectsToRenewBeforeExpiry`, `TestJoinCertState`)
