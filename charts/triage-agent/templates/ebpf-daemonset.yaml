@@ -145,7 +145,7 @@ spec:
       {{- end }}
       {{- with $ebpf.tolerations }}
       tolerations:
-        {{- toYaml . | nindent 8 }}
+        {{- include "triage-agent.tolerations" . | nindent 8 }}
       {{- end }}
       {{- with $ebpf.nodeSelector }}
       nodeSelector:

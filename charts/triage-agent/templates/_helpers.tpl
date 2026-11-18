@@ -240,3 +240,21 @@ core.endpoint is set.
 {{- $_ := set $c "storage" ($c.storage | default "secret") -}}
 {{- toYaml $c -}}
 {{- end -}}
+
+{{/*
+Tolerations as the API wants them: a toleration's value is a string. An
+unquoted `true` or `1` (a YAML value, or `--set ...tolerations[0].value=true`,
+which Helm types as a boolean) would otherwise render as a boolean and the
+API server refuses the pod template.
+*/}}
+{{- define "triage-agent.tolerations" -}}
+{{- $out := list -}}
+{{- range . -}}
+{{- $t := deepCopy . -}}
+{{- if hasKey $t "value" -}}
+{{- $_ := set $t "value" (toString $t.value) -}}
+{{- end -}}
+{{- $out = append $out $t -}}
+{{- end -}}
+{{- toYaml $out -}}
+{{- end -}}
