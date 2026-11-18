@@ -162,12 +162,34 @@ jobs:
       - name: Test
         run: go test -race ./...
 
+  # The chart is rendered with the defaults and with values YAML or --set types
+  # as a boolean or a number where the API wants a string, and every object is
+  # validated against the Kubernetes schemas, so a value the API would refuse
+  # fails here and not at install.
+  chart:
+    needs: changes
+    if: needs.changes.outputs.chart == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Install kubeconform
+        run: go install github.com/yannh/kubeconform/cmd/kubeconform@v0.6.7
+
+      - name: Render and validate the chart
+        run: hack/chart-test/run.sh
+
   # The one check a pull request must pass. A required check is a fixed job
   # name, so a job skipped above for paths a pull request never touched would
   # still be listed as required; this job waits for every test job instead
   # and fails if one that ran failed, and main asks for this job alone.
   ci:
-    needs: [changes, test, gcpevents, promevents]
+    needs: [changes, test, gcpevents, promevents, chart]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -179,8 +201,9 @@ jobs:
           ! echo "$RESULTS" | grep -Eq '"(failure|cancelled)"'
 
   # Decides what a push or pull request can change: the image (anything but
-  # the chart, the docs and Markdown), and the two modules of their own,
-  # gcpevents and promevents, which only their directories touch. A tag, or
+  # the chart, the docs and Markdown), the chart check (the chart and
+  # hack/chart-test), and the two modules of their own, gcpevents and
+  # promevents, which only their directories touch. A tag, or
   # a push whose previous commit is unknown, changes everything. A job
   # skipped here is not run and not required: the ci job above passes.
   changes:
@@ -189,6 +212,7 @@ jobs:
       code: ${{ steps.diff.outputs.code }}
       gcpevents: ${{ steps.diff.outputs.gcpevents }}
       promevents: ${{ steps.diff.outputs.promevents }}
+      chart: ${{ steps.diff.outputs.chart }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -200,7 +224,7 @@ jobs:
           BASE: ${{ github.event.pull_request.base.sha }}
         run: |
           set -euo pipefail
-          all() { printf 'code=true\ngcpevents=true\npromevents=true\n' >> "$GITHUB_OUTPUT"; }
+          all() { printf 'code=true\ngcpevents=true\npromevents=true\nchart=true\n' >> "$GITHUB_OUTPUT"; }
           case "$GITHUB_EVENT_NAME" in
             push) from="$BEFORE" ;;
             pull_request) from="$BASE" ;;
@@ -209,17 +233,18 @@ jobs:
           if [ "$GITHUB_REF_TYPE" = tag ] || ! git cat-file -e "${from}^{commit}" 2>/dev/null; then
             all; exit 0
           fi
-          code=false gcpevents=false promevents=false
+          code=false gcpevents=false promevents=false chart=false
           while IFS= read -r f; do
             case "$f" in
-              .github/workflows/ci.yaml) code=true gcpevents=true promevents=true ;;
+              .github/workflows/ci.yaml) code=true gcpevents=true promevents=true chart=true ;;
               gcpevents/*) gcpevents=true; code=true ;;
               promevents/*) promevents=true; code=true ;;
-              charts/*|docs/*|*.md|.github/CODEOWNERS|.github/dependabot.yml) ;;
+              charts/*|hack/chart-test/*) chart=true ;;
+              docs/*|*.md|.github/CODEOWNERS|.github/dependabot.yml) ;;
               *) echo "image input changed: $f"; code=true ;;
             esac
           done < <(git diff --name-only "$from" "$GITHUB_SHA")
-          printf 'code=%s\ngcpevents=%s\npromevents=%s\n' "$code" "$gcpevents" "$promevents" >> "$GITHUB_OUTPUT"
+          printf 'code=%s\ngcpevents=%s\npromevents=%s\nchart=%s\n' "$code" "$gcpevents" "$promevents" "$chart" >> "$GITHUB_OUTPUT"
 
   image:
     needs: [test, changes]

@@ -72,7 +72,7 @@ spec:
         {{- include "triage-agent.otlpSensorSelectorLabels" . | nindent 8 }}
       {{- with .Values.podAnnotations }}
       annotations:
-        {{- toYaml . | nindent 8 }}
+        {{- include "triage-agent.stringMap" . | nindent 8 }}
       {{- end }}
     spec:
       serviceAccountName: {{ $name }}
@@ -197,15 +197,15 @@ spec:
         {{- end }}
       {{- with $s.nodeSelector }}
       nodeSelector:
-        {{- toYaml . | nindent 8 }}
+        {{- include "triage-agent.stringMap" . | nindent 8 }}
       {{- end }}
       {{- with $s.affinity }}
       affinity:
-        {{- toYaml . | nindent 8 }}
+        {{- include "triage-agent.affinity" . | nindent 8 }}
       {{- end }}
       {{- with $s.tolerations }}
       tolerations:
-        {{- toYaml . | nindent 8 }}
+        {{- include "triage-agent.tolerations" . | nindent 8 }}
       {{- end }}
 {{- if gt (int ($s.replicas | default 2)) 1 }}
 ---
