@@ -149,7 +149,7 @@ spec:
       {{- end }}
       {{- with $ebpf.nodeSelector }}
       nodeSelector:
-        {{- toYaml . | nindent 8 }}
+        {{- include "triage-agent.stringMap" . | nindent 8 }}
       {{- end }}
       containers:
         {{- /* ONE container running all three roles in one process: the

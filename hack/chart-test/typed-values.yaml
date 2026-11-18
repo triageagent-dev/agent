@@ -1,0 +1,50 @@
+# Values that YAML or `helm --set` types as a boolean or a number where the
+# API wants a string: a toleration value, a node selector, an annotation, a
+# label value in an affinity. The chart has to render them as strings, so
+# `helm template | kubeconform` passes on this file (hack/chart-test/run.sh).
+core:
+  host: core.example.test
+  clusterName: chart-test
+  caFingerprint: "SHA256:0000000000000000000000000000000000000000000000000000000000000000"
+podAnnotations:
+  flag: true
+  count: 3
+nodeSelector:
+  pool: 7
+  dedicated: true
+tolerations:
+  - {key: dedicated, operator: Equal, value: true, effect: NoSchedule}
+  - {key: gen, operator: Equal, value: 2, effect: NoSchedule}
+  - {key: transient, operator: Exists, effect: NoExecute, tolerationSeconds: 300}
+affinity:
+  nodeAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - {key: gpu, operator: In, values: [true, 1]}
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 10
+        preference:
+          matchExpressions:
+            - {key: pool, operator: In, values: [7]}
+ebpf:
+  enabled: true
+  nodeSelector:
+    dedicated: true
+  tolerations:
+    - {key: dedicated, operator: Equal, value: true, effect: NoSchedule}
+otlp:
+  enabled: true
+  clientCASecret: ca
+  sensor:
+    enabled: true
+    nodeSelector:
+      dedicated: true
+    tolerations:
+      - {key: dedicated, operator: Equal, value: true, effect: NoSchedule}
+    affinity:
+      nodeAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution:
+          nodeSelectorTerms:
+            - matchExpressions:
+                - {key: gpu, operator: In, values: [true]}

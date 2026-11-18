@@ -258,3 +258,59 @@ API server refuses the pod template.
 {{- end -}}
 {{- toYaml $out -}}
 {{- end -}}
+
+{{/*
+A map whose values the API wants as strings (nodeSelector, annotations):
+`true` or `3` typed by YAML or --set is rendered as "true" or "3".
+*/}}
+{{- define "triage-agent.stringMap" -}}
+{{- $out := dict -}}
+{{- range $k, $v := . -}}
+{{- $_ := set $out $k (include "triage-agent.scalarString" $v) -}}
+{{- end -}}
+{{- toYaml $out -}}
+{{- end -}}
+
+{{/* A scalar as the string it is written as: a number that is whole prints
+     without an exponent. */}}
+{{- define "triage-agent.scalarString" -}}
+{{- if kindIs "float64" . -}}
+{{- if eq (floor .) . -}}{{- printf "%d" (int64 .) -}}{{- else -}}{{- toString . -}}{{- end -}}
+{{- else -}}
+{{- toString . -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+An affinity with every scalar a string (label values in matchLabels and
+matchExpressions, namespaces, topology keys) except `weight`, the one number.
+Called with {v: <value>}; returns {"v": <converted>} as JSON.
+*/}}
+{{- define "triage-agent.affinityValue" -}}
+{{- $v := .v -}}
+{{- if kindIs "map" $v -}}
+{{- $o := dict -}}
+{{- range $k, $x := $v -}}
+{{- if eq $k "weight" -}}
+{{- $_ := set $o $k $x -}}
+{{- else -}}
+{{- $_ := set $o $k ((include "triage-agent.affinityValue" (dict "v" $x) | fromJson).v) -}}
+{{- end -}}
+{{- end -}}
+{{- dict "v" $o | toJson -}}
+{{- else if kindIs "slice" $v -}}
+{{- $o := list -}}
+{{- range $x := $v -}}
+{{- $o = append $o ((include "triage-agent.affinityValue" (dict "v" $x) | fromJson).v) -}}
+{{- end -}}
+{{- dict "v" $o | toJson -}}
+{{- else if kindIs "invalid" $v -}}
+{{- dict "v" nil | toJson -}}
+{{- else -}}
+{{- dict "v" (include "triage-agent.scalarString" $v) | toJson -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "triage-agent.affinity" -}}
+{{- toYaml ((include "triage-agent.affinityValue" (dict "v" .) | fromJson).v) -}}
+{{- end -}}
