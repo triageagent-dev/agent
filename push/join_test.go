@@ -32,10 +32,11 @@ import (
 // stubCore plays the core's side of agent join: challenge, join result,
 // certificate hello check.
 type stubCore struct {
-	caCert   *x509.Certificate
-	caKey    ed25519.PrivateKey
-	approved atomic.Bool
-	revoked  atomic.Bool
+	joins, renewals atomic.Int32
+	caCert          *x509.Certificate
+	caKey           ed25519.PrivateKey
+	approved        atomic.Bool
+	revoked         atomic.Bool
 
 	mu        sync.Mutex
 	helloOK   bool
@@ -203,6 +204,7 @@ func (s *stubCore) serveWith(t *testing.T, start func(http.Handler) *httptest.Se
 		}
 		switch f.Kind {
 		case KindJoin:
+			s.joins.Add(1)
 			csr, err := x509.ParseCertificateRequest(f.Join.CSR)
 			if err != nil || csr.CheckSignature() != nil {
 				t.Error("bad CSR")
@@ -231,6 +233,32 @@ func (s *stubCore) serveWith(t *testing.T, start func(http.Handler) *httptest.Se
 				if keyed {
 					res.Bindings = []JoinBinding{{Tenant: "tenant-a", Namespaces: []string{"shop"}}}
 				}
+			}
+			out, _ := encode(&Frame{V: ProtocolVersion, Kind: KindJoinResult, JoinResult: res})
+			_ = conn.WriteMessage(websocket.TextMessage, out)
+		case KindRenew:
+			csr, err := x509.ParseCertificateRequest(f.Join.CSR)
+			if err != nil || csr.CheckSignature() != nil {
+				t.Error("bad CSR")
+				return
+			}
+			cert, err := x509.ParseCertificate(f.Join.Cert)
+			if err != nil || !cert.PublicKey.(ed25519.PublicKey).Equal(csr.PublicKey) {
+				t.Error("a renewal must carry the certificate of the CSR's key")
+				return
+			}
+			if !ed25519.Verify(csr.PublicKey.(ed25519.PublicKey), joinProofMessage("renew", nonce, joinCSRHash(f.Join.CSR)), f.Join.Proof) {
+				t.Error("renew proof does not verify")
+			}
+			res := &JoinResultPayload{Status: JoinRefused, Message: "certificate is revoked"}
+			if !s.revoked.Load() {
+				der, err := s.issue(csr, csr.URIs)
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				res = &JoinResultPayload{Status: JoinIssued, Cert: der, CACert: s.caCert.Raw}
+				s.renewals.Add(1)
 			}
 			out, _ := encode(&Frame{V: ProtocolVersion, Kind: KindJoinResult, JoinResult: res})
 			_ = conn.WriteMessage(websocket.TextMessage, out)
@@ -397,6 +425,129 @@ func TestJoinCertState(t *testing.T) {
 	_ = id.setCert(issue(now.Add(-9*time.Hour), now.Add(time.Hour)))
 	if _, usable, renew := id.certState(now, "cluster-a", []string{"tenant-a", "tenant-b"}); !usable || !renew {
 		t.Errorf("late cert: usable=%v renew=%v, want renewal", usable, renew)
+	}
+	if due := id.renewDue(now, "cluster-a", []string{"tenant-a", "tenant-b"}); !due.IsZero() {
+		t.Errorf("a late cert is due already, got %v", due)
+	}
+	_ = id.setCert(issue(now.Add(-time.Hour), now.Add(10*time.Hour)))
+	if due := id.renewDue(now, "cluster-a", []string{"tenant-a", "tenant-b"}); due.Sub(now).Round(time.Minute) != 6*time.Hour+20*time.Minute {
+		t.Errorf("a fresh 11h cert is due at a third of its life before the end, got in %v", due.Sub(now))
+	}
+	// expired within the grace: not usable, but renewed rather than replaced
+	_ = id.setCert(issue(now.Add(-26*time.Hour), now.Add(-2*time.Hour)))
+	if cert, usable, renew := id.certState(now, "cluster-a", []string{"tenant-a", "tenant-b"}); usable || !renew || len(cert) == 0 {
+		t.Errorf("expired cert: usable=%v renew=%v cert=%d bytes, want a renewal", usable, renew, len(cert))
+	}
+	if _, usable, renew := id.certState(now, "cluster-a", []string{"tenant-a"}); usable || renew {
+		t.Error("an expired cert for other tenants is not renewed")
+	}
+	_ = id.setCert(issue(now.Add(-20*24*time.Hour), now.Add(-10*24*time.Hour)))
+	if cert, usable, renew := id.certState(now, "cluster-a", []string{"tenant-a", "tenant-b"}); usable || renew || cert != nil {
+		t.Errorf("a cert past the grace: usable=%v renew=%v, want a fresh join", usable, renew)
+	}
+}
+
+// An agent that comes back with a certificate that expired under its session
+// renews it instead of joining with its spent one-time key; the renewed
+// certificate then opens a session.
+func TestJoin_ExpiredCertificateIsRenewedNotReplacedByAKey(t *testing.T) {
+	core := newStubCore(t)
+	srv := core.serve(t)
+	url := "ws" + strings.TrimPrefix(srv.URL, "http")
+	p := newJoinTestPusher(t, url, core.fingerprint(), t.TempDir())
+	w := p.primaryWorker()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	core.approved.Store(true)
+	if _, err := w.runOnce(ctx); !errors.Is(err, errJoinIssued) {
+		t.Fatalf("first attempt: %v, want issued", err)
+	}
+	id, err := p.joinIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// the certificate expired two hours ago, as after a long session
+	csr, _ := newJoinCSR(id.key, p.opts.ClusterName, p.joinTenants())
+	parsed, _ := x509.ParseCertificateRequest(csr)
+	now := time.Now()
+	expired, err := x509.CreateCertificate(rand.Reader, &x509.Certificate{
+		SerialNumber: big.NewInt(7), Subject: parsed.Subject, URIs: parsed.URIs,
+		NotBefore: now.Add(-26 * time.Hour), NotAfter: now.Add(-2 * time.Hour),
+	}, core.caCert, id.key.Public(), core.caKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := id.setCert(expired); err != nil {
+		t.Fatal(err)
+	}
+	joins := core.joins.Load()
+	if _, err := w.runOnce(ctx); !errors.Is(err, errJoinIssued) {
+		t.Fatalf("with an expired certificate: %v, want a renewal issued", err)
+	}
+	if core.renewals.Load() != 1 || core.joins.Load() != joins {
+		t.Fatalf("renewals %d, joins %d: the expired certificate should have been renewed, not replaced", core.renewals.Load(), core.joins.Load()-joins)
+	}
+	if _, usable, renew := id.certState(time.Now(), p.opts.ClusterName, p.joinTenants()); !usable || renew {
+		t.Fatalf("after the renewal: usable=%v renew=%v", usable, renew)
+	}
+	connCtx, connCancel := context.WithTimeout(ctx, 500*time.Millisecond)
+	defer connCancel()
+	_, _ = w.runOnce(connCtx)
+	core.mu.Lock()
+	defer core.mu.Unlock()
+	if !core.helloOK {
+		t.Fatalf("certificate hello not accepted after the renewal: %s", core.helloFail)
+	}
+}
+
+// A session that outlives the renewal point is ended so the reconnect renews
+// the certificate before it expires.
+func TestJoin_SessionReconnectsToRenewBeforeExpiry(t *testing.T) {
+	core := newStubCore(t)
+	srv := core.serveSession(t, func(conn *websocket.Conn, _ *Frame) {
+		for {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				return
+			}
+		}
+	})
+	url := "ws" + strings.TrimPrefix(srv.URL, "http")
+	p := newJoinTestPusher(t, url, core.fingerprint(), t.TempDir())
+	w := p.primaryWorker()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	core.approved.Store(true)
+	if _, err := w.runOnce(ctx); !errors.Is(err, errJoinIssued) {
+		t.Fatalf("first attempt: %v, want issued", err)
+	}
+	id, err := p.joinIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// a certificate whose renewal comes due in about a second
+	csr, _ := newJoinCSR(id.key, p.opts.ClusterName, p.joinTenants())
+	parsed, _ := x509.ParseCertificateRequest(csr)
+	now := time.Now()
+	short, err := x509.CreateCertificate(rand.Reader, &x509.Certificate{
+		SerialNumber: big.NewInt(8), Subject: parsed.Subject, URIs: parsed.URIs,
+		NotBefore: now.Add(-2 * time.Second), NotAfter: now.Add(2500 * time.Millisecond),
+	}, core.caCert, id.key.Public(), core.caKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := id.setCert(short); err != nil {
+		t.Fatal(err)
+	}
+	started := time.Now()
+	connected, err := w.runOnce(ctx)
+	if !connected {
+		t.Fatalf("the session did not open: %v", err)
+	}
+	if since := time.Since(started); since > 5*time.Second {
+		t.Fatalf("the session was not ended for the renewal in time: %v", since)
+	}
+	if _, err := w.runOnce(ctx); !errors.Is(err, errJoinIssued) || core.renewals.Load() != 1 {
+		t.Fatalf("reconnect: %v, renewals %d, want a renewal", err, core.renewals.Load())
 	}
 }
 

@@ -88,7 +88,7 @@ spec:
         {{- include "triage-agent.selectorLabels" . | nindent 8 }}
       {{- with .Values.podAnnotations }}
       annotations:
-        {{- toYaml . | nindent 8 }}
+        {{- include "triage-agent.stringMap" . | nindent 8 }}
       {{- end }}
     spec:
       serviceAccountName: {{ include "triage-agent.serviceAccountName" . }}
@@ -484,13 +484,13 @@ spec:
       {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
-        {{- toYaml . | nindent 8 }}
+        {{- include "triage-agent.stringMap" . | nindent 8 }}
       {{- end }}
       {{- with .Values.tolerations }}
       tolerations:
-        {{- toYaml . | nindent 8 }}
+        {{- include "triage-agent.tolerations" . | nindent 8 }}
       {{- end }}
       {{- with .Values.affinity }}
       affinity:
-        {{- toYaml . | nindent 8 }}
+        {{- include "triage-agent.affinity" . | nindent 8 }}
       {{- end }}
