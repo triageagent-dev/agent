@@ -1,180 +1,270 @@
-# ADR-0023: Spot Role (the agent runs the workspace's spot on the customer's side)
+# ADR-0023: Spot Role (the cluster's MCP tools for Tria: tunnel and delegate)
 
-- **Status:** Proposed 2026-10-30 (Den: "add spot capabilities to agent. so
-  agent became spot with this mode enabled. so customer will have
-  comprehensive agent (we call it spot) on their side that send telemetry to
-  tria + has capabilities to call llm and talk to customer via chat"; "go").
-  Nothing is built.
-- **Date:** 2026-10-30
+- **Status:** Proposed. Nothing is built. This text replaces the draft of
+  2026-10-30, which gave the role built-in cluster tools, its own chat with
+  people and the tenant's model calls.
+- **Date:** 2026-11-27
 - **Deciders:** Denis (Principal SRE)
 - **Related:** ADR-0015 (sensor stream), ADR-0022 (OTLP sensor role, the
-  pattern of a role in its own Deployment). Core: ADR-098 (the spot runs its
-  own agent loop), ADR-099 (the spot runs the tenant's model calls), ADR-105
-  (spots join by certificate), ADR-106 (the core is the spot's scheduler),
-  ADR-107 (spots on Agent Substrate), and the core ADR this one asks for (the
-  spot of an agent cluster; see "What the core has to decide").
+  pattern of a role in its own Deployment). Core: ADR-098 (the spot's own
+  agent loop), ADR-099 (a spot runs the core's model calls), ADR-105 (spots
+  join by certificate), ADR-109 (Tria fronts the workspace), ADR-114 (agent
+  cards), ADR-121 (durable tasks), and the core ADR this one asks for.
 
 ## Context
 
-Two things run for a workspace today, in two places:
+The agent runs on the customer's cluster and sends telemetry to the core. When
+Tria investigates, she sees what that telemetry holds and what the core's own
+external MCP servers reach. Data that only the customer's tools can serve, such
+as a log search or a cluster API behind the cluster's network, is out of her
+reach.
 
-- **The agent**, on the customer's cluster. It joins the core by certificate,
-  holds one outbound WebSocket to the core and sends telemetry over it:
-  virtual apps, Kubernetes events, RED/USE/LOG metrics, topology, sensor
-  state. It reads the customer's cluster through a read-only ClusterRole. It
-  runs no model and talks to nobody.
-- **The spot**, on our side, as a Deployment or an Agent Substrate actor. It
-  is the conversational and investigative half of Tria for one workspace: an
-  agent loop over a model (Anthropic or Gemini), the core's MCP tools, the
-  messenger rooms where it talks with the customer, and the tenant's model
-  calls the core hands it as jobs (ADR-099). It joins the core by certificate
-  too (ADR-105 copied the agent's join) and is woken by the core (ADR-106).
+Customers have MCP servers for such data inside their network, and some have a
+model of their own that they want to read it with. They need one component
+that connects outbound to the core, uses those servers within limits the
+cluster owner sets, and can be managed from a conversation with Tria.
 
-The spot sees the customer's cluster only through what the core stored from
-the agent's frames. When a person asks it in a room why a pod restarts, the
-answer stops at the signals the agent chose to send. The thing that could look
-at the pod, the agent, has no model; the thing that has a model cannot look.
-
-The customer installs two things, approves two identities, and the model
-credential that pays for the workspace's calls sits in our cluster although
-ADR-099 says it should be the customer's choice of project, account, model and
-spend.
-
-The spot's runtime is already a Go library: `supervisor`, `llm`, `tools`,
-`mcptools`, `prompt`, `ledger`, `schedule`, `telemetry`, `triggers`,
-`identity`, `corecli`, `edges`, `config`, about 10,000 lines behind a 470-line
-main. Its `triggers` package has two drivers: the WebSocket to the core (the
-`deployment` runtime) and the HTTP link of a substrate actor (ADR-107). Its
-only dependencies the agent lacks are the Anthropic SDK, `genai`, `mcp-go` and
-the OpenTelemetry SDK, all pure Go.
+A spot today is an agent loop for one workspace that joins the core by
+certificate and reaches other systems through connectors: streamable-HTTP MCP
+servers with a required list of allowed tools. Two things it does not do are
+needed here: it sends a connector no credential of its own, and it talks to
+Anthropic or Gemini only, at their own endpoints.
 
 ## Decision
 
-The spot becomes a role of the agent, `--mode=spot`, in the same image. A
-customer who enables it has one install, one key, one component on their side
-that sends telemetry, calls the model with their credential, looks at their
-cluster with the agent's access and talks with them in the rooms. We call that
-component the spot.
+The agent gets a spot role, `--mode=spot`. It connects the customer's MCP
+servers to Tria in one of two modes.
 
-1. **A role in its own Deployment, not in the controller.** Like the OTLP
-   sensor role (ADR-0022), `--mode=spot` runs as `<release>-spot`, one
-   replica, chart `spot.enabled` (default `false`). The controller process
-   keeps leader election, the replica mesh and the push; the spot keeps the
-   model credential, the provider egress and the memory of a long turn. A
-   restart of one never touches the other. The role refuses to run with any
-   other mode in the same process.
+```
+tunnel:    Tria (core's model) -> agent -> customer's MCP servers
+delegate:  Tria -> agent (customer's model, customer's MCP servers) -> answer
+```
 
-2. **The spot stream to the core, not the agent hub.** The role joins and
-   talks over the core's spot stream (`/v2/messenger/spot/ws`, ADR-105 join,
-   ADR-106 frames), the WebSocket the `deployment` runtime already uses. It is
-   a second outbound connection from the cluster, nothing new to open, and
-   the core's wire does not change: challenge, join, hello, `wake`, `rooms`,
-   `name`, `budget`, `control` in; `wake`, `turn`, `stats`, `schedule` reports
-   out. The agent hub stays a telemetry stream. (Teaching the hub the spot
-   frames would duplicate the spot stream for no gain.)
+### 1. Who does what
 
-3. **One key, one approval per identity.** The role presents the cluster's
-   agent key (the one in `<release>-join`) for its first join and asks for the
-   spot identity `spot:<workspace>/<name>`; `name` defaults to the cluster
-   name. The core shows it pending as any spot and a person approves it in the
-   TUI. The core has to accept an agent key for a spot join bound to that
-   key's workspace; that is item 1 of "What the core has to decide". Until it
-   does, the chart also takes a spot enroll key (`spot.enrollKeySecret`) so the
-   role works against a core that has not changed.
+| Tria (core) | Spot role (agent) |
+|---|---|
+| Talks with people | Takes requests from Tria only |
+| RCA, decisions, memory, issues | None of these |
+| Chooses what to ask for | Reads through MCP, and in `delegate` analyses and answers |
+| Switches installed servers, tools and models | Applies what narrows its cluster config |
 
-4. **The runtime moves into this repo.** The spot's runtime packages come in
-   under `spot/` with their tests and keep their shape; `cmd/triage-agent` is
-   the only main and wires `--mode=spot` to them. The role's flags are the
-   spot's, prefixed `spot-` where they would collide with the agent's (`name`,
-   `tenant`, `listen`, `log-level`, `runtime`). The spot repo's `tria-spot`
-   main becomes a build of the same packages until step 4 of the rollout
-   retires it. Our-side actors run this image with `--mode=spot
-   --spot-runtime=substrate` (the HTTP link of ADR-107), so one image runs
-   every spot.
+The role starts no work of its own: no issue wakes, timers, promises or chat
+with people. It gets no model calls of the core (ADR-099 does not apply to it).
+With no request it calls no model and no tool, apart from health checks of the
+MCP servers (`initialize`, `ping`, `tools/list`).
 
-5. **Local tools, read-only.** The role serves one more tool server to the
-   loop, `cluster`, from the agent's own Kubernetes client: pods and their
-   logs, events, workloads, services and endpoints, the fields `describe`
-   shows, bounded to the workspace scope the core sends in the `limits` frame
-   and to `tool-result-max-bytes` as every tool result is. Its ServiceAccount
-   gets the controller's read ClusterRole and nothing else. No tool in this
-   role writes to the cluster; an acting tool is a separate ADR with its own
-   opt-in, if it ever comes.
+Tools come from the customer's MCP servers only. The role has no built-in
+cluster tools and no shell. Cluster access is an MCP server like any other,
+and what it can read is set by that server's own credential. A Kubernetes MCP
+server shipped with the chart can be proposed later.
 
-6. **The customer's credential, never in the environment.** The model
-   credential is a file from a Secret (`spot.llm.keySecret`, Anthropic or
-   Gemini key) or workload identity (Vertex, Anthropic federation), as the
-   spot's `--llm-auth` already offers. The chart renders no NetworkPolicy
-   (the agent chart's rule); the role's egress is the core and the provider.
+### 2. Deployment
 
-7. **The spot's own telemetry stays optional.** OTLP spans of the loop to ego
-   (`spot.otel.*`) are off by default on a customer cluster and on when we
-   run the image as our own actor.
+- The role runs as `<release>-spot`: its own Deployment, one replica, chart
+  `spot.enabled` (default `false`), in the `agent` image. It refuses to run
+  with another mode in the same process. The telemetry roles do not change.
+- It has its own ServiceAccount with **no ClusterRole**. Its one Kubernetes
+  grant is `get` and `update` on the Secret that holds its identity, by name.
+- The pods that send telemetry get no MCP credential and no model credential.
+- As for the other roles, the chart renders no NetworkPolicy.
 
-8. **Resources of its own.** `spot.resources` with `GOMEMLIMIT` from the
-   memory limit as the other roles do; a defaults block sized from the
-   measured spots (about 100 MiB resident at a 100K-token context).
+### 3. Identity
 
-### What stays as it is
+The role joins over the core's spot join (ADR-105), under its own identity
+named after the cluster by default. An enrollment key is good for one join and
+the controller has spent the install key, so the first join of the role either
+uses a spot enrollment key from a Secret (`spot.enrollKeySecret`) or waits as
+pending until a person approves it. One key for both roles is an open
+question. The role renews its certificate and keeps it in
+`<release>-spot-identity`.
 
-- ADR-099's rule: a workspace with a spot runs its model calls there; a
-  workspace without one is covered by the core. A customer spot is a spot.
-- The core's messenger, the MCP tool surface and the instruction cell. The
-  instruction gains the `cluster` tools (core side).
-- The controller, the sensor roles and the host mode. `agent-obi` is
-  unchanged.
+### 4. The cluster owner sets the limits
 
-### What the core has to decide
+Everything the role can reach is declared in chart values. The core cannot add
+to it: it never sends a URL, a credential or a new tool name.
 
-A short core ADR, handed to the core session with this one:
+```yaml
+spot:
+  enabled: false
+  mode: ""                  # tunnel | delegate; required when enabled
+  mcpServers:
+    - name: example-logs
+      url: https://logs.example.svc/mcp
+      tools: [search_logs]  # required, exact names
+      hint: Application logs.
+      assumeReadOnly: false
+      auth:
+        bearerSecret: {name: "", key: token}
+      caSecret: {name: "", key: ca.crt}
+  limits: {}                # result bytes, call timeout, parallel calls, calls per minute
+  models: []                # delegate only
+  dailyTokens: 0            # delegate only: the ceiling
+```
 
-1. **An agent key may join a spot** of the workspace the key is bound to; the
-   spot's hello carries the cluster name so the TUI shows "spot of cluster
-   X", and the core gives the spot the cluster's namespace scope.
-2. **One spot per workspace stays the model.** A second spot join for a
-   workspace that already has an approved spot stays pending with the reason
-   "the workspace already has a spot: <name>" shown in the TUI; a person
-   revokes one to switch. (A customer with several clusters enables the role
-   on one of them. Spots per cluster, or a speaker election, is a later ADR
-   when someone needs it.)
-3. **Instruction and tools.** The instruction cell names the `cluster` tools
-   and when to prefer them over stored signals.
+- MCP transport is streamable HTTP.
+- Credentials are files mounted from Secrets, read again when they change. They
+  are never environment variables and never leave the cluster, except toward
+  the server they are for.
+- A credential goes over `https`, or over `http` only to a cluster-local
+  Service name. The role follows no redirect.
+- The first release sends a bearer token. OAuth client credentials and
+  workload identity come later.
+- The render fails when the role is enabled without a mode, when a server has
+  no tool list, when `tunnel` is given a model, and when `delegate` is given
+  none.
+
+### 5. No writes
+
+MCP gives no reliable way to know whether a tool writes. The role therefore
+serves a listed tool only when its server annotates it `readOnlyHint: true`,
+or when the cluster owner sets `assumeReadOnly: true` for that server. A tool
+held back is reported with the reason.
+
+Both are claims, one by the server and one by the owner. **The boundary against
+writes is the credential the MCP server itself holds**, which the install guide
+asks to be read-only. Write tools, and the approval they need, are a separate
+ADR.
+
+### 6. `tunnel`: Tria uses the tools, no model in the cluster
+
+The core talks MCP to the role over the role's own outbound connection,
+separate from the telemetry stream and from the spot's control stream. The
+customer opens nothing inbound.
+
+It is not a network tunnel and not a message forwarder. Toward the core the
+role **is** an MCP server for each installed server name, and toward that
+server it is an MCP client. Only what the role implements passes.
+
+| Control | Rule |
+|---|---|
+| Target | The core names an installed server, never a URL |
+| Features | Tools only: `initialize` and its notice, `ping`, `tools/list`, `tools/call`, the cancel notice |
+| Tools | The list holds served tools only, and every call is checked again |
+| Headers | The role adds the server's credential and passes no header in either direction |
+| Server requests | Sampling, elicitation and roots are refused, so a server cannot use the core's model or prompt a person |
+| Resources and prompts | Not offered |
+| Limits | Result size, run time, parallel calls and calls per minute; an oversize result fails or is cut with a mark, never silently |
+| Disconnect | Calls in flight fail; the role replays none |
+| Audit | One log line per call: who asked (as the core states it), server, tool, outcome, time, size. No arguments and no results |
+
+Raw tool results and tool descriptions reach the core and Tria's model. The
+prompt injection risk is that of any MCP client with any server. The core
+treats them as it treats its other external MCP servers, with one rule of its
+own: a tunnelled server exists only in its workspace.
+
+### 7. `delegate`: the customer's model reads, Tria gets the answer
+
+- Tria sends a request the way she asks any spot. The role runs one agent turn
+  for it and returns one answer. No MCP is offered to the core.
+- The model gets the served tools of the customer's servers **and nothing
+  else**: no core tool and no memory of the core. The role's own code uses the
+  core to receive the request and send the answer.
+- Tool results are handed to the model fenced as data.
+- Each turn is bounded by steps, tool calls, tokens and a deadline, and all
+  turns by the daily ceiling. A request that cannot be run is answered with
+  the reason.
+- Between requests the role keeps only what its limits need.
+- Raw results stay between the MCP servers, the role and the customer's model
+  provider. The answer goes to the core and may quote them.
+- Model endpoints and credentials come from the cluster config only. Phase 2
+  has Anthropic and Gemini, by key file or workload identity. Phase 3 adds an
+  OpenAI-compatible provider, a custom endpoint and a private CA. A provider
+  with its own sign-in may need more than that.
+- Spans of the loop are off by default. When they are on, prompts, arguments
+  and results are left out unless the cluster owner turns them on.
+
+### 8. The mode is explicit
+
+`spot.mode` has no default and a release runs one mode. A `delegate` whose
+model is missing or failing **fails the request**. It never serves a tunnel
+instead, because that would send raw results to the core without anyone
+choosing it.
+
+### 9. Report and settings
+
+After joining, and on every change, the role reports: mode, version and
+cluster; for each server its name, hint and health; for each tool its name,
+what the server annotates and whether it is served, with the reason when not;
+for each installed model its name, provider and model id; its limits; and the
+settings revision it applies. It reports no URL, credential or Secret name.
+
+Through Tria, a workspace admin may switch an installed server or tool off and
+on again, choose among installed models, set the effort, lower the daily
+budget, and pause the role. Settings can only narrow the cluster config:
+
+- The core sends the whole wanted state with a revision.
+- The role answers applied or rejected, with the reason. A setting that names
+  something no longer installed is ignored and listed in the answer. A model
+  that is not installed is rejected. A budget above the ceiling changes
+  nothing.
+- After each connect the role serves nothing until the core has sent the
+  current settings, so a restart cannot switch a disabled tool back on.
+
+### 10. Code
+
+The join and identity code of the spot comes into this repository for phase 1,
+with an MCP library as a new dependency. Phase 2 copies the model clients and
+the MCP client and adds a small loop for one request at a time. The Anthropic
+and Gemini SDKs come with it. The spot's supervisor, schedule and notes do not
+come: this role has no work of its own. The spot repository stays as it is and
+keeps building the full spot. If the copied code drifts, it moves to a shared
+module.
+
+## What the core has to decide
+
+1. **Two spot kinds, `tunnel` and `delegate`**, from the join. Neither gets
+   model calls of the core, wakes, promises or booked work, and neither is
+   picked when Tria asks "a spot" without naming it. Neither takes the place
+   of the workspace's full spot.
+2. **Several per workspace**, one for each cluster, chosen by name and by what
+   they report.
+3. **The tunnel as an MCP server of Tria**, in the machinery that serves her
+   other external MCP servers: bound to one workspace, tools loaded when
+   needed, off in shared rooms by default. A call reaches the replica that
+   holds the connection.
+4. **Report and settings**, with tools for Tria; settings need workspace admin.
+5. **Delegate requests** over the path Tria uses to ask a spot, without the
+   core tools in the model's turn.
+6. **Guardrail on tool results** as a policy setting that only flags at first.
+   Blocking is decided after false alarms on real logs are measured.
 
 ## Consequences
 
-- One binary carries the Anthropic SDK, `genai`, `mcp-go` and the OTel SDK
-  (pure Go, no cgo). The image grows; nothing starts unless the role runs. A
-  separate image for the role is not worth a second supply chain; revisit if
-  the size ever matters to a customer.
-- The runtime has two homes until the spot repo is retired; the move is a
-  copy with history (`git subtree` or a filter), and the spot repo accepts
-  only fixes it then ports.
-- The customer's cluster now holds a model credential and runs model calls on
-  the customer's bill, which is the point (ADR-099). Nothing in the
-  substrate sandbox exists there: the binary and the read-only ClusterRole are
-  the boundary. The security review of the role covers prompt injection from
-  logs and events into a loop that holds no write verb.
-- The `cluster` tools answer from the live cluster, so a room question gets
-  the pod's logs and events rather than the agent's summary of them.
+- A customer can let Tria use data that never had to be sent as telemetry, and
+  chooses whether raw results leave the cluster (`tunnel`) or only answers
+  (`delegate`).
+- A cluster with the role holds MCP credentials, and in `delegate` a model
+  credential, in pods that have no cluster-wide rights.
+- A compromised core can call served tools with any arguments (`tunnel`) or
+  send any request (`delegate`), inside the limits. It cannot add a server, a
+  tool, a model or a credential.
+- Join code, model clients and the MCP client have two homes until a shared
+  module exists.
 
 ## Rollout
 
-1. **The role.** Packages in, `--mode=spot`, chart `spot.*`, join with a spot
-   enroll key (works against today's core); a customer spot on the test
-   cluster talks in a room.
-2. **One key.** Core item 1 and 2 land; the chart's enroll key becomes
-   optional; the first customer spot joins with the cluster's agent key.
-3. **Local tools.** The `cluster` tool server, its RBAC, the instruction;
-   a room question answered from live logs.
-4. **One image everywhere.** Our-side actors on the agent image
-   (`--spot-runtime=substrate`); the spot repo archived, its chart deprecated
-   with a pointer to `spot.enabled`.
+| Phase | Agent | Needs from the core |
+|---|---|---|
+| 1 | `tunnel`: join, report, MCP with bearer token and private CA, cluster limits | Spot kind, report, tunnel as Tria's MCP server |
+| 2 | `delegate` with Anthropic and Gemini | Delegate kind, requests without core tools |
+| 3 | OpenAI-compatible provider, custom model endpoint, private CA | Nothing |
+| 4 | Settings applied | Settings tools for Tria |
 
-Each phase is a release of this chart; a customer on an earlier phase loses
-nothing, the role is off until they turn it on.
+Each phase is a release of this chart. The role is off until it is turned on.
 
 ## Non-goals
 
-- A spot that acts on the cluster (writes). Separate ADR.
-- Several spots per workspace or a speaker election among them.
-- Moving the core's machine path (ingest, gating, issue lifecycle) anywhere.
+- Tools that write.
+- Adding a server, tool, model or credential through Tria or the core.
+- RCA, memory, schedules or chat with people in this role.
+- Built-in cluster tools or a shell.
+- A raw network or HTTP tunnel.
+- MCP clients other than Tria using the tunnel.
+- MCP resources and prompts.
+
+## Open questions
+
+- One enrollment for the controller and the role.
+- Whether these identities count against a workspace's spot licences.
+- Both modes in one release, chosen per server.
